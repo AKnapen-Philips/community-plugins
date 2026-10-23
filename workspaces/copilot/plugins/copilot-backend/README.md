@@ -77,6 +77,7 @@ Configure the following `app-config.yaml` values:
 - `copilot.backfillFromDate`: Optional earliest V2 date to ingest. Must be `2025-10-10` or later. Default: `2025-10-10`.
 - `copilot.backfillDelayMs`: Optional delay between per-day backfill requests. Default: `200`.
 - `copilot.ingestTeams`: Optional flag that enables user and user-team ingestion so V2 team filtering can be derived. Default: `false`.
+- `copilot.ingestCostCenters`: Optional backend-only flag that enables enterprise cost-center ingestion and organization cost-center reporting when both `copilot.enterprise` and `copilot.organization` are configured. Default: `false`.
 
 At least one of `copilot.enterprise` or `copilot.organization` must be configured.
 
@@ -97,11 +98,24 @@ copilot:
   backfillFromDate: 2025-10-10
   backfillDelayMs: 200
   ingestTeams: true
+  ingestCostCenters: true
   defaultView: enterprise
   showLegacyView: true
 ```
 
 `defaultView` and `showLegacyView` are consumed by the frontend plugin, but they commonly live in the same `copilot` config block.
+
+### Cost Centers
+
+Set `copilot.ingestCostCenters: true` to enable cost-center ingestion for the enterprise view. Organization-view cost centers are also available when both `copilot.enterprise` and `copilot.organization` are configured; organization-only configurations continue to ingest without cost centers and log a warning. Cost-center memberships are resolved from enterprise-level resources and applied to each scope's per-user metrics. The flag ingests per-user reports itself. Set `copilot.ingestTeams: true` as well only if you want the team-within-cost-center cascade.
+
+Membership comes from GitHub cost-center resources: direct `User`, enterprise `Team`, or `Org`; repository resources are ignored. Each user is attributed to at most one cost center, in this order: direct user, enterprise team, then organization. Among teams, the earlier `created_at` wins when both dates are available. If dates tie or either is unavailable, the lower numeric team ID wins, then case-insensitive resource name. Organization ties use case-insensitive organization name. Remaining ties use the lexically lower cost-center ID. Users without a matching resource appear as **No cost center**.
+
+A cost center, a team within a cost center, or the **No cost center** bucket is listed or queryable only when at least five distinct users have Copilot data over the selected date range. The threshold applies to the range as a whole, so individual days in an eligible range may reflect fewer users.
+
+GitHub does not provide historical cost-center membership. Each ingested day uses the membership snapshot fetched at that time; backfilling existing per-user data applies the current snapshot to those historical days.
+
+Detailed CLI and VS Code Agent breakdowns are not available for cost-center views, as with team views.
 
 ### GitHub Enterprise Cloud With Data Residency (GHE.com)
 
@@ -307,6 +321,15 @@ integrations:
 ```
 
 [You can find more about the integrations config in the official docs](https://backstage.io/docs/integrations/github/locations/)
+
+### Cost centers
+
+With `copilot.ingestCostCenters` enabled, cost-center and enterprise-team lookups use the credential selected for `copilot.enterprise` (an enterprise-installed App or PAT). Organization per-user reports continue to use the credential selected for `copilot.organization`. The enterprise credential needs the following additional access, depending on its type:
+
+- **GitHub App:** install the App on the enterprise with **Enterprise Copilot metrics: read**, **Enterprise teams: read**, and **Enterprise billing: read**. Also install it on each organization included as a cost-center `Org` resource, with **Members: read**.
+- **Classic PAT:** `read:enterprise` to read cost centers and enterprise teams, and `read:org` to read members of organizations included as cost-center `Org` resources.
+
+If a referenced organization is unavailable, lacks the required permission, or returns an empty roster, its resource is skipped with a warning.
 
 ## Run
 

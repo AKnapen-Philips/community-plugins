@@ -32,7 +32,15 @@ export function useV2DashboardData(params: V2MetricsParams) {
   const api = useApi(copilotApiV2Ref);
   const { value, loading, error } = useAsync(
     () => api.getDashboardData(params),
-    [api, params.type, params.entityId, params.from, params.to, params.team],
+    [
+      api,
+      params.type,
+      params.entityId,
+      params.from,
+      params.to,
+      params.team,
+      params.costCenter,
+    ],
   );
   return { data: value ?? EMPTY_DASHBOARD, loading, error };
 }

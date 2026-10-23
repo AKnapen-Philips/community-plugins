@@ -30,14 +30,15 @@ export function useV2Teams(
   entityId: string,
   from?: string,
   to?: string,
+  costCenter?: string,
 ) {
   const api = useApi(copilotApiV2Ref);
-  const queryKey = JSON.stringify([type, entityId, from, to]);
+  const queryKey = JSON.stringify([type, entityId, from, to, costCenter]);
   const { value, loading } = useAsync(async (): Promise<TeamsResult> => {
     try {
       return {
         queryKey,
-        items: await api.getTeams({ type, entityId, from, to }),
+        items: await api.getTeams({ type, entityId, from, to, costCenter }),
       };
     } catch (error) {
       return {
@@ -46,7 +47,7 @@ export function useV2Teams(
         error: error instanceof Error ? error : new Error(String(error)),
       };
     }
-  }, [api, type, entityId, from, to]);
+  }, [api, type, entityId, from, to, costCenter]);
   const hasCurrentResult = value?.queryKey === queryKey;
 
   return {
