@@ -68,5 +68,19 @@ export interface Config {
      * @default false
      */
     ingestTeams?: boolean;
+    /**
+     * Opt-in to ingesting Cost Center membership and pre-aggregating per-user
+     * Copilot metrics by cost center. Organization metrics are included when
+     * both copilot.enterprise and copilot.organization are configured. This
+     * ingests the users-1-day report even when ingestTeams is disabled; team
+     * pair aggregation requires ingestTeams. Enterprise App installations
+     * need Enterprise billing: read, Enterprise Copilot metrics: read, and
+     * Enterprise teams: read permissions. Org resources also require Members:
+     * read on each referenced organization. Classic PATs require
+     * read:enterprise and read:org.
+     *
+     * @default false
+     */
+    ingestCostCenters?: boolean;
   };
 }

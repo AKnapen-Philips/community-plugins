@@ -15,10 +15,14 @@
  */
 
 import {
+  NO_COST_CENTER_ID,
   V2UserMetricRow,
   V2UserTeamRow,
 } from '@backstage-community/plugin-copilot-common';
-import { aggregateTeamMetrics } from './teamAggregator';
+import {
+  aggregateCostCenterMetrics,
+  aggregateTeamMetrics,
+} from './teamAggregator';
 
 describe('aggregateTeamMetrics', () => {
   const day = '2026-05-14';
@@ -57,6 +61,121 @@ describe('aggregateTeamMetrics', () => {
     expect(result.byLanguageFeature).toEqual([]);
     expect(result.byModelFeature).toEqual([]);
     expect(result.byLanguageModel).toEqual([]);
+  });
+
+  it('keeps team aggregates unscoped by cost center', () => {
+    const result = aggregateTeamMetrics(
+      [makeUserMetric({ user_id: 1, loc_added_sum: 7 })],
+      [makeUserTeam({ user_id: 1, team_slug: 'platform' })],
+      [],
+      day,
+      metricsType,
+      entityId,
+    );
+
+    expect(result.dailyTotals).toEqual([
+      {
+        day,
+        metrics_type: metricsType,
+        entity_id: entityId,
+        team_slug: 'platform',
+        daily_active_users: 1,
+        weekly_active_users: undefined,
+        monthly_active_users: undefined,
+        monthly_active_agent_users: 0,
+        monthly_active_chat_users: 0,
+        daily_active_vscode_agent_users: 0,
+        code_acceptance_activity_count: 1,
+        code_generation_activity_count: 2,
+        loc_added_sum: 7,
+        loc_deleted_sum: 3,
+        loc_suggested_to_add_sum: 12,
+        loc_suggested_to_delete_sum: 4,
+        user_initiated_interaction_count: 5,
+        total_ai_credits_used: 0,
+      },
+    ]);
+    expect(result.dailyTotals[0]).not.toHaveProperty('cost_center_id');
+  });
+
+  it('aggregates cost-center and team intersections with distinct user counts', () => {
+    const result = aggregateCostCenterMetrics(
+      [
+        makeUserMetric({
+          user_id: 1,
+          loc_added_sum: 10,
+          used_cli: true,
+          used_vscode_agent: true,
+        }),
+        makeUserMetric({
+          user_id: 2,
+          loc_added_sum: 20,
+          used_cli: false,
+          used_vscode_agent: false,
+        }),
+        makeUserMetric({
+          user_id: 3,
+          loc_added_sum: 5,
+          used_cli: true,
+          used_vscode_agent: true,
+        }),
+      ],
+      [
+        makeUserTeam({ user_id: 1, team_slug: 'platform' }),
+        makeUserTeam({ user_id: 2, team_slug: 'platform' }),
+        makeUserTeam({ user_id: 2, team_slug: 'platform' }),
+        makeUserTeam({ user_id: 3, team_slug: 'platform' }),
+      ],
+      [],
+      new Map([
+        [1, 'cc-a'],
+        [2, 'cc-a'],
+      ]),
+      day,
+      metricsType,
+      entityId,
+      true,
+    );
+
+    expect(result.dailyTotals).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          team_slug: '',
+          cost_center_id: 'cc-a',
+          daily_active_users: 2,
+          loc_added_sum: 30,
+          daily_active_cli_users: 1,
+          daily_active_vscode_agent_users: 1,
+        }),
+        expect.objectContaining({
+          team_slug: '',
+          cost_center_id: NO_COST_CENTER_ID,
+          daily_active_users: 1,
+          loc_added_sum: 5,
+          daily_active_cli_users: 1,
+          daily_active_vscode_agent_users: 1,
+        }),
+        expect.objectContaining({
+          team_slug: 'platform',
+          cost_center_id: 'cc-a',
+          daily_active_users: 2,
+          loc_added_sum: 30,
+          daily_active_cli_users: 1,
+          daily_active_vscode_agent_users: 1,
+        }),
+        expect.objectContaining({
+          team_slug: 'platform',
+          cost_center_id: NO_COST_CENTER_ID,
+          daily_active_users: 1,
+          loc_added_sum: 5,
+          daily_active_cli_users: 1,
+          daily_active_vscode_agent_users: 1,
+        }),
+      ]),
+    );
+    expect(result.dailyTotals).toHaveLength(4);
+    expect(result.byCli).toEqual([]);
+    expect(result.byVscodeAgent).toEqual([]);
   });
 
   it('counts user in multiple teams', () => {
