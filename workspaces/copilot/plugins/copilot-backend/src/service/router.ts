@@ -57,6 +57,8 @@ import {
   v2FeatureQuerySchema,
   V2MeDashboardQuery,
   v2MeDashboardQuerySchema,
+  V2CostCentersQuery,
+  v2CostCentersQuerySchema,
   V2MetricsQuery,
   v2MetricsQuerySchema,
   V2PeriodRangeQuery,
@@ -339,18 +341,105 @@ async function createRouter(
   // ---------------------------------------------------------------------------
   const v2Router = express.Router();
 
+  const configuredEnterprise = config.getOptionalString('copilot.enterprise');
+  const configuredOrganization = config.getOptionalString(
+    'copilot.organization',
+  );
+  const costCenterIngestionEnabled =
+    config.getOptionalBoolean('copilot.ingestCostCenters') ?? false;
+  const isCostCenterScopeEnabled = (
+    type: V2MetricsQuery['type'],
+    entityId: string,
+  ) =>
+    type === 'enterprise' ||
+    (costCenterIngestionEnabled &&
+      Boolean(configuredEnterprise && configuredOrganization) &&
+      entityId === configuredOrganization);
+
+  const validateCostCenterSelection = async (params: {
+    type: V2MetricsQuery['type'];
+    entityId: string;
+    from?: string;
+    to?: string;
+    team?: string;
+    costCenter?: string;
+  }) => {
+    const { type, entityId, from, to, team, costCenter } = params;
+    if (!costCenter) {
+      return;
+    }
+
+    if (!isCostCenterScopeEnabled(type, entityId)) {
+      throw new InputError(
+        'Cost centers are only supported for enterprise scope',
+      );
+    }
+
+    const costCenters = await dbV2.getCostCenters(type, entityId, from, to);
+    // The threshold counts distinct users across the range, not daily or rolling rows.
+    if (!costCenters.some(item => item.id === costCenter)) {
+      throw new InputError(
+        'Cost center is not eligible for the requested scope and date range',
+      );
+    }
+
+    if (team) {
+      const teams = await dbV2.getTeams(
+        type,
+        entityId,
+        from,
+        to,
+        undefined,
+        costCenter,
+      );
+      if (!teams.includes(team)) {
+        throw new InputError(
+          'Team and cost center combination is not eligible for the requested date range',
+        );
+      }
+    }
+  };
+
+  v2Router.get(
+    '/cost-centers',
+    validateQuery(v2CostCentersQuerySchema),
+    async (req, res, next) => {
+      try {
+        const { type, entityId, from, to } = req.query as V2CostCentersQuery;
+        if (!isCostCenterScopeEnabled(type, entityId)) {
+          return res.json([]);
+        }
+
+        const result = await dbV2.getCostCenters(type, entityId, from, to);
+        return res.json(result);
+      } catch (err) {
+        return next(err);
+      }
+    },
+  );
+
   v2Router.get(
     '/metrics/daily',
     validateQuery(v2MetricsQuerySchema),
     async (req, res, next) => {
       try {
-        const { type, entityId, from, to, team } = req.query as V2MetricsQuery;
+        const { type, entityId, from, to, team, costCenter } =
+          req.query as V2MetricsQuery;
+        await validateCostCenterSelection({
+          type,
+          entityId,
+          from,
+          to,
+          team,
+          costCenter,
+        });
         const result = await dbV2.getDailyTotals(
           type,
           entityId,
           from,
           to,
           team,
+          costCenter,
         );
         return res.json(result);
       } catch (err) {
@@ -364,8 +453,24 @@ async function createRouter(
     validateQuery(v2MetricsQuerySchema),
     async (req, res, next) => {
       try {
-        const { type, entityId, from, to, team } = req.query as V2MetricsQuery;
-        const result = await dbV2.getPrMetrics(type, entityId, from, to, team);
+        const { type, entityId, from, to, team, costCenter } =
+          req.query as V2MetricsQuery;
+        await validateCostCenterSelection({
+          type,
+          entityId,
+          from,
+          to,
+          team,
+          costCenter,
+        });
+        const result = await dbV2.getPrMetrics(
+          type,
+          entityId,
+          from,
+          to,
+          team,
+          costCenter,
+        );
         return res.json(result);
       } catch (err) {
         return next(err);
@@ -378,9 +483,25 @@ async function createRouter(
     validateQuery(v2MetricsQuerySchema),
     async (req, res, next) => {
       try {
-        const { type, entityId, from, to, team } = req.query as V2MetricsQuery;
+        const { type, entityId, from, to, team, costCenter } =
+          req.query as V2MetricsQuery;
+        await validateCostCenterSelection({
+          type,
+          entityId,
+          from,
+          to,
+          team,
+          costCenter,
+        });
         // eslint-disable-next-line testing-library/no-await-sync-queries
-        const result = await dbV2.getByFeature(type, entityId, from, to, team);
+        const result = await dbV2.getByFeature(
+          type,
+          entityId,
+          from,
+          to,
+          team,
+          costCenter,
+        );
         return res.json(result);
       } catch (err) {
         return next(err);
@@ -393,9 +514,25 @@ async function createRouter(
     validateQuery(v2MetricsQuerySchema),
     async (req, res, next) => {
       try {
-        const { type, entityId, from, to, team } = req.query as V2MetricsQuery;
+        const { type, entityId, from, to, team, costCenter } =
+          req.query as V2MetricsQuery;
+        await validateCostCenterSelection({
+          type,
+          entityId,
+          from,
+          to,
+          team,
+          costCenter,
+        });
         // eslint-disable-next-line testing-library/no-await-sync-queries
-        const result = await dbV2.getByIde(type, entityId, from, to, team);
+        const result = await dbV2.getByIde(
+          type,
+          entityId,
+          from,
+          to,
+          team,
+          costCenter,
+        );
         return res.json(result);
       } catch (err) {
         return next(err);
@@ -408,8 +545,16 @@ async function createRouter(
     validateQuery(v2FeatureQuerySchema),
     async (req, res, next) => {
       try {
-        const { type, entityId, from, to, team, feature } =
+        const { type, entityId, from, to, team, costCenter, feature } =
           req.query as V2FeatureQuery;
+        await validateCostCenterSelection({
+          type,
+          entityId,
+          from,
+          to,
+          team,
+          costCenter,
+        });
         // eslint-disable-next-line testing-library/no-await-sync-queries
         const result = await dbV2.getByLanguageFeature(
           type,
@@ -418,6 +563,7 @@ async function createRouter(
           to,
           team,
           feature,
+          costCenter,
         );
         return res.json(result);
       } catch (err) {
@@ -431,7 +577,16 @@ async function createRouter(
     validateQuery(v2MetricsQuerySchema),
     async (req, res, next) => {
       try {
-        const { type, entityId, from, to, team } = req.query as V2MetricsQuery;
+        const { type, entityId, from, to, team, costCenter } =
+          req.query as V2MetricsQuery;
+        await validateCostCenterSelection({
+          type,
+          entityId,
+          from,
+          to,
+          team,
+          costCenter,
+        });
         // eslint-disable-next-line testing-library/no-await-sync-queries
         const result = await dbV2.getByModelFeature(
           type,
@@ -439,6 +594,7 @@ async function createRouter(
           from,
           to,
           team,
+          costCenter,
         );
         return res.json(result);
       } catch (err) {
@@ -452,7 +608,16 @@ async function createRouter(
     validateQuery(v2MetricsQuerySchema),
     async (req, res, next) => {
       try {
-        const { type, entityId, from, to, team } = req.query as V2MetricsQuery;
+        const { type, entityId, from, to, team, costCenter } =
+          req.query as V2MetricsQuery;
+        await validateCostCenterSelection({
+          type,
+          entityId,
+          from,
+          to,
+          team,
+          costCenter,
+        });
         // eslint-disable-next-line testing-library/no-await-sync-queries
         const result = await dbV2.getByLanguageModel(
           type,
@@ -460,6 +625,7 @@ async function createRouter(
           from,
           to,
           team,
+          costCenter,
         );
         return res.json(result);
       } catch (err) {
@@ -473,8 +639,18 @@ async function createRouter(
     validateQuery(v2TeamsQuerySchema),
     async (req, res, next) => {
       try {
-        const { type, entityId, from, to } = req.query as V2TeamsQuery;
-        const result = await dbV2.getTeams(type, entityId, from, to);
+        const { type, entityId, from, to, costCenter } =
+          req.query as V2TeamsQuery;
+        await validateCostCenterSelection({
+          type,
+          entityId,
+          from,
+          to,
+          costCenter,
+        });
+        const result = costCenter
+          ? await dbV2.getTeams(type, entityId, from, to, undefined, costCenter)
+          : await dbV2.getTeams(type, entityId, from, to);
         return res.json(result);
       } catch (err) {
         return next(err);
@@ -563,13 +739,23 @@ async function createRouter(
     validateQuery(v2MetricsQuerySchema),
     async (req, res, next) => {
       try {
-        const { type, entityId, from, to, team } = req.query as V2MetricsQuery;
+        const { type, entityId, from, to, team, costCenter } =
+          req.query as V2MetricsQuery;
+        await validateCostCenterSelection({
+          type,
+          entityId,
+          from,
+          to,
+          team,
+          costCenter,
+        });
         const result = await dbV2.getDashboardData(
           type,
           entityId,
           from,
           to,
           team,
+          costCenter,
         );
         return res.json(result);
       } catch (err) {

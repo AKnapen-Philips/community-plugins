@@ -72,6 +72,9 @@ describe('router v2 endpoints', () => {
       getByFeature: jest.fn(),
       getByIde: jest.fn(),
       getByLanguageFeature: jest.fn(),
+      getByModelFeature: jest.fn(),
+      getByLanguageModel: jest.fn(),
+      getCostCenters: jest.fn(),
       getTeams: jest.fn(),
       getPeriodRange: jest.fn(),
       getIngestionLog: jest.fn(),
@@ -94,6 +97,9 @@ describe('router v2 endpoints', () => {
     mockDbV2.getByFeature.mockResolvedValue([]);
     mockDbV2.getByIde.mockResolvedValue([]);
     mockDbV2.getByLanguageFeature.mockResolvedValue([]);
+    mockDbV2.getByModelFeature.mockResolvedValue([]);
+    mockDbV2.getByLanguageModel.mockResolvedValue([]);
+    mockDbV2.getCostCenters.mockResolvedValue([]);
     mockDbV2.getTeams.mockResolvedValue([]);
     mockDbV2.getPeriodRange.mockResolvedValue({
       minDate: '2025-10-10',
@@ -137,6 +143,110 @@ describe('router v2 endpoints', () => {
     return app;
   }
 
+  const costCenterMetricRoutes: Array<{
+    path: string;
+    reader: string;
+    expectedArgs: unknown[];
+  }> = [
+    {
+      path: '/v2/metrics/daily',
+      reader: 'getDailyTotals',
+      expectedArgs: [
+        'enterprise',
+        'ent-1',
+        '2026-05-01',
+        '2026-05-20',
+        undefined,
+        'cc-1',
+      ],
+    },
+    {
+      path: '/v2/metrics/pull-requests',
+      reader: 'getPrMetrics',
+      expectedArgs: [
+        'enterprise',
+        'ent-1',
+        '2026-05-01',
+        '2026-05-20',
+        undefined,
+        'cc-1',
+      ],
+    },
+    {
+      path: '/v2/metrics/by-feature',
+      reader: 'getByFeature',
+      expectedArgs: [
+        'enterprise',
+        'ent-1',
+        '2026-05-01',
+        '2026-05-20',
+        undefined,
+        'cc-1',
+      ],
+    },
+    {
+      path: '/v2/metrics/by-ide',
+      reader: 'getByIde',
+      expectedArgs: [
+        'enterprise',
+        'ent-1',
+        '2026-05-01',
+        '2026-05-20',
+        undefined,
+        'cc-1',
+      ],
+    },
+    {
+      path: '/v2/metrics/by-language',
+      reader: 'getByLanguageFeature',
+      expectedArgs: [
+        'enterprise',
+        'ent-1',
+        '2026-05-01',
+        '2026-05-20',
+        undefined,
+        undefined,
+        'cc-1',
+      ],
+    },
+    {
+      path: '/v2/metrics/by-model-feature',
+      reader: 'getByModelFeature',
+      expectedArgs: [
+        'enterprise',
+        'ent-1',
+        '2026-05-01',
+        '2026-05-20',
+        undefined,
+        'cc-1',
+      ],
+    },
+    {
+      path: '/v2/metrics/by-language-model',
+      reader: 'getByLanguageModel',
+      expectedArgs: [
+        'enterprise',
+        'ent-1',
+        '2026-05-01',
+        '2026-05-20',
+        undefined,
+        'cc-1',
+      ],
+    },
+    {
+      path: '/v2/dashboard',
+      reader: 'getDashboardData',
+      expectedArgs: [
+        'enterprise',
+        'ent-1',
+        '2026-05-01',
+        '2026-05-20',
+        undefined,
+        'cc-1',
+      ],
+    },
+  ];
+
   it('GET /v2/metrics/daily returns daily totals', async () => {
     mockDbV2.getDailyTotals.mockResolvedValue([
       { day: '2026-05-20', metrics_type: 'enterprise', entity_id: 'ent-1' },
@@ -157,7 +267,9 @@ describe('router v2 endpoints', () => {
       '2026-05-01',
       '2026-05-20',
       undefined,
+      undefined,
     );
+    expect(mockDbV2.getCostCenters).not.toHaveBeenCalled();
   });
 
   it('GET /v2/metrics/pull-requests returns PR metrics', async () => {
@@ -226,6 +338,381 @@ describe('router v2 endpoints', () => {
 
     expect(response.status).toBe(200);
     expect(response.body).toEqual(['platform', 'core']);
+  });
+
+  it('GET /v2/cost-centers returns eligible enterprise cost centers', async () => {
+    mockDbV2.getCostCenters.mockResolvedValue([
+      { id: 'cc-1', name: 'Platform' },
+      { id: '__none__', name: null },
+    ]);
+
+    const app = await createTestApp();
+    const response = await request(app).get(
+      '/v2/cost-centers?type=enterprise&entityId=ent-1&from=2026-05-01&to=2026-05-20',
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual([
+      { id: 'cc-1', name: 'Platform' },
+      { id: '__none__', name: null },
+    ]);
+    expect(mockDbV2.getCostCenters).toHaveBeenCalledWith(
+      'enterprise',
+      'ent-1',
+      '2026-05-01',
+      '2026-05-20',
+    );
+  });
+
+  it('GET /v2/cost-centers returns an empty list when organization scope is not enabled', async () => {
+    const app = await createTestApp();
+    const response = await request(app).get(
+      '/v2/cost-centers?type=organization&entityId=org-1&from=2026-05-01&to=2026-05-20',
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual([]);
+    expect(mockDbV2.getCostCenters).not.toHaveBeenCalled();
+  });
+
+  it('GET /v2/cost-centers lists eligible centers for a configured organization scope', async () => {
+    mockDbV2.getCostCenters.mockResolvedValue([
+      { id: 'cc-1', name: 'Platform' },
+      { id: '__none__', name: null },
+    ]);
+    const app = await createTestApp({
+      config: mockServices.rootConfig({
+        data: {
+          copilot: {
+            enterprise: 'ent-1',
+            organization: 'org-1',
+            ingestCostCenters: true,
+          },
+        },
+      }),
+    });
+    const response = await request(app).get(
+      '/v2/cost-centers?type=organization&entityId=org-1&from=2026-05-01&to=2026-05-20',
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual([
+      { id: 'cc-1', name: 'Platform' },
+      { id: '__none__', name: null },
+    ]);
+    expect(mockDbV2.getCostCenters).toHaveBeenCalledWith(
+      'organization',
+      'org-1',
+      '2026-05-01',
+      '2026-05-20',
+    );
+  });
+
+  it('GET /v2/cost-centers returns an empty list when no cost centers are eligible', async () => {
+    const app = await createTestApp();
+    const response = await request(app).get(
+      '/v2/cost-centers?type=enterprise&entityId=ent-1',
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual([]);
+  });
+
+  it('GET /v2/teams filters to an eligible cost-center intersection', async () => {
+    mockDbV2.getCostCenters.mockResolvedValue([
+      { id: 'cc-1', name: 'Platform' },
+    ]);
+    mockDbV2.getTeams.mockResolvedValue(['platform']);
+
+    const app = await createTestApp();
+    const response = await request(app).get(
+      '/v2/teams?type=enterprise&entityId=ent-1&from=2026-05-01&to=2026-05-20&costCenter=cc-1',
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual(['platform']);
+    expect(mockDbV2.getCostCenters).toHaveBeenCalledWith(
+      'enterprise',
+      'ent-1',
+      '2026-05-01',
+      '2026-05-20',
+    );
+    expect(mockDbV2.getTeams).toHaveBeenCalledWith(
+      'enterprise',
+      'ent-1',
+      '2026-05-01',
+      '2026-05-20',
+      undefined,
+      'cc-1',
+    );
+  });
+
+  it('GET /v2/teams cascades organization teams from the selected cost center', async () => {
+    mockDbV2.getCostCenters.mockResolvedValue([
+      { id: 'cc-1', name: 'Platform' },
+    ]);
+    mockDbV2.getTeams.mockResolvedValue(['org-team']);
+    const app = await createTestApp({
+      config: mockServices.rootConfig({
+        data: {
+          copilot: {
+            enterprise: 'ent-1',
+            organization: 'org-1',
+            ingestCostCenters: true,
+          },
+        },
+      }),
+    });
+    const response = await request(app).get(
+      '/v2/teams?type=organization&entityId=org-1&from=2026-05-01&to=2026-05-20&costCenter=cc-1',
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual(['org-team']);
+    expect(mockDbV2.getCostCenters).toHaveBeenCalledWith(
+      'organization',
+      'org-1',
+      '2026-05-01',
+      '2026-05-20',
+    );
+    expect(mockDbV2.getTeams).toHaveBeenCalledWith(
+      'organization',
+      'org-1',
+      '2026-05-01',
+      '2026-05-20',
+      undefined,
+      'cc-1',
+    );
+  });
+
+  it('GET /v2/dashboard accepts an eligible cost center for a configured organization', async () => {
+    mockDbV2.getCostCenters.mockResolvedValue([
+      { id: 'cc-1', name: 'Platform' },
+    ]);
+    const app = await createTestApp({
+      config: mockServices.rootConfig({
+        data: {
+          copilot: {
+            enterprise: 'ent-1',
+            organization: 'org-1',
+            ingestCostCenters: true,
+          },
+        },
+      }),
+    });
+    const response = await request(app).get(
+      '/v2/dashboard?type=organization&entityId=org-1&from=2026-05-01&to=2026-05-20&costCenter=cc-1',
+    );
+
+    expect(response.status).toBe(200);
+    expect(mockDbV2.getDashboardData).toHaveBeenCalledWith(
+      'organization',
+      'org-1',
+      '2026-05-01',
+      '2026-05-20',
+      undefined,
+      'cc-1',
+    );
+  });
+
+  it.each(costCenterMetricRoutes)(
+    '$path rejects an ineligible cost center before reading metrics',
+    async ({ path, reader }) => {
+      mockDbV2.getCostCenters.mockResolvedValueOnce([]);
+
+      const app = await createTestApp();
+      const response = await request(app).get(
+        `${path}?type=enterprise&entityId=ent-1&from=2026-05-01&to=2026-05-20&costCenter=cc-hidden`,
+      );
+
+      expect(response.status).toBe(400);
+      expect(response.body).toEqual({
+        error:
+          'Cost center is not eligible for the requested scope and date range',
+      });
+      expect(mockDbV2.getCostCenters).toHaveBeenCalledWith(
+        'enterprise',
+        'ent-1',
+        '2026-05-01',
+        '2026-05-20',
+      );
+      expect(mockDbV2[reader]).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(costCenterMetricRoutes)(
+    '$path rejects cost centers for organization scope',
+    async ({ path, reader }) => {
+      const app = await createTestApp();
+      const response = await request(app).get(
+        `${path}?type=organization&entityId=org-1&from=2026-05-01&to=2026-05-20&costCenter=cc-1`,
+      );
+
+      expect(response.status).toBe(400);
+      expect(response.body).toEqual({
+        error: 'Cost centers are only supported for enterprise scope',
+      });
+      expect(mockDbV2.getCostCenters).not.toHaveBeenCalled();
+      expect(mockDbV2[reader]).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(costCenterMetricRoutes)(
+    '$path reads metrics for an eligible cost center',
+    async ({ path, reader, expectedArgs }) => {
+      mockDbV2.getCostCenters.mockResolvedValueOnce([
+        { id: 'cc-1', name: 'Platform' },
+      ]);
+
+      const app = await createTestApp();
+      const response = await request(app).get(
+        `${path}?type=enterprise&entityId=ent-1&from=2026-05-01&to=2026-05-20&costCenter=cc-1`,
+      );
+
+      expect(response.status).toBe(200);
+      expect(mockDbV2[reader]).toHaveBeenCalledWith(...expectedArgs);
+    },
+  );
+
+  it('GET /v2/metrics/daily accepts an eligible team and rejects an ineligible pair', async () => {
+    mockDbV2.getCostCenters.mockResolvedValue([
+      { id: 'cc-1', name: 'Platform' },
+    ]);
+    mockDbV2.getTeams
+      .mockResolvedValueOnce(['platform'])
+      .mockResolvedValueOnce([]);
+
+    const app = await createTestApp();
+    const eligibleResponse = await request(app).get(
+      '/v2/metrics/daily?type=enterprise&entityId=ent-1&from=2026-05-01&to=2026-05-20&team=platform&costCenter=cc-1',
+    );
+    const ineligibleResponse = await request(app).get(
+      '/v2/metrics/daily?type=enterprise&entityId=ent-1&from=2026-05-01&to=2026-05-20&team=private&costCenter=cc-1',
+    );
+
+    expect(eligibleResponse.status).toBe(200);
+    expect(ineligibleResponse.status).toBe(400);
+    expect(mockDbV2.getTeams).toHaveBeenNthCalledWith(
+      1,
+      'enterprise',
+      'ent-1',
+      '2026-05-01',
+      '2026-05-20',
+      undefined,
+      'cc-1',
+    );
+    expect(mockDbV2.getTeams).toHaveBeenNthCalledWith(
+      2,
+      'enterprise',
+      'ent-1',
+      '2026-05-01',
+      '2026-05-20',
+      undefined,
+      'cc-1',
+    );
+    expect(mockDbV2.getDailyTotals).toHaveBeenCalledTimes(1);
+    expect(mockDbV2.getDailyTotals).toHaveBeenCalledWith(
+      'enterprise',
+      'ent-1',
+      '2026-05-01',
+      '2026-05-20',
+      'platform',
+      'cc-1',
+    );
+  });
+
+  it('rejects a cost-center filter for organization scope', async () => {
+    const app = await createTestApp({
+      config: mockServices.rootConfig({
+        data: {
+          copilot: {
+            organization: 'org-1',
+            ingestCostCenters: true,
+          },
+        },
+      }),
+    });
+    const response = await request(app).get(
+      '/v2/teams?type=organization&entityId=org-1&costCenter=cc-1',
+    );
+
+    expect(response.status).toBe(400);
+    expect(mockDbV2.getCostCenters).not.toHaveBeenCalled();
+    expect(mockDbV2.getTeams).not.toHaveBeenCalled();
+  });
+
+  it.each(['', 'x'.repeat(256)])(
+    'rejects an invalid costCenter query value',
+    async costCenter => {
+      const app = await createTestApp();
+      const response = await request(app).get(
+        `/v2/teams?type=enterprise&entityId=ent-1&costCenter=${costCenter}`,
+      );
+
+      expect(response.status).toBe(400);
+      expect(mockDbV2.getCostCenters).not.toHaveBeenCalled();
+      expect(mockDbV2.getTeams).not.toHaveBeenCalled();
+    },
+  );
+
+  it('rejects repeated costCenter query parameters', async () => {
+    const app = await createTestApp();
+    const response = await request(app).get(
+      '/v2/teams?type=enterprise&entityId=ent-1&costCenter=cc-a&costCenter=cc-b',
+    );
+
+    expect(response.status).toBe(400);
+    expect(mockDbV2.getCostCenters).not.toHaveBeenCalled();
+    expect(mockDbV2.getTeams).not.toHaveBeenCalled();
+  });
+
+  it('uses an unbounded range for cost-center and team eligibility when dates are omitted', async () => {
+    mockDbV2.getCostCenters.mockResolvedValueOnce([
+      { id: 'cc-1', name: 'Platform' },
+    ]);
+    mockDbV2.getTeams.mockResolvedValue(['platform']);
+
+    const app = await createTestApp();
+    const response = await request(app).get(
+      '/v2/teams?type=enterprise&entityId=ent-1&costCenter=cc-1',
+    );
+
+    expect(response.status).toBe(200);
+    expect(mockDbV2.getCostCenters).toHaveBeenCalledWith(
+      'enterprise',
+      'ent-1',
+      undefined,
+      undefined,
+    );
+    expect(mockDbV2.getTeams).toHaveBeenCalledWith(
+      'enterprise',
+      'ent-1',
+      undefined,
+      undefined,
+      undefined,
+      'cc-1',
+    );
+  });
+
+  it('accepts an eligible unassigned sentinel and passes it to the metrics reader', async () => {
+    mockDbV2.getCostCenters.mockResolvedValueOnce([
+      { id: '__none__', name: null },
+    ]);
+
+    const app = await createTestApp();
+    const response = await request(app).get(
+      '/v2/metrics/daily?type=enterprise&entityId=ent-1&from=2026-05-01&to=2026-05-20&costCenter=__none__',
+    );
+
+    expect(response.status).toBe(200);
+    expect(mockDbV2.getDailyTotals).toHaveBeenCalledWith(
+      'enterprise',
+      'ent-1',
+      '2026-05-01',
+      '2026-05-20',
+      undefined,
+      '__none__',
+    );
   });
 
   it('GET /v2/metrics/period-range returns period range', async () => {
@@ -385,6 +872,7 @@ describe('router v2 endpoints', () => {
       '2026-05-01',
       '2026-05-20',
       undefined,
+      undefined,
     );
   });
 
@@ -401,6 +889,7 @@ describe('router v2 endpoints', () => {
       '2026-05-01',
       '2026-05-20',
       'my-team',
+      undefined,
     );
   });
 
