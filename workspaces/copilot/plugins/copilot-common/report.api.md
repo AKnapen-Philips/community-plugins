@@ -184,6 +184,9 @@ export type MetricsScope = 'enterprise' | 'organization';
 // @public
 export type MetricsType = MetricsScope;
 
+// @public (undocumented)
+export const NO_COST_CENTER_ID = '__none__';
+
 // @public
 export interface PeriodRange {
   maxDate: string;
@@ -258,11 +261,37 @@ export interface V2CliTotals {
 }
 
 // @public (undocumented)
+export interface V2CostCenterOption {
+  // (undocumented)
+  id: string;
+  // (undocumented)
+  name: string | null;
+}
+
+// @public (undocumented)
+export interface V2CostCenterRow {
+  // (undocumented)
+  cost_center_id: string;
+  // (undocumented)
+  entity_id: string;
+  // (undocumented)
+  id?: number;
+  // (undocumented)
+  metrics_type: MetricsScope;
+  // (undocumented)
+  name: string;
+  // (undocumented)
+  updated_at?: string | Date;
+}
+
+// @public (undocumented)
 export interface V2DailyTotal {
   // (undocumented)
   code_acceptance_activity_count: number;
   // (undocumented)
   code_generation_activity_count: number;
+  // (undocumented)
+  cost_center_id?: string;
   // (undocumented)
   daily_active_cli_users?: number;
   // (undocumented)
@@ -398,6 +427,8 @@ export interface V2MetricsByCliRow {
   // (undocumented)
   avg_tokens_per_request: number;
   // (undocumented)
+  cost_center_id?: string;
+  // (undocumented)
   day: string;
   // (undocumented)
   entity_id: string;
@@ -445,6 +476,8 @@ export interface V2MetricsByFeatureRow {
   code_acceptance_activity_count: number;
   // (undocumented)
   code_generation_activity_count: number;
+  // (undocumented)
+  cost_center_id?: string;
   // (undocumented)
   day: string;
   // (undocumented)
@@ -496,6 +529,8 @@ export interface V2MetricsByIdeRow {
   // (undocumented)
   code_generation_activity_count: number;
   // (undocumented)
+  cost_center_id?: string;
+  // (undocumented)
   day: string;
   // (undocumented)
   entity_id: string;
@@ -546,6 +581,8 @@ export interface V2MetricsByLanguageFeatureRow {
   // (undocumented)
   code_generation_activity_count: number;
   // (undocumented)
+  cost_center_id?: string;
+  // (undocumented)
   day: string;
   // (undocumented)
   entity_id: string;
@@ -575,6 +612,8 @@ export interface V2MetricsByLanguageModelRow {
   code_acceptance_activity_count: number;
   // (undocumented)
   code_generation_activity_count: number;
+  // (undocumented)
+  cost_center_id?: string;
   // (undocumented)
   day: string;
   // (undocumented)
@@ -608,6 +647,8 @@ export interface V2MetricsByModelFeatureRow {
   // (undocumented)
   code_generation_activity_count: number;
   // (undocumented)
+  cost_center_id?: string;
+  // (undocumented)
   day: string;
   // (undocumented)
   entity_id: string;
@@ -635,6 +676,8 @@ export interface V2MetricsByModelFeatureRow {
 
 // @public
 export interface V2MetricsByVscodeAgentRow {
+  // (undocumented)
+  cost_center_id?: string;
   // (undocumented)
   day: string;
   // (undocumented)
@@ -695,6 +738,8 @@ export interface V2PrMetrics {
 // @public (undocumented)
 export interface V2PrMetricsRow {
   // (undocumented)
+  cost_center_id?: string;
+  // (undocumented)
   day: string;
   // (undocumented)
   entity_id: string;
@@ -732,6 +777,24 @@ export interface V2PrMetricsRow {
   total_reviewed_by_copilot: number;
   // (undocumented)
   total_suggestions: number;
+}
+
+// @public (undocumented)
+export interface V2UserCostCenterRow {
+  // (undocumented)
+  cost_center_id: string;
+  // (undocumented)
+  day: string;
+  // (undocumented)
+  entity_id: string;
+  // (undocumented)
+  id?: number;
+  // (undocumented)
+  metrics_type: MetricsScope;
+  // (undocumented)
+  user_id: number;
+  // (undocumented)
+  user_login: string;
 }
 
 // @public

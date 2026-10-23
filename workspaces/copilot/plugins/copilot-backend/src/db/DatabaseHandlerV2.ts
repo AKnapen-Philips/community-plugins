@@ -16,6 +16,7 @@
 import { DatabaseService } from '@backstage/backend-plugin-api';
 import {
   PeriodRange,
+  V2CostCenterRow,
   V2DailyTotal,
   V2DashboardData,
   V2IngestionLogRow,
@@ -29,6 +30,7 @@ import {
   V2PrMetricsRow,
   V2UserDashboardData,
   V2UserMetricRow,
+  V2UserCostCenterRow,
   V2UserMetricsByFeatureRow,
   V2UserMetricsByIdeRow,
   V2UserMetricsByLanguageFeatureRow,
@@ -36,11 +38,13 @@ import {
   V2UserMetricsByLanguageModelRow,
   V2UserTeamRow,
   MetricsScope,
+  NO_COST_CENTER_ID,
 } from '@backstage-community/plugin-copilot-common';
 import { DateTime } from 'luxon';
 import { Knex } from 'knex';
 import { migrationsDir } from './DatabaseHandler';
 import { batchInsertInChunks } from '../utils/batchInsert';
+import { UserBreakdownData } from '../utils/reportParser';
 
 type Options = {
   database: DatabaseService;
@@ -54,6 +58,34 @@ type TeamActivityRow = {
   used_agent: boolean | number | null;
   used_chat: boolean | number | null;
 };
+
+type CostCenterScopedRow = {
+  cost_center_id?: string;
+};
+
+export type CostCenterAggregateRows = {
+  dailyTotals: V2DailyTotal[];
+  prMetrics: V2PrMetricsRow[];
+  byFeature: V2MetricsByFeatureRow[];
+  byIde: V2MetricsByIdeRow[];
+  byLanguageFeature: V2MetricsByLanguageFeatureRow[];
+  byModelFeature: V2MetricsByModelFeatureRow[];
+  byLanguageModel: V2MetricsByLanguageModelRow[];
+  byCli: V2MetricsByCliRow[];
+  byVscodeAgent: V2MetricsByVscodeAgentRow[];
+};
+
+const costCenterAggregateTables = [
+  'copilot_daily_totals',
+  'copilot_pr_metrics',
+  'copilot_metrics_by_feature',
+  'copilot_metrics_by_ide',
+  'copilot_metrics_by_language_feature',
+  'copilot_metrics_by_model_feature',
+  'copilot_metrics_by_language_model',
+  'copilot_metrics_by_cli',
+  'copilot_metrics_by_vscode_agent',
+] as const;
 
 export class DatabaseHandlerV2 {
   static async create(options: Options): Promise<DatabaseHandlerV2> {
@@ -69,21 +101,40 @@ export class DatabaseHandlerV2 {
 
   private constructor(private readonly db: Knex) {}
 
+  private withDefaultCostCenter<T extends CostCenterScopedRow>(
+    rows: T[],
+  ): Array<T & { cost_center_id: string }> {
+    return rows.map(row => ({
+      ...row,
+      cost_center_id: row.cost_center_id ?? '',
+    }));
+  }
+
   async insertDailyTotals(rows: V2DailyTotal[]): Promise<void> {
     if (!rows.length) {
       return;
     }
 
-    await batchInsertInChunks(rows, 100, async chunk => {
-      await this.db<V2DailyTotal>('copilot_daily_totals')
-        .insert(chunk)
-        // Merge `total_ai_credits_used`/`daily_active_vscode_agent_users` on
-        // conflict (rather than ignoring) so that re-ingesting a day that
-        // was already stored before these columns existed backfills the new
-        // metrics in place.
-        .onConflict(['day', 'metrics_type', 'entity_id', 'team_slug'])
-        .merge(['total_ai_credits_used', 'daily_active_vscode_agent_users']);
-    });
+    await batchInsertInChunks(
+      this.withDefaultCostCenter(rows),
+      100,
+      async chunk => {
+        await this.db<V2DailyTotal>('copilot_daily_totals')
+          .insert(chunk)
+          // Merge `total_ai_credits_used`/`daily_active_vscode_agent_users` on
+          // conflict (rather than ignoring) so that re-ingesting a day that
+          // was already stored before these columns existed backfills the new
+          // metrics in place.
+          .onConflict([
+            'day',
+            'metrics_type',
+            'entity_id',
+            'team_slug',
+            'cost_center_id',
+          ])
+          .merge(['total_ai_credits_used', 'daily_active_vscode_agent_users']);
+      },
+    );
   }
 
   async insertPrMetrics(rows: V2PrMetricsRow[]): Promise<void> {
@@ -91,12 +142,22 @@ export class DatabaseHandlerV2 {
       return;
     }
 
-    await batchInsertInChunks(rows, 100, async chunk => {
-      await this.db<V2PrMetricsRow>('copilot_pr_metrics')
-        .insert(chunk)
-        .onConflict(['day', 'metrics_type', 'entity_id', 'team_slug'])
-        .ignore();
-    });
+    await batchInsertInChunks(
+      this.withDefaultCostCenter(rows),
+      100,
+      async chunk => {
+        await this.db<V2PrMetricsRow>('copilot_pr_metrics')
+          .insert(chunk)
+          .onConflict([
+            'day',
+            'metrics_type',
+            'entity_id',
+            'team_slug',
+            'cost_center_id',
+          ])
+          .ignore();
+      },
+    );
   }
 
   async insertByFeature(rows: V2MetricsByFeatureRow[]): Promise<void> {
@@ -104,18 +165,23 @@ export class DatabaseHandlerV2 {
       return;
     }
 
-    await batchInsertInChunks(rows, 100, async chunk => {
-      await this.db<V2MetricsByFeatureRow>('copilot_metrics_by_feature')
-        .insert(chunk)
-        .onConflict([
-          'day',
-          'metrics_type',
-          'entity_id',
-          'team_slug',
-          'feature',
-        ])
-        .ignore();
-    });
+    await batchInsertInChunks(
+      this.withDefaultCostCenter(rows),
+      100,
+      async chunk => {
+        await this.db<V2MetricsByFeatureRow>('copilot_metrics_by_feature')
+          .insert(chunk)
+          .onConflict([
+            'day',
+            'metrics_type',
+            'entity_id',
+            'team_slug',
+            'cost_center_id',
+            'feature',
+          ])
+          .ignore();
+      },
+    );
   }
 
   async insertByIde(rows: V2MetricsByIdeRow[]): Promise<void> {
@@ -123,12 +189,23 @@ export class DatabaseHandlerV2 {
       return;
     }
 
-    await batchInsertInChunks(rows, 100, async chunk => {
-      await this.db<V2MetricsByIdeRow>('copilot_metrics_by_ide')
-        .insert(chunk)
-        .onConflict(['day', 'metrics_type', 'entity_id', 'team_slug', 'ide'])
-        .ignore();
-    });
+    await batchInsertInChunks(
+      this.withDefaultCostCenter(rows),
+      100,
+      async chunk => {
+        await this.db<V2MetricsByIdeRow>('copilot_metrics_by_ide')
+          .insert(chunk)
+          .onConflict([
+            'day',
+            'metrics_type',
+            'entity_id',
+            'team_slug',
+            'cost_center_id',
+            'ide',
+          ])
+          .ignore();
+      },
+    );
   }
 
   async insertByLanguageFeature(
@@ -138,101 +215,136 @@ export class DatabaseHandlerV2 {
       return;
     }
 
-    await batchInsertInChunks(rows, 100, async chunk => {
-      await this.db<V2MetricsByLanguageFeatureRow>(
-        'copilot_metrics_by_language_feature',
-      )
-        .insert(chunk)
-        .onConflict([
-          'day',
-          'metrics_type',
-          'entity_id',
-          'team_slug',
-          'language',
-          'feature',
-        ])
-        .ignore();
-    });
+    await batchInsertInChunks(
+      this.withDefaultCostCenter(rows),
+      100,
+      async chunk => {
+        await this.db<V2MetricsByLanguageFeatureRow>(
+          'copilot_metrics_by_language_feature',
+        )
+          .insert(chunk)
+          .onConflict([
+            'day',
+            'metrics_type',
+            'entity_id',
+            'team_slug',
+            'cost_center_id',
+            'language',
+            'feature',
+          ])
+          .ignore();
+      },
+    );
   }
 
   async insertByModelFeature(
     rows: V2MetricsByModelFeatureRow[],
   ): Promise<void> {
     if (!rows.length) return;
-    await batchInsertInChunks(rows, 100, async chunk => {
-      await this.db<V2MetricsByModelFeatureRow>(
-        'copilot_metrics_by_model_feature',
-      )
-        .insert(chunk)
-        .onConflict([
-          'day',
-          'metrics_type',
-          'entity_id',
-          'team_slug',
-          'model_id',
-          'feature',
-        ])
-        .ignore();
-    });
+    await batchInsertInChunks(
+      this.withDefaultCostCenter(rows),
+      100,
+      async chunk => {
+        await this.db<V2MetricsByModelFeatureRow>(
+          'copilot_metrics_by_model_feature',
+        )
+          .insert(chunk)
+          .onConflict([
+            'day',
+            'metrics_type',
+            'entity_id',
+            'team_slug',
+            'cost_center_id',
+            'model_id',
+            'feature',
+          ])
+          .ignore();
+      },
+    );
   }
 
   async insertByLanguageModel(
     rows: V2MetricsByLanguageModelRow[],
   ): Promise<void> {
     if (!rows.length) return;
-    await batchInsertInChunks(rows, 100, async chunk => {
-      await this.db<V2MetricsByLanguageModelRow>(
-        'copilot_metrics_by_language_model',
-      )
-        .insert(chunk)
-        .onConflict([
-          'day',
-          'metrics_type',
-          'entity_id',
-          'team_slug',
-          'language',
-          'model_id',
-        ])
-        .ignore();
-    });
+    await batchInsertInChunks(
+      this.withDefaultCostCenter(rows),
+      100,
+      async chunk => {
+        await this.db<V2MetricsByLanguageModelRow>(
+          'copilot_metrics_by_language_model',
+        )
+          .insert(chunk)
+          .onConflict([
+            'day',
+            'metrics_type',
+            'entity_id',
+            'team_slug',
+            'cost_center_id',
+            'language',
+            'model_id',
+          ])
+          .ignore();
+      },
+    );
   }
 
   async insertByCli(rows: V2MetricsByCliRow[]): Promise<void> {
     if (!rows.length) return;
-    await batchInsertInChunks(rows, 100, async chunk => {
-      await this.db<V2MetricsByCliRow>('copilot_metrics_by_cli')
-        .insert(chunk)
-        .onConflict(['day', 'metrics_type', 'entity_id', 'team_slug'])
-        // Merge (rather than ignore) on conflict so that re-ingesting a day
-        // updates any stale/zeroed row already stored for that key — e.g.
-        // rows written before the `output_tokens_sum`/`prompt_tokens_sum`
-        // columns were widened to `bigint` (see
-        // 202608240000_widen_cli_token_sum_columns.js), which would
-        // otherwise be silently skipped forever by `.ignore()`.
-        .merge([
-          'prompt_count',
-          'request_count',
-          'session_count',
-          'avg_tokens_per_request',
-          'output_tokens_sum',
-          'prompt_tokens_sum',
-        ]);
-    });
+    await batchInsertInChunks(
+      this.withDefaultCostCenter(rows),
+      100,
+      async chunk => {
+        await this.db<V2MetricsByCliRow>('copilot_metrics_by_cli')
+          .insert(chunk)
+          .onConflict([
+            'day',
+            'metrics_type',
+            'entity_id',
+            'team_slug',
+            'cost_center_id',
+          ])
+          // Merge (rather than ignore) on conflict so that re-ingesting a day
+          // updates any stale/zeroed row already stored for that key — e.g.
+          // rows written before the `output_tokens_sum`/`prompt_tokens_sum`
+          // columns were widened to `bigint` (see
+          // 202608240000_widen_cli_token_sum_columns.js), which would
+          // otherwise be silently skipped forever by `.ignore()`.
+          .merge([
+            'prompt_count',
+            'request_count',
+            'session_count',
+            'avg_tokens_per_request',
+            'output_tokens_sum',
+            'prompt_tokens_sum',
+          ]);
+      },
+    );
   }
 
   async insertByVscodeAgent(rows: V2MetricsByVscodeAgentRow[]): Promise<void> {
     if (!rows.length) return;
-    await batchInsertInChunks(rows, 100, async chunk => {
-      await this.db<V2MetricsByVscodeAgentRow>(
-        'copilot_metrics_by_vscode_agent',
-      )
-        .insert(chunk)
-        .onConflict(['day', 'metrics_type', 'entity_id', 'team_slug'])
-        // Merge (rather than ignore) on conflict so that re-ingesting a day
-        // updates any stale/zeroed row already stored for that key, mirroring
-        // insertByCli above.
-        .merge(['session_count', 'total_user_messages']);
-    });
+    await batchInsertInChunks(
+      this.withDefaultCostCenter(rows),
+      100,
+      async chunk => {
+        await this.db<V2MetricsByVscodeAgentRow>(
+          'copilot_metrics_by_vscode_agent',
+        )
+          .insert(chunk)
+          .onConflict([
+            'day',
+            'metrics_type',
+            'entity_id',
+            'team_slug',
+            'cost_center_id',
+          ])
+          // Merge (rather than ignore) on conflict so that re-ingesting a day
+          // updates any stale/zeroed row already stored for that key, mirroring
+          // insertByCli above.
+          .merge(['session_count', 'total_user_messages']);
+      },
+    );
   }
 
   async insertUserMetrics(rows: V2UserMetricRow[]): Promise<void> {
@@ -261,6 +373,159 @@ export class DatabaseHandlerV2 {
         .insert(chunk)
         .onConflict(['day', 'metrics_type', 'entity_id', 'user_id', 'team_id'])
         .ignore();
+    });
+  }
+
+  async upsertCostCenters(rows: V2CostCenterRow[]): Promise<void> {
+    if (!rows.length) {
+      return;
+    }
+
+    const updatedAt = new Date();
+    const rowsWithUpdatedAt = rows.map(row => ({
+      ...row,
+      updated_at: updatedAt,
+    }));
+
+    await batchInsertInChunks(rowsWithUpdatedAt, 100, async chunk => {
+      await this.db<V2CostCenterRow>('copilot_cost_centers')
+        .insert(chunk)
+        .onConflict(['metrics_type', 'entity_id', 'cost_center_id'])
+        .merge(['name', 'updated_at']);
+    });
+  }
+
+  async upsertUserCostCenters(rows: V2UserCostCenterRow[]): Promise<void> {
+    if (!rows.length) {
+      return;
+    }
+
+    await batchInsertInChunks(rows, 100, async chunk => {
+      await this.db<V2UserCostCenterRow>('copilot_user_cost_centers')
+        .insert(chunk)
+        .onConflict(['day', 'metrics_type', 'entity_id', 'user_id'])
+        .merge(['user_login', 'cost_center_id']);
+    });
+  }
+
+  /**
+   * Replaces all cost-center-derived state for a day atomically.
+   */
+  async replaceCostCenterAggregates(
+    day: string,
+    metricsType: MetricsScope,
+    entityId: string,
+    userCostCenters: V2UserCostCenterRow[],
+    aggregates: CostCenterAggregateRows,
+  ): Promise<void> {
+    const aggregateRows = [
+      ...aggregates.dailyTotals,
+      ...aggregates.prMetrics,
+      ...aggregates.byFeature,
+      ...aggregates.byIde,
+      ...aggregates.byLanguageFeature,
+      ...aggregates.byModelFeature,
+      ...aggregates.byLanguageModel,
+      ...aggregates.byCli,
+      ...aggregates.byVscodeAgent,
+    ];
+    const rowsWithCostCenter = aggregateRows.map(row => ({
+      ...row,
+      cost_center_id: row.cost_center_id ?? '',
+    }));
+
+    if (
+      userCostCenters.some(
+        row =>
+          row.day !== day ||
+          row.metrics_type !== metricsType ||
+          row.entity_id !== entityId,
+      ) ||
+      rowsWithCostCenter.some(
+        row =>
+          row.day !== day ||
+          row.metrics_type !== metricsType ||
+          row.entity_id !== entityId ||
+          row.cost_center_id === '',
+      )
+    ) {
+      throw new Error(
+        'Cost-center replacement rows must match the requested day and scope and include a cost-center ID.',
+      );
+    }
+
+    await this.db.transaction(async transaction => {
+      await transaction('copilot_user_cost_centers')
+        .where({ day, metrics_type: metricsType, entity_id: entityId })
+        .del();
+
+      await batchInsertInChunks(userCostCenters, 100, async chunk => {
+        await transaction<V2UserCostCenterRow>(
+          'copilot_user_cost_centers',
+        ).insert(chunk);
+      });
+
+      for (const tableName of costCenterAggregateTables) {
+        await transaction(tableName)
+          .where({ day, metrics_type: metricsType, entity_id: entityId })
+          .whereNot('cost_center_id', '')
+          .del();
+      }
+
+      const insertCostCenterRows = async <T extends CostCenterScopedRow>(
+        tableName: string,
+        rows: T[],
+      ): Promise<void> => {
+        if (!rows.length) {
+          return;
+        }
+
+        await batchInsertInChunks(
+          this.withDefaultCostCenter(rows),
+          100,
+          async chunk => {
+            await transaction(tableName).insert(chunk);
+          },
+        );
+      };
+
+      await insertCostCenterRows(
+        'copilot_daily_totals',
+        aggregates.dailyTotals,
+      );
+      await insertCostCenterRows('copilot_pr_metrics', aggregates.prMetrics);
+      await insertCostCenterRows(
+        'copilot_metrics_by_feature',
+        aggregates.byFeature,
+      );
+      await insertCostCenterRows('copilot_metrics_by_ide', aggregates.byIde);
+      await insertCostCenterRows(
+        'copilot_metrics_by_language_feature',
+        aggregates.byLanguageFeature,
+      );
+      await insertCostCenterRows(
+        'copilot_metrics_by_model_feature',
+        aggregates.byModelFeature,
+      );
+      await insertCostCenterRows(
+        'copilot_metrics_by_language_model',
+        aggregates.byLanguageModel,
+      );
+      await insertCostCenterRows('copilot_metrics_by_cli', aggregates.byCli);
+      await insertCostCenterRows(
+        'copilot_metrics_by_vscode_agent',
+        aggregates.byVscodeAgent,
+      );
+
+      await transaction('copilot_cost_center_aggregation_log')
+        .insert({
+          day,
+          metrics_type: metricsType,
+          entity_id: entityId,
+          aggregated_at: this.db.fn.now(),
+        })
+        .onConflict(['day', 'metrics_type', 'entity_id'])
+        .merge(['aggregated_at']);
     });
   }
 
@@ -438,12 +703,82 @@ export class DatabaseHandlerV2 {
     }));
   }
 
+  async getDaysMissingCostCenterAggregation(
+    metricsType: MetricsScope,
+    entityId: string,
+    from: string,
+    to: string,
+  ): Promise<string[]> {
+    const [metricRows, ingestionRows, completedRows] = await Promise.all([
+      this.db('copilot_user_metrics')
+        .where({ metrics_type: metricsType, entity_id: entityId })
+        .whereBetween('day', [from, to])
+        .distinct('day')
+        .select('day'),
+      this.db('copilot_ingestion_log')
+        .where({ metrics_type: metricsType, entity_id: entityId })
+        .whereBetween('day', [from, to])
+        .select('day', 'components_loaded'),
+      this.db('copilot_cost_center_aggregation_log')
+        .where({ metrics_type: metricsType, entity_id: entityId })
+        .whereBetween('day', [from, to])
+        .select('day'),
+    ]);
+
+    const daysToAggregate = new Set<string>();
+    for (const row of metricRows) {
+      const day = this.normalizeDay(row.day);
+      if (day) {
+        daysToAggregate.add(day);
+      }
+    }
+    for (const row of ingestionRows) {
+      if (!this.hasRequiredComponents(row.components_loaded, ['users'])) {
+        continue;
+      }
+
+      const day = this.normalizeDay(row.day);
+      if (day) {
+        daysToAggregate.add(day);
+      }
+    }
+
+    const completedDays = new Set(
+      completedRows
+        .map(row => this.normalizeDay(row.day))
+        .filter((day): day is string => Boolean(day)),
+    );
+
+    return [...daysToAggregate].filter(day => !completedDays.has(day)).sort();
+  }
+
+  async markCostCenterAggregationDone(
+    day: string,
+    metricsType: MetricsScope,
+    entityId: string,
+  ): Promise<void> {
+    await this.db('copilot_cost_center_aggregation_log')
+      .insert({
+        day,
+        metrics_type: metricsType,
+        entity_id: entityId,
+        aggregated_at: this.db.fn.now(),
+      })
+      .onConflict(['day', 'metrics_type', 'entity_id'])
+      .merge(['aggregated_at']);
+  }
+
+  /**
+   * Callers MUST enforce the minimum-member threshold for team/cost-center
+   * scopes before exposing these results; the router enforces this.
+   */
   async getDailyTotals(
     metricsType: MetricsScope,
     entityId: string,
     from: string,
     to: string,
     teamSlug?: string,
+    costCenter?: string,
   ): Promise<V2DailyTotal[]> {
     const query = this.db<V2DailyTotal>('copilot_daily_totals')
       .where('metrics_type', metricsType)
@@ -451,24 +786,25 @@ export class DatabaseHandlerV2 {
       .whereBetween('day', [from, to]);
 
     query.where('team_slug', teamSlug ?? '');
+    query.where('cost_center_id', costCenter ?? '');
 
     const rows = (await query.orderBy('day', 'asc').select('*')).map(row => ({
       ...row,
       day: this.normalizeRequiredDay(row.day),
     }));
 
-    // Org/enterprise-level rows already carry rolling weekly/monthly active
-    // user counts straight from GitHub's report. Team-level rows are derived
-    // from daily per-user data and have no rolling windows, so we compute them
-    // here from the persisted per-user activity tables.
-    if (teamSlug) {
-      return this.enrichTeamRollingActiveUsers(
+    // Unscoped org/enterprise rows already carry rolling counts from GitHub.
+    // Team and cost-center aggregates are derived from daily per-user data,
+    // so their rolling counts are computed from the membership snapshots.
+    if (teamSlug || costCenter) {
+      return this.enrichScopedRollingActiveUsers(
         rows,
         metricsType,
         entityId,
         from,
         to,
         teamSlug,
+        costCenter,
       );
     }
 
@@ -476,9 +812,8 @@ export class DatabaseHandlerV2 {
   }
 
   /**
-   * Enrich team-level daily totals with rolling weekly/monthly active-user
-   * counts derived from the persisted per-user activity tables
-   * (copilot_user_metrics joined with copilot_user_teams).
+   * Enrich scoped daily totals with rolling weekly/monthly active-user counts
+   * derived from per-user activity and the selected membership snapshots.
    *
    * Definitions follow GitHub's standard rolling windows:
    * - weekly_active_users: distinct active users over the trailing 7 days
@@ -486,16 +821,17 @@ export class DatabaseHandlerV2 {
    * - monthly_active_agent_users / monthly_active_chat_users: distinct users
    *   that used agent/chat over the trailing 28 days
    *
-   * A user is "active" for the team on a given day when they have a per-user
-   * metrics row that day and a team-membership row for the same day.
+   * A user is active for a scope on a day when they have a per-user metrics
+   * row and matching team/cost-center membership rows for that day.
    */
-  private async enrichTeamRollingActiveUsers(
+  private async enrichScopedRollingActiveUsers(
     rows: V2DailyTotal[],
     metricsType: MetricsScope,
     entityId: string,
     from: string,
     to: string,
-    teamSlug: string,
+    teamSlug?: string,
+    costCenter?: string,
   ): Promise<V2DailyTotal[]> {
     if (rows.length === 0) {
       return rows;
@@ -503,12 +839,13 @@ export class DatabaseHandlerV2 {
 
     const WEEKLY_WINDOW_DAYS = 7;
     const MONTHLY_WINDOW_DAYS = 28;
-    const activityRows = await this.loadTeamActivityRows(
+    const activityRows = await this.loadScopedActivityRows(
       metricsType,
       entityId,
       from,
       to,
       teamSlug,
+      costCenter,
       MONTHLY_WINDOW_DAYS,
     );
 
@@ -526,12 +863,13 @@ export class DatabaseHandlerV2 {
     );
   }
 
-  private async loadTeamActivityRows(
+  private async loadScopedActivityRows(
     metricsType: MetricsScope,
     entityId: string,
     from: string,
     to: string,
-    teamSlug: string,
+    teamSlug: string | undefined,
+    costCenter: string | undefined,
     monthlyWindowDays: number,
   ) {
     // Each emitted row's rolling value is anchored at *that row's own day* and
@@ -541,23 +879,45 @@ export class DatabaseHandlerV2 {
       .minus({ days: monthlyWindowDays - 1 })
       .toFormat('yyyy-MM-dd');
 
-    return this.db('copilot_user_metrics as m')
-      .join('copilot_user_teams as t', function joinOn() {
+    const query = this.db('copilot_user_metrics as m');
+
+    if (teamSlug) {
+      query.join('copilot_user_teams as t', function joinTeam() {
         this.on('m.day', '=', 't.day')
           .andOn('m.user_id', '=', 't.user_id')
           .andOn('m.metrics_type', '=', 't.metrics_type')
           .andOn('m.entity_id', '=', 't.entity_id');
-      })
+      });
+    }
+
+    if (costCenter) {
+      query.join('copilot_user_cost_centers as c', function joinCostCenter() {
+        this.on('m.day', '=', 'c.day')
+          .andOn('m.user_id', '=', 'c.user_id')
+          .andOn('m.metrics_type', '=', 'c.metrics_type')
+          .andOn('m.entity_id', '=', 'c.entity_id');
+      });
+    }
+
+    query
       .where('m.metrics_type', metricsType)
       .where('m.entity_id', entityId)
-      .where('t.team_slug', teamSlug)
-      .whereBetween('m.day', [fetchLowerBound, to])
-      .select(
-        'm.day as day',
-        'm.user_id as user_id',
-        'm.used_agent as used_agent',
-        'm.used_chat as used_chat',
-      );
+      .whereBetween('m.day', [fetchLowerBound, to]);
+
+    if (teamSlug) {
+      query.where('t.team_slug', teamSlug);
+    }
+
+    if (costCenter) {
+      query.where('c.cost_center_id', costCenter);
+    }
+
+    return query.select(
+      'm.day as day',
+      'm.user_id as user_id',
+      'm.used_agent as used_agent',
+      'm.used_chat as used_chat',
+    );
   }
 
   private enrichDailyTotalWithRollingUsers(
@@ -666,12 +1026,17 @@ export class DatabaseHandlerV2 {
     byDay.set(day, users);
   }
 
+  /**
+   * Callers MUST enforce the minimum-member threshold for team/cost-center
+   * scopes before exposing these results; the router enforces this.
+   */
   async getPrMetrics(
     metricsType: MetricsScope,
     entityId: string,
     from: string,
     to: string,
     teamSlug?: string,
+    costCenter?: string,
   ): Promise<V2PrMetricsRow[]> {
     const query = this.db<V2PrMetricsRow>('copilot_pr_metrics')
       .where('metrics_type', metricsType)
@@ -679,6 +1044,7 @@ export class DatabaseHandlerV2 {
       .whereBetween('day', [from, to]);
 
     query.where('team_slug', teamSlug ?? '');
+    query.where('cost_center_id', costCenter ?? '');
 
     const rows = await query.orderBy('day', 'asc').select('*');
     return rows.map(row => ({
@@ -687,12 +1053,17 @@ export class DatabaseHandlerV2 {
     }));
   }
 
+  /**
+   * Callers MUST enforce the minimum-member threshold for team/cost-center
+   * scopes before exposing these results; the router enforces this.
+   */
   async getByFeature(
     metricsType: MetricsScope,
     entityId: string,
     from: string,
     to: string,
     teamSlug?: string,
+    costCenter?: string,
   ): Promise<V2MetricsByFeatureRow[]> {
     const query = this.db<V2MetricsByFeatureRow>('copilot_metrics_by_feature')
       .where('metrics_type', metricsType)
@@ -700,6 +1071,7 @@ export class DatabaseHandlerV2 {
       .whereBetween('day', [from, to]);
 
     query.where('team_slug', teamSlug ?? '');
+    query.where('cost_center_id', costCenter ?? '');
 
     const rows = await query.orderBy('day', 'asc').select('*');
     return rows.map(row => ({
@@ -708,12 +1080,17 @@ export class DatabaseHandlerV2 {
     }));
   }
 
+  /**
+   * Callers MUST enforce the minimum-member threshold for team/cost-center
+   * scopes before exposing these results; the router enforces this.
+   */
   async getByIde(
     metricsType: MetricsScope,
     entityId: string,
     from: string,
     to: string,
     teamSlug?: string,
+    costCenter?: string,
   ): Promise<V2MetricsByIdeRow[]> {
     const query = this.db<V2MetricsByIdeRow>('copilot_metrics_by_ide')
       .where('metrics_type', metricsType)
@@ -721,6 +1098,7 @@ export class DatabaseHandlerV2 {
       .whereBetween('day', [from, to]);
 
     query.where('team_slug', teamSlug ?? '');
+    query.where('cost_center_id', costCenter ?? '');
 
     const rows = await query.orderBy('day', 'asc').select('*');
     return rows.map(row => ({
@@ -729,6 +1107,10 @@ export class DatabaseHandlerV2 {
     }));
   }
 
+  /**
+   * Callers MUST enforce the minimum-member threshold for team/cost-center
+   * scopes before exposing these results; the router enforces this.
+   */
   async getByLanguageFeature(
     metricsType: MetricsScope,
     entityId: string,
@@ -736,6 +1118,7 @@ export class DatabaseHandlerV2 {
     to: string,
     teamSlug?: string,
     feature?: string,
+    costCenter?: string,
   ): Promise<V2MetricsByLanguageFeatureRow[]> {
     const query = this.db<V2MetricsByLanguageFeatureRow>(
       'copilot_metrics_by_language_feature',
@@ -745,6 +1128,7 @@ export class DatabaseHandlerV2 {
       .whereBetween('day', [from, to]);
 
     query.where('team_slug', teamSlug ?? '');
+    query.where('cost_center_id', costCenter ?? '');
 
     if (feature !== undefined) {
       query.where('feature', feature);
@@ -757,12 +1141,17 @@ export class DatabaseHandlerV2 {
     }));
   }
 
+  /**
+   * Callers MUST enforce the minimum-member threshold for team/cost-center
+   * scopes before exposing these results; the router enforces this.
+   */
   async getByModelFeature(
     metricsType: MetricsScope,
     entityId: string,
     from: string,
     to: string,
     teamSlug?: string,
+    costCenter?: string,
   ): Promise<V2MetricsByModelFeatureRow[]> {
     const query = this.db<V2MetricsByModelFeatureRow>(
       'copilot_metrics_by_model_feature',
@@ -771,6 +1160,7 @@ export class DatabaseHandlerV2 {
       .where('entity_id', entityId)
       .whereBetween('day', [from, to]);
     query.where('team_slug', teamSlug ?? '');
+    query.where('cost_center_id', costCenter ?? '');
     const rows = await query.orderBy('day', 'asc').select('*');
     return rows.map(row => ({
       ...row,
@@ -778,12 +1168,17 @@ export class DatabaseHandlerV2 {
     }));
   }
 
+  /**
+   * Callers MUST enforce the minimum-member threshold for team/cost-center
+   * scopes before exposing these results; the router enforces this.
+   */
   async getByLanguageModel(
     metricsType: MetricsScope,
     entityId: string,
     from: string,
     to: string,
     teamSlug?: string,
+    costCenter?: string,
   ): Promise<V2MetricsByLanguageModelRow[]> {
     const query = this.db<V2MetricsByLanguageModelRow>(
       'copilot_metrics_by_language_model',
@@ -792,6 +1187,7 @@ export class DatabaseHandlerV2 {
       .where('entity_id', entityId)
       .whereBetween('day', [from, to]);
     query.where('team_slug', teamSlug ?? '');
+    query.where('cost_center_id', costCenter ?? '');
     const rows = await query.orderBy('day', 'asc').select('*');
     return rows.map(row => ({
       ...row,
@@ -799,12 +1195,17 @@ export class DatabaseHandlerV2 {
     }));
   }
 
+  /**
+   * Callers MUST enforce the minimum-member threshold for team/cost-center
+   * scopes before exposing these results; the router enforces this.
+   */
   async getDashboardData(
     metricsType: MetricsScope,
     entityId: string,
     from: string,
     to: string,
     teamSlug?: string,
+    costCenter?: string,
   ): Promise<V2DashboardData> {
     const [
       daily,
@@ -814,12 +1215,41 @@ export class DatabaseHandlerV2 {
       byLanguageModel,
       prMetrics,
     ] = await Promise.all([
-      this.getDailyTotals(metricsType, entityId, from, to, teamSlug),
-      this.getByFeature(metricsType, entityId, from, to, teamSlug),
-      this.getByLanguageFeature(metricsType, entityId, from, to, teamSlug),
-      this.getByModelFeature(metricsType, entityId, from, to, teamSlug),
-      this.getByLanguageModel(metricsType, entityId, from, to, teamSlug),
-      this.getPrMetrics(metricsType, entityId, from, to, teamSlug),
+      this.getDailyTotals(
+        metricsType,
+        entityId,
+        from,
+        to,
+        teamSlug,
+        costCenter,
+      ),
+      this.getByFeature(metricsType, entityId, from, to, teamSlug, costCenter),
+      this.getByLanguageFeature(
+        metricsType,
+        entityId,
+        from,
+        to,
+        teamSlug,
+        undefined,
+        costCenter,
+      ),
+      this.getByModelFeature(
+        metricsType,
+        entityId,
+        from,
+        to,
+        teamSlug,
+        costCenter,
+      ),
+      this.getByLanguageModel(
+        metricsType,
+        entityId,
+        from,
+        to,
+        teamSlug,
+        costCenter,
+      ),
+      this.getPrMetrics(metricsType, entityId, from, to, teamSlug, costCenter),
     ]);
 
     return {
@@ -1036,6 +1466,166 @@ export class DatabaseHandlerV2 {
     };
   }
 
+  async getUserMetricsForDay(
+    metricsType: MetricsScope,
+    entityId: string,
+    day: string,
+  ): Promise<V2UserMetricRow[]> {
+    const rows = await this.db<V2UserMetricRow>('copilot_user_metrics')
+      .where('metrics_type', metricsType)
+      .where('entity_id', entityId)
+      .where('day', day)
+      .orderBy('user_id', 'asc')
+      .select('*');
+
+    return rows.map(row => ({
+      ...row,
+      day: this.normalizeRequiredDay(row.day),
+      user_id: Number(row.user_id),
+    }));
+  }
+
+  async getUserBreakdownsForDay(
+    metricsType: MetricsScope,
+    entityId: string,
+    day: string,
+  ): Promise<UserBreakdownData[]> {
+    const getRows = (tableName: string) =>
+      this.db(tableName)
+        .where('metrics_type', metricsType)
+        .where('entity_id', entityId)
+        .where('day', day)
+        .orderBy('user_id', 'asc')
+        .select('*');
+
+    const [
+      featureRows,
+      ideRows,
+      languageFeatureRows,
+      modelFeatureRows,
+      languageModelRows,
+    ] = await Promise.all([
+      getRows('copilot_user_metrics_by_feature'),
+      getRows('copilot_user_metrics_by_ide'),
+      getRows('copilot_user_metrics_by_language_feature'),
+      getRows('copilot_user_metrics_by_model_feature'),
+      getRows('copilot_user_metrics_by_language_model'),
+    ]);
+
+    const breakdowns = new Map<number, UserBreakdownData>();
+    const getBreakdown = (
+      userIdValue: unknown,
+      userLogin: string,
+    ): UserBreakdownData => {
+      const userId = Number(userIdValue);
+      const existing = breakdowns.get(userId);
+      if (existing) {
+        return existing;
+      }
+
+      const breakdown: UserBreakdownData = {
+        user_id: userId,
+        user_login: userLogin,
+        byFeature: [],
+        byIde: [],
+        byLanguageFeature: [],
+        byModelFeature: [],
+        byLanguageModel: [],
+      };
+      breakdowns.set(userId, breakdown);
+      return breakdown;
+    };
+
+    for (const row of featureRows) {
+      getBreakdown(row.user_id, row.user_login).byFeature.push({
+        feature: row.feature,
+        user_initiated_interaction_count: row.user_initiated_interaction_count,
+        code_generation_activity_count: row.code_generation_activity_count,
+        code_acceptance_activity_count: row.code_acceptance_activity_count,
+        loc_added_sum: row.loc_added_sum,
+        loc_deleted_sum: row.loc_deleted_sum,
+        loc_suggested_to_add_sum: row.loc_suggested_to_add_sum,
+        loc_suggested_to_delete_sum: row.loc_suggested_to_delete_sum,
+      });
+    }
+
+    for (const row of ideRows) {
+      getBreakdown(row.user_id, row.user_login).byIde.push({
+        ide: row.ide,
+        user_initiated_interaction_count: row.user_initiated_interaction_count,
+        code_generation_activity_count: row.code_generation_activity_count,
+        code_acceptance_activity_count: row.code_acceptance_activity_count,
+        loc_added_sum: row.loc_added_sum,
+        loc_deleted_sum: row.loc_deleted_sum,
+        loc_suggested_to_add_sum: row.loc_suggested_to_add_sum,
+        loc_suggested_to_delete_sum: row.loc_suggested_to_delete_sum,
+      });
+    }
+
+    for (const row of languageFeatureRows) {
+      getBreakdown(row.user_id, row.user_login).byLanguageFeature.push({
+        language: row.language,
+        feature: row.feature,
+        code_generation_activity_count: row.code_generation_activity_count,
+        code_acceptance_activity_count: row.code_acceptance_activity_count,
+        loc_added_sum: row.loc_added_sum,
+        loc_deleted_sum: row.loc_deleted_sum,
+        loc_suggested_to_add_sum: row.loc_suggested_to_add_sum,
+        loc_suggested_to_delete_sum: row.loc_suggested_to_delete_sum,
+      });
+    }
+
+    for (const row of modelFeatureRows) {
+      getBreakdown(row.user_id, row.user_login).byModelFeature.push({
+        model_id: row.model_id,
+        feature: row.feature,
+        user_initiated_interaction_count: row.user_initiated_interaction_count,
+        code_generation_activity_count: row.code_generation_activity_count,
+        code_acceptance_activity_count: row.code_acceptance_activity_count,
+        loc_added_sum: row.loc_added_sum,
+        loc_deleted_sum: row.loc_deleted_sum,
+        loc_suggested_to_add_sum: row.loc_suggested_to_add_sum,
+        loc_suggested_to_delete_sum: row.loc_suggested_to_delete_sum,
+      });
+    }
+
+    for (const row of languageModelRows) {
+      getBreakdown(row.user_id, row.user_login).byLanguageModel.push({
+        language: row.language,
+        model_id: row.model_id,
+        request_count: row.request_count,
+        code_generation_activity_count: row.code_generation_activity_count,
+        code_acceptance_activity_count: row.code_acceptance_activity_count,
+        loc_added_sum: row.loc_added_sum,
+        loc_deleted_sum: row.loc_deleted_sum,
+        loc_suggested_to_add_sum: row.loc_suggested_to_add_sum,
+        loc_suggested_to_delete_sum: row.loc_suggested_to_delete_sum,
+      });
+    }
+
+    return [...breakdowns.values()];
+  }
+
+  async getUserTeamsForDay(
+    metricsType: MetricsScope,
+    entityId: string,
+    day: string,
+  ): Promise<V2UserTeamRow[]> {
+    const rows = await this.db<V2UserTeamRow>('copilot_user_teams')
+      .where('metrics_type', metricsType)
+      .where('entity_id', entityId)
+      .where('day', day)
+      .orderBy('user_id', 'asc')
+      .select('*');
+
+    return rows.map(row => ({
+      ...row,
+      day: this.normalizeRequiredDay(row.day),
+      user_id: Number(row.user_id),
+      team_id: Number(row.team_id),
+    }));
+  }
+
   async hasUserMetrics(
     metricsType: MetricsScope,
     entityId: string,
@@ -1051,42 +1641,117 @@ export class DatabaseHandlerV2 {
     return Boolean(row);
   }
 
+  async getCostCenters(
+    metricsType: MetricsScope,
+    entityId: string,
+    from?: string,
+    to?: string,
+    minMembers: number = 5,
+  ): Promise<Array<{ id: string; name: string | null }>> {
+    const query = this.db('copilot_user_cost_centers as ucc')
+      .join('copilot_user_metrics as m', function joinMetrics() {
+        this.on('ucc.day', '=', 'm.day')
+          .andOn('ucc.metrics_type', '=', 'm.metrics_type')
+          .andOn('ucc.entity_id', '=', 'm.entity_id')
+          .andOn('ucc.user_id', '=', 'm.user_id');
+      })
+      .leftJoin('copilot_cost_centers as cc', function joinOn() {
+        this.on('ucc.metrics_type', '=', 'cc.metrics_type')
+          .andOn('ucc.entity_id', '=', 'cc.entity_id')
+          .andOn('ucc.cost_center_id', '=', 'cc.cost_center_id');
+      })
+      .where('ucc.metrics_type', metricsType)
+      .where('ucc.entity_id', entityId);
+
+    if (from && to) {
+      query.whereBetween('ucc.day', [from, to]);
+    } else if (from) {
+      query.where('ucc.day', '>=', from);
+    } else if (to) {
+      query.where('ucc.day', '<=', to);
+    }
+
+    const rows = await query
+      .groupBy('ucc.cost_center_id', 'cc.name')
+      .havingRaw('COUNT(DISTINCT ??) >= ?', ['ucc.user_id', minMembers])
+      .orderByRaw('COALESCE(??, ??) ASC', ['cc.name', 'ucc.cost_center_id'])
+      .select('ucc.cost_center_id as id', 'cc.name as name');
+
+    return rows.map(row => {
+      const id = String(row.id);
+      if (id === NO_COST_CENTER_ID) {
+        return { id, name: null };
+      }
+
+      return {
+        id,
+        name:
+          typeof row.name === 'string' && row.name.length > 0 ? row.name : id,
+      };
+    });
+  }
+
   async getTeams(
     metricsType: MetricsScope,
     entityId: string,
     from?: string,
     to?: string,
     minMembers: number = 5,
+    costCenter?: string,
   ): Promise<string[]> {
-    const query = this.db('copilot_user_teams')
-      .where('metrics_type', metricsType)
-      .where('entity_id', entityId)
-      .whereNot('team_slug', '');
+    const query = this.db('copilot_user_teams as t')
+      .where('t.metrics_type', metricsType)
+      .where('t.entity_id', entityId)
+      .whereNot('t.team_slug', '');
+
+    if (costCenter) {
+      query.join('copilot_user_metrics as m', function joinMetrics() {
+        this.on('t.day', '=', 'm.day')
+          .andOn('t.metrics_type', '=', 'm.metrics_type')
+          .andOn('t.entity_id', '=', 'm.entity_id')
+          .andOn('t.user_id', '=', 'm.user_id');
+      });
+      query.join('copilot_user_cost_centers as c', function joinOn() {
+        this.on('t.day', '=', 'c.day')
+          .andOn('t.user_id', '=', 'c.user_id')
+          .andOn('t.metrics_type', '=', 'c.metrics_type')
+          .andOn('t.entity_id', '=', 'c.entity_id');
+      });
+      query.where('c.cost_center_id', costCenter);
+    }
 
     if (from && to) {
-      query.whereBetween('day', [from, to]);
+      query.whereBetween('t.day', [from, to]);
     } else if (from) {
-      query.where('day', '>=', from);
+      query.where('t.day', '>=', from);
     } else if (to) {
-      query.where('day', '<=', to);
+      query.where('t.day', '<=', to);
     }
 
     const rows = await query
-      .groupBy('team_slug')
-      .havingRaw('COUNT(DISTINCT ??) >= ?', ['user_id', minMembers])
-      .orderBy('team_slug', 'asc')
-      .select('team_slug');
+      .groupBy('t.team_slug')
+      .havingRaw('COUNT(DISTINCT ??) >= ?', ['t.user_id', minMembers])
+      .orderBy('t.team_slug', 'asc')
+      .select('t.team_slug');
 
     return rows.map(row => row.team_slug);
   }
 
+  /**
+   * Callers MUST enforce the minimum-member threshold for cost-center scopes
+   * before exposing this range; the router enforces this.
+   */
   async getPeriodRange(
     metricsType: MetricsScope,
     entityId: string,
+    costCenter?: string,
   ): Promise<PeriodRange | null> {
-    const row = await this.db('copilot_daily_totals')
+    const query = this.db('copilot_daily_totals')
       .where('metrics_type', metricsType)
       .where('entity_id', entityId)
+      .where('cost_center_id', costCenter ?? '');
+
+    const row = await query
       .select(
         this.db.raw('MIN(day) as min_day'),
         this.db.raw('MAX(day) as max_day'),
