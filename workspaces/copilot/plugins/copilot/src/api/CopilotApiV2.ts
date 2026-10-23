@@ -27,6 +27,7 @@ import {
   V2DashboardData,
   PeriodRange,
   MetricsScope,
+  V2CostCenterOption,
 } from '@backstage-community/plugin-copilot-common';
 
 export const copilotApiV2Ref: ApiRef<CopilotApiV2> = createApiRef<CopilotApiV2>(
@@ -41,6 +42,7 @@ export interface V2MetricsParams {
   from: string;
   to: string;
   team?: string;
+  costCenter?: string;
 }
 
 export interface CopilotApiV2 {
@@ -51,10 +53,17 @@ export interface CopilotApiV2 {
   getLanguageByFeature(
     params: V2MetricsParams & { feature?: string },
   ): Promise<V2MetricsByLanguageFeatureRow[]>;
+  fetchCostCenters(
+    params: Pick<V2MetricsParams, 'type' | 'entityId'> & {
+      from?: string;
+      to?: string;
+    },
+  ): Promise<V2CostCenterOption[]>;
   getTeams(
     params: Pick<V2MetricsParams, 'type' | 'entityId'> & {
       from?: string;
       to?: string;
+      costCenter?: string;
     },
   ): Promise<string[]>;
   getPeriodRange(

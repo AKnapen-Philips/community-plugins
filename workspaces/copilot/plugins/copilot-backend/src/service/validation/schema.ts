@@ -22,6 +22,8 @@ const isoDateSchema = z.string().refine(date => !isNaN(Date.parse(date)), {
   message: 'Invalid date format',
 });
 
+const costCenterSchema = z.string().trim().min(1).max(255);
+
 export type MetricsQuery = {
   startDate: string;
   endDate: string;
@@ -63,6 +65,7 @@ export const v2MetricsQuerySchema = z.object({
   from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Must be YYYY-MM-DD'),
   to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Must be YYYY-MM-DD'),
   team: z.string().optional(),
+  costCenter: costCenterSchema.optional(),
 });
 export type V2MetricsQuery = z.infer<typeof v2MetricsQuerySchema>;
 
@@ -82,8 +85,23 @@ export const v2TeamsQuerySchema = z.object({
     .string()
     .regex(/^\d{4}-\d{2}-\d{2}$/, 'Must be YYYY-MM-DD')
     .optional(),
+  costCenter: costCenterSchema.optional(),
 });
 export type V2TeamsQuery = z.infer<typeof v2TeamsQuerySchema>;
+
+export const v2CostCentersQuerySchema = z.object({
+  type: z.enum(['enterprise', 'organization']),
+  entityId: z.string().min(1),
+  from: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/, 'Must be YYYY-MM-DD')
+    .optional(),
+  to: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/, 'Must be YYYY-MM-DD')
+    .optional(),
+});
+export type V2CostCentersQuery = z.infer<typeof v2CostCentersQuerySchema>;
 
 export const v2PeriodRangeQuerySchema = z.object({
   type: z.enum(['enterprise', 'organization']),
