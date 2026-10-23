@@ -76,7 +76,8 @@ Configure the following `app-config.yaml` values:
 - `copilot.schedule`: Optional Backstage scheduler configuration for recurring ingestion.
 - `copilot.backfillFromDate`: Optional earliest V2 date to ingest. Must be `2025-10-10` or later. Default: `2025-10-10`.
 - `copilot.backfillDelayMs`: Optional delay between per-day backfill requests. Default: `200`.
-- `copilot.ingestTeams`: Optional flag that enables user and user-team ingestion so V2 team filtering can be derived. Default: `false`.
+- `copilot.ingestTeams`: Optional flag that enables user and user-team ingestion for V2 team filtering. The setting is also frontend-visible so the dashboard can expose the Team filter target. Default: `false`.
+- `copilot.ingestCostCenters`: Optional flag that enables enterprise cost-center ingestion and organization cost-center reporting when both `copilot.enterprise` and `copilot.organization` are configured. The setting is also frontend-visible so the dashboard can expose the Cost center filter target. Default: `false`.
 
 At least one of `copilot.enterprise` or `copilot.organization` must be configured.
 
@@ -97,11 +98,75 @@ copilot:
   backfillFromDate: 2025-10-10
   backfillDelayMs: 200
   ingestTeams: true
+  ingestCostCenters: true
   defaultView: enterprise
   showLegacyView: true
 ```
 
 `defaultView` and `showLegacyView` are consumed by the frontend plugin, but they commonly live in the same `copilot` config block.
+
+### Cost Centers
+
+Set `copilot.ingestCostCenters: true` to enable cost-center ingestion for the enterprise view. Organization-view cost centers are also available when both `copilot.enterprise` and `copilot.organization` are configured; organization-only configurations continue to ingest without cost centers and log a warning. Cost-center memberships are resolved from enterprise-level resources and applied to each scope's per-user metrics. Cost-center ingestion fetches the per-user report itself, so `copilot.ingestTeams` is not required for cost-center filtering. `copilot.ingestTeams` independently controls team membership ingestion.
+
+The V2 dashboard filters by either cost center or team, never both. When both settings are enabled for the current view, it shows a `Filter by` toggle button group (`Cost center | Team`, defaulting to Cost center) and only the selected target's dropdown. Changing targets clears the previous selection. A successful empty list disables that target's toggle button with an explanation; if the selected target is empty and the other has options, the dashboard falls back to the other target. If both lists are empty, Cost center remains selected with an enabled empty dropdown, while both toggle buttons are disabled.
+
+Membership comes from GitHub cost-center resources: direct `User`, enterprise `Team`, or `Org`; repository resources are ignored. Each user is attributed to at most one cost center, in this order: direct user, enterprise team, then organization. Among teams, the earlier `created_at` wins when both dates are available. If dates tie or either is unavailable, the lower numeric team ID wins, then case-insensitive resource name. Organization ties use case-insensitive organization name. Remaining ties use the lexically lower cost-center ID. Users without a matching resource appear as **No cost center**.
+
+Named cost centers are listed or queryable only when at least five distinct users have Copilot data over the selected date range. The **No cost center** listing flag uses that range, while its dashboard applies the threshold only to complete daily rows returned within the requested range; rolling lookback users contribute to displayed rolling counts, but not eligibility.
+
+Days whose roster could not be fully resolved are omitted from the **No cost center** view, and their data is excluded from rolling-user counts and threshold checks.
+
+When all relevant organization rosters are readable, users without a matching resource appear as **No cost center**. If a cost-center organization resource has no GitHub App installation, that resource is skipped with a warning and other cost centers continue to ingest. Because its members cannot be identified, no-cost-center results are withheld for affected days; the other named cost centers remain available. Previously complete days are retained if an organization installation later disappears; only newly aggregated days use the incomplete roster state. Permission or transient failures for an installed organization fail the whole snapshot and preserve existing data. A direct user resource that returns 404 is skipped because it cannot contribute metrics; other user-lookup failures fail closed.
+
+The cost-center listing response contains real cost centers in `costCenters`
+and reports the unassigned-user threshold separately in
+`hasUsersWithoutCostCenter`; no cost-center ID is reserved. The dashboard's
+unassigned scope is served by `GET /v2/no-cost-center/dashboard`, which accepts
+`type`, `entityId`, `from`, and `to` only. Other metric and dashboard filters
+accept real cost-center IDs only, including IDs that resemble former
+implementation markers.
+
+GitHub does not provide historical cost-center membership. Each ingested day uses the membership snapshot fetched at that time; backfilling existing per-user data applies the current snapshot to those historical days. GitHub's per-user and team reports cover roughly a rolling year, so newly enabled user, team, and cost-center data is backfilled only within that window. Older totals-only records remain unchanged and are not retried.
+
+For expired native team-report days, `/v2/backfill/status` omits `teams` from `components_loaded` while preserving the successful totals status.
+
+Detailed CLI and VS Code Agent breakdowns are not available for cost-center views, as with team views.
+
+Cost-center dashboard breakdowns retain the ten highest-ranked named values
+per day and combine the remaining additive report counters into `others`.
+Pair breakdowns rank full pairs. These breakdown tables contain additive
+counters rather than distinct-user, average, or median fields; PR median
+metrics are not bucketed. Full breakdown detail remains stored in the database.
+
+### Enterprise team fallback
+
+When `copilot.ingestTeams: true` and both `copilot.enterprise` and
+`copilot.organization` are configured, the enterprise-view Team filter
+automatically uses the configured organization's teams if GitHub definitively
+denies the organization Copilot user-team report. In that fallback mode, the
+organization's teams replace enterprise teams in the enterprise view; the
+organization view continues to use its organization report when available.
+When the report is authorized, existing enterprise and organization team
+behavior is unchanged. The fallback is not used if the organization's App
+installation or team-membership access cannot be verified.
+
+The organization's GitHub App installation needs **Members: read** to read
+team memberships. Membership includes child-team members, matching GitHub's
+`ALL` team-membership semantics. Each ingested day uses the membership
+snapshot fetched at ingestion time; backfilling existing per-user data applies
+the current snapshot to those historical days. As with native teams, a team
+is listed only when at least five distinct users have Copilot data across the
+selected date range.
+
+Team discovery starts with GraphQL batches of up to 25 teams and 50 nested
+members per team; teams with larger rosters use additional 100-member pages.
+An organization with about 4,660 teams needs roughly 187 team-list pages,
+plus any member pages. The plugin reads GitHub's rate-limit cost and remaining
+budget from each response, pauses when the budget is low, retries transient
+502/503/504 responses, and halves the team batch size down to five after
+repeated server errors. Pagination resumes from saved cursors after
+interruption.
 
 ### GitHub Enterprise Cloud With Data Residency (GHE.com)
 
@@ -176,7 +241,7 @@ The older schema and legacy read paths remain available during migration, but ne
 
 The V2 task runner performs gap-fill ingestion for missing days from `copilot.backfillFromDate` through yesterday.
 
-GitHub's report API currently exposes historical data back to `2025-10-10`, which means existing users can backfill V2 data covering October 2025 onward.
+GitHub's report API currently exposes historical data from `2025-10-10` up to a rolling year. When enabling user, team, or cost-center ingestion after an upgrade, only missing components within that window are backfilled; existing totals-only data outside it is retained.
 
 Use `copilot.backfillDelayMs` to slow down day-by-day requests if you encounter rate pressure during historical ingestion.
 
@@ -307,6 +372,15 @@ integrations:
 ```
 
 [You can find more about the integrations config in the official docs](https://backstage.io/docs/integrations/github/locations/)
+
+### Cost centers
+
+With `copilot.ingestCostCenters` enabled, cost-center and enterprise-team lookups use the credential selected for `copilot.enterprise` (an enterprise-installed App or PAT). Organization per-user reports continue to use the credential selected for `copilot.organization`. The enterprise credential needs the following additional access, depending on its type:
+
+- **GitHub App:** install the App on the enterprise with **Enterprise Copilot metrics: read**, **Enterprise teams: read**, and **Enterprise billing: read**. Also install it on each organization included as a cost-center `Org` resource, with **Members: read**.
+- **Classic PAT:** `read:enterprise` to read cost centers and enterprise teams, and `read:org` to read members of organizations included as cost-center `Org` resources.
+
+If an organization roster, enterprise-team list or membership, or direct-user lookup cannot be resolved, the snapshot is marked incomplete. No cost-center memberships or aggregates are replaced for any affected day, and the next ingestion run retries. An empty or unverifiable organization roster also blocks the snapshot; for fine-grained PATs, a missing scopes header means roster completeness cannot be verified. A direct `User` resource that returns HTTP 404 is the exception: it is treated as permanently unresolvable and skipped because that user cannot contribute metrics. Other direct-user lookup failures, including permission and transient errors, block the snapshot.
 
 ## Run
 

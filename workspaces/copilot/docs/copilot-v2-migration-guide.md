@@ -102,12 +102,32 @@ Notes:
 - Use `defaultView` only when both enterprise and organization are configured.
 - Set `showLegacyView: true` during migration if you want an explicit sidebar entry for the old dashboard.
 - Set `ingestTeams: true` if you want team filtering in the V2 UI. This increases ingestion volume and storage because the backend will ingest `users-1-day` and `user-teams-1-day` reports.
+- When enabling user, team, or cost-center ingestion after an upgrade, missing report data is backfilled only within GitHub's roughly one-year window; older totals-only records remain untouched. GitHub does not provide historical membership, so today's snapshots are applied to the historical days being backfilled.
+
+When both enterprise and organization are configured, enterprise-view team
+filtering automatically falls back to the configured organization's teams if
+GitHub returns a definitive HTTP 403/404 for its Copilot `user-teams-1-day`
+report. Successful 200/204 responses, including an empty report, keep the
+native source active. The fallback is used only when the organization
+installation can also read team membership;
+GitHub Apps need **Members: read** on that organization. Membership includes
+child-team members (`ALL` semantics), and each ingested or backfilled day uses
+the membership snapshot fetched at that time. The organization's teams replace
+enterprise teams only in the enterprise view while fallback is active. Teams
+are listed only when at least five distinct users have Copilot data across the
+selected date range.
+
+Team discovery uses GraphQL batches of up to 100 teams and paginates members
+for teams with more than 100 members. A read-only benchmark measured about one
+GraphQL rate-limit point per team page (roughly 47 points for 4,660 teams),
+plus extra points for member pages and normal query variation. Pagination
+resumes from saved cursors after interruption.
 
 ### 3. Backfill Historical Data
 
 The scheduled V2 task performs gap-fill ingestion from `copilot.backfillFromDate` up to yesterday.
 
-GitHub's report API exposes historical data back to `2025-10-10`, which means you can backfill V2 data for October 2025 onward.
+GitHub's report API exposes historical data from `2025-10-10` up to a rolling year, so backfills cannot extend indefinitely into the past.
 
 If you want to trigger a backfill immediately instead of waiting for the scheduler, call:
 
@@ -134,7 +154,7 @@ After backfill has populated recent and historical periods:
 1. Open `/copilot` and confirm the V2 dashboard loads.
 2. Open `/copilot/v2` directly and verify the expected scope is selected.
 3. If `showLegacyView` is enabled, compare results with `/copilot/legacy` during the transition period.
-4. If team filtering is required, confirm `ingestTeams` is enabled and that team options appear in the V2 dashboard.
+4. If cost-center or team filtering is required, confirm the corresponding ingestion setting is enabled and that its options appear in the V2 dashboard. When both targets are enabled, use the `Cost center | Team` toggle button group to select one target at a time.
 
 ## Legacy Dashboard Guidance
 
