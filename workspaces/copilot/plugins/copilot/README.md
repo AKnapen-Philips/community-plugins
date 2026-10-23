@@ -18,9 +18,12 @@ The plugin now defaults to the V2 dashboard, backed by GitHub's report-based Cop
 - **V2 Insights Dashboard**: View daily totals, feature usage, IDE breakdowns, language views, model usage, and PR metrics from the new GitHub reports API.
 - **Legacy Dashboard Access**: Keep the pre-V2 dashboard available during migration when you need to compare behavior.
 - **Team Filtering**: Filter V2 data by team when backend ingestion is configured to collect team membership data.
+- **Cost Center Filtering**: In enterprise views, and in organization views when both `copilot.enterprise` and `copilot.organization` are configured, an eligible Cost Center selector appears above the Team selector when cost-center data is available. The Consumption tab also works for a selected cost center.
 - **Individual ("Me") Metrics**: A privacy-scoped view, mounted by default at `/copilot/me`, that shows only the signed-in user's own Copilot usage and consumption — see [Individual ("Me") Metrics](#individual-me-metrics) below.
 
 _GitHub APIs will only show metrics for teams of 5 or more active users per day_
+
+_Cost-center views require at least five distinct Copilot users across the selected date range._
 
 ## Setup
 

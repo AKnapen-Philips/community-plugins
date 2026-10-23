@@ -36,7 +36,7 @@ import { parseDate } from '@internationalized/date';
 import { DateTime } from 'luxon';
 import { configApiRef, useApi } from '@backstage/core-plugin-api';
 import { CopilotPage } from '../Pages/CopilotPage';
-import { useV2DashboardData, useV2Teams } from './hooks';
+import { useV2CostCenters, useV2DashboardData, useV2Teams } from './hooks';
 import { CopilotUsageSummary } from './CopilotUsageSummary';
 import { CodeGenerationSummary } from './CodeGenerationSummary';
 import {
@@ -61,7 +61,10 @@ import {
   AiCreditsConsumptionChart,
 } from './charts';
 import { ConsumptionSummary } from './ConsumptionSummary';
-import { MetricsScope } from '@backstage-community/plugin-copilot-common';
+import {
+  MetricsScope,
+  NO_COST_CENTER_ID,
+} from '@backstage-community/plugin-copilot-common';
 
 function ChartCard({
   title,
@@ -104,6 +107,8 @@ export const V2DashboardPage = () => {
     type === 'enterprise'
       ? enterprise ?? organization ?? ''
       : organization ?? enterprise ?? '';
+  const costCenterScopeEnabled =
+    type === 'enterprise' || Boolean(enterprise && organization);
 
   const [from, setFrom] = useState(
     DateTime.now().minus({ days: 30 }).toFormat('yyyy-MM-dd'),
@@ -114,26 +119,66 @@ export const V2DashboardPage = () => {
     scopeKey: string;
     value: string | undefined;
   }>({ scopeKey, value: undefined });
+  const [costCenterSelection, setCostCenterSelection] = useState<{
+    scopeKey: string;
+    value: string | undefined;
+  }>({ scopeKey, value: undefined });
   const selectedTeam =
     teamSelection.scopeKey === scopeKey ? teamSelection.value : undefined;
+  const selectedCostCenter =
+    costCenterScopeEnabled && costCenterSelection.scopeKey === scopeKey
+      ? costCenterSelection.value
+      : undefined;
   const setSelectedTeam = useCallback(
     (value: string | undefined) => setTeamSelection({ scopeKey, value }),
     [scopeKey],
   );
+  const setSelectedCostCenter = useCallback(
+    (value: string | undefined) => {
+      setCostCenterSelection({ scopeKey, value });
+      setTeamSelection({ scopeKey, value: undefined });
+    },
+    [scopeKey],
+  );
 
   const params = useMemo(
-    () => ({ type, entityId, from, to, team: selectedTeam }),
-    [type, entityId, from, to, selectedTeam],
+    () => ({
+      type,
+      entityId,
+      from,
+      to,
+      team: selectedTeam,
+      costCenter: selectedCostCenter,
+    }),
+    [type, entityId, from, to, selectedTeam, selectedCostCenter],
   );
 
   const { data } = useV2DashboardData(params);
-  const teams = useV2Teams(type, entityId, from, to);
+  const costCenters = useV2CostCenters(type, entityId, from, to);
+  const teams = useV2Teams(type, entityId, from, to, selectedCostCenter);
+
+  const costCenterOptions = useMemo(() => {
+    const options = costCenters.items
+      .filter(({ id }) => id !== NO_COST_CENTER_ID)
+      .sort((a, b) => (a.name ?? a.id).localeCompare(b.name ?? b.id))
+      .map(({ id, name }) => ({ value: id, label: name ?? id }));
+    if (costCenters.items.some(({ id }) => id === NO_COST_CENTER_ID)) {
+      options.push({
+        value: NO_COST_CENTER_ID,
+        label: 'No cost center',
+      });
+    }
+    return [{ value: '', label: 'All cost centers' }, ...options];
+  }, [costCenters.items]);
 
   useEffect(() => {
     if (teamSelection.scopeKey !== scopeKey) {
       setTeamSelection({ scopeKey, value: undefined });
     }
-  }, [scopeKey, teamSelection.scopeKey]);
+    if (costCenterSelection.scopeKey !== scopeKey) {
+      setCostCenterSelection({ scopeKey, value: undefined });
+    }
+  }, [scopeKey, teamSelection.scopeKey, costCenterSelection.scopeKey]);
 
   useEffect(() => {
     if (
@@ -145,6 +190,26 @@ export const V2DashboardPage = () => {
       setSelectedTeam(undefined);
     }
   }, [selectedTeam, setSelectedTeam, teams.error, teams.items, teams.loading]);
+
+  useEffect(() => {
+    if (
+      selectedCostCenter &&
+      !costCenters.loading &&
+      (costCenters.error ||
+        !costCenters.items.some(({ id }) => id === selectedCostCenter))
+    ) {
+      setSelectedCostCenter(undefined);
+    }
+  }, [
+    costCenters.error,
+    costCenters.items,
+    costCenters.loading,
+    selectedCostCenter,
+    setSelectedCostCenter,
+  ]);
+
+  const showCostCenterSelector =
+    costCenterScopeEnabled && costCenters.items.length > 0;
 
   const onDateRangeChange = useCallback(
     (value: RangeValue<DateValue> | null) => {
@@ -181,23 +246,48 @@ export const V2DashboardPage = () => {
               value={{ start: parseDate(from), end: parseDate(to) }}
               onChange={onDateRangeChange}
             />
-            {teams.items.length > 0 && (
-              <Flex direction="column" style={{ minWidth: 200, flex: 1 }}>
-                <Select
-                  searchable
-                  label="Team"
-                  selectedKey={selectedTeam ?? ''}
-                  onChange={key =>
-                    setSelectedTeam(key ? String(key) : undefined)
-                  }
-                  options={[
-                    { value: '', label: 'All teams' },
-                    ...teams.items.map(team => ({
-                      value: team,
-                      label: team,
-                    })),
-                  ]}
-                />
+            {(showCostCenterSelector || teams.items.length > 0) && (
+              <Flex
+                direction="column"
+                style={{
+                  minWidth: 200,
+                  flex: 1,
+                  gap:
+                    showCostCenterSelector && teams.items.length > 0
+                      ? 'var(--bui-space-4, 16px)'
+                      : undefined,
+                }}
+              >
+                {showCostCenterSelector && (
+                  <Select
+                    searchable
+                    isDisabled={costCenters.loading}
+                    label="Cost center"
+                    selectedKey={selectedCostCenter ?? ''}
+                    onChange={key =>
+                      setSelectedCostCenter(key ? String(key) : undefined)
+                    }
+                    options={costCenterOptions}
+                  />
+                )}
+                {teams.items.length > 0 && (
+                  <Select
+                    searchable
+                    isDisabled={teams.loading}
+                    label="Team"
+                    selectedKey={selectedTeam ?? ''}
+                    onChange={key =>
+                      setSelectedTeam(key ? String(key) : undefined)
+                    }
+                    options={[
+                      { value: '', label: 'All teams' },
+                      ...teams.items.map(team => ({
+                        value: team,
+                        label: team,
+                      })),
+                    ]}
+                  />
+                )}
               </Flex>
             )}
           </Flex>
@@ -206,7 +296,9 @@ export const V2DashboardPage = () => {
             <TabList>
               <Tab id="copilot-usage">Copilot Usage</Tab>
               <Tab id="code-generation">Code Generation</Tab>
-              {selectedTeam && <Tab id="consumption">Consumption</Tab>}
+              {(selectedTeam || selectedCostCenter) && (
+                <Tab id="consumption">Consumption</Tab>
+              )}
             </TabList>
 
             <TabPanel id="copilot-usage">
@@ -450,7 +542,7 @@ export const V2DashboardPage = () => {
               </Flex>
             </TabPanel>
 
-            {selectedTeam && (
+            {(selectedTeam || selectedCostCenter) && (
               <TabPanel id="consumption">
                 <Flex
                   direction="column"
@@ -461,7 +553,7 @@ export const V2DashboardPage = () => {
                 >
                   <Text variant="body-small" color="secondary">
                     AI credit consumption is derived from per-user data and is
-                    only available for team-level views.
+                    available for team or cost center views.
                   </Text>
 
                   {/* Summary stat */}
