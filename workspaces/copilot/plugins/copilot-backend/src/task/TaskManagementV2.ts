@@ -64,6 +64,27 @@ function getReportWindowStartDate(now = DateTime.utc()): string {
     : GITHUB_REPORTS_EARLIEST_DATE;
 }
 
+function parseComponentsLoaded(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.filter(
+      (component): component is string => typeof component === 'string',
+    );
+  }
+  if (typeof value !== 'string') {
+    return [];
+  }
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return Array.isArray(parsed)
+      ? parsed.filter(
+          (component): component is string => typeof component === 'string',
+        )
+      : [];
+  } catch {
+    return [];
+  }
+}
+
 export async function runBackfill(
   options: TaskManagementV2Options,
   fromDate: string,
@@ -463,18 +484,44 @@ export class TaskManagementV2 {
   ): Promise<void> {
     const { db, logger } = this.options;
     const requiredComponents = getRequiredComponents(context.ingestTeams);
-    const componentsLoaded: string[] = [];
+    const componentsLoaded = new Set<string>();
 
     try {
-      if (await this.ingestTotals(day, metricsType, entityId)) {
-        componentsLoaded.push('totals');
+      const previousLog = (
+        await db.getIngestionLog(metricsType, entityId, day, day)
+      )[0];
+      const previouslyLoaded = new Set(
+        parseComponentsLoaded(previousLog?.components_loaded),
+      );
+      for (const component of previouslyLoaded) {
+        componentsLoaded.add(component);
+      }
+
+      if (
+        !previouslyLoaded.has('totals') &&
+        (await this.ingestTotals(day, metricsType, entityId))
+      ) {
+        componentsLoaded.add('totals');
       }
 
       if (context.ingestTeams) {
-        const { loaded, userMetrics, userBreakdowns } =
-          await this.ingestUserReports(day, metricsType, entityId);
-        if (loaded) {
-          componentsLoaded.push('users');
+        const userReport = previouslyLoaded.has('users')
+          ? {
+              loaded: true,
+              userMetrics: await db.getUserMetricsForDay(
+                metricsType,
+                entityId,
+                day,
+              ),
+              userBreakdowns: await db.getUserBreakdownsForDay(
+                metricsType,
+                entityId,
+                day,
+              ),
+            }
+          : await this.ingestUserReports(day, metricsType, entityId);
+        if (userReport.loaded) {
+          componentsLoaded.add('users');
         }
 
         if (
@@ -482,11 +529,11 @@ export class TaskManagementV2 {
             day,
             metricsType,
             entityId,
-            userMetrics,
-            userBreakdowns,
+            userReport.userMetrics,
+            userReport.userBreakdowns,
           )
         ) {
-          componentsLoaded.push('teams');
+          componentsLoaded.add('teams');
         }
       }
 
@@ -495,7 +542,7 @@ export class TaskManagementV2 {
         metricsType,
         entityId,
         context,
-        componentsLoaded,
+        [...componentsLoaded],
         requiredComponents,
       );
     } catch (error) {
@@ -510,7 +557,7 @@ export class TaskManagementV2 {
         metrics_type: metricsType,
         entity_id: entityId,
         status: 'error',
-        components_loaded: JSON.stringify(componentsLoaded),
+        components_loaded: JSON.stringify([...componentsLoaded]),
         error_message: message,
         source: context.source,
       });
