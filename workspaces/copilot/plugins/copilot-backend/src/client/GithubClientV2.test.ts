@@ -18,6 +18,7 @@ import { GithubClientV2 } from './GithubClientV2';
 import { Octokit } from '@octokit/rest';
 
 const mockRequest = jest.fn();
+const mockGraphql = jest.fn();
 const mockGetOrgInstallation = jest.fn();
 const mockHookBefore = jest.fn();
 const mockOutgoingHeaders: Array<Record<string, string>> = [];
@@ -48,7 +49,7 @@ jest.mock('@octokit/rest', () => ({
           getOrgInstallation: mockGetOrgInstallation,
         },
       },
-      graphql: jest.fn(),
+      graphql: (...args: any[]) => mockGraphql(...args),
       hook: {
         before: (
           name: string,
@@ -84,6 +85,10 @@ jest.mock('../utils/GithubUtils', () => ({
   }),
 }));
 
+function httpError(status: number): Error & { status: number } {
+  return Object.assign(new Error(`HTTP ${status}`), { status });
+}
+
 describe('GithubClientV2', () => {
   let mockConfig: any;
   let mockLogger: any;
@@ -92,6 +97,7 @@ describe('GithubClientV2', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockRequest.mockReset();
+    mockGraphql.mockReset();
     mockGetOrgInstallation.mockReset().mockResolvedValue({ data: { id: 999 } });
     mockHookBefore.mockReset();
     mockOutgoingHeaders.length = 0;
@@ -521,6 +527,616 @@ describe('GithubClientV2', () => {
     });
 
     expect(res.download_links[0]).toContain('s3.amazonaws.com');
+  });
+
+  it.each([
+    ['200', { data: { download_links: [] }, status: 200 }],
+    ['204', { data: undefined, status: 204 }],
+  ])(
+    'treats an organization user-teams report response of %s as authorized',
+    async (_status, response) => {
+      mockRequest.mockResolvedValueOnce(response);
+      const client = await GithubClientV2.fromConfig(mockConfig, mockLogger);
+
+      await expect(
+        client.probeOrganizationUserTeamsReport('2026-01-04'),
+      ).resolves.toBe('available');
+    },
+  );
+
+  it.each([403, 404])(
+    'detects an unavailable organization user-teams report on HTTP %s',
+    async status => {
+      mockRequest.mockRejectedValueOnce(httpError(status));
+      const client = await GithubClientV2.fromConfig(mockConfig, mockLogger);
+
+      await expect(
+        client.probeOrganizationUserTeamsReport('2026-01-04'),
+      ).resolves.toBe('unavailable');
+    },
+  );
+
+  it('does not classify a rate-limited 403 as an unavailable report', async () => {
+    mockRequest.mockRejectedValueOnce(
+      Object.assign(httpError(403), {
+        response: { headers: { 'x-ratelimit-remaining': '0' } },
+      }),
+    );
+    const client = await GithubClientV2.fromConfig(mockConfig, mockLogger);
+
+    await expect(
+      client.probeOrganizationUserTeamsReport('2026-01-04'),
+    ).rejects.toMatchObject({ status: 403 });
+  });
+
+  it.each([401, 429, 500])(
+    'does not classify HTTP %s as an unavailable organization report',
+    async status => {
+      mockRequest.mockRejectedValueOnce(httpError(status));
+      const client = await GithubClientV2.fromConfig(mockConfig, mockLogger);
+
+      await expect(
+        client.probeOrganizationUserTeamsReport('2026-01-04'),
+      ).rejects.toMatchObject({ status });
+    },
+  );
+
+  it('does not classify a network failure as an unavailable organization report', async () => {
+    mockRequest.mockRejectedValueOnce(new Error('network failure'));
+    const client = await GithubClientV2.fromConfig(mockConfig, mockLogger);
+
+    await expect(
+      client.probeOrganizationUserTeamsReport('2026-01-04'),
+    ).rejects.toThrow('network failure');
+  });
+
+  it('classifies a missing organization installation separately from report access', async () => {
+    const { getGithubCredentials } = jest.requireMock('../utils/GithubUtils');
+    getGithubCredentials.mockResolvedValueOnce({
+      enterprise: 'enterprise-pat',
+      organization: { appId: 123, privateKey: 'private-key' },
+    });
+    mockGetOrgInstallation.mockRejectedValueOnce(httpError(404));
+    const client = await GithubClientV2.fromConfig(mockConfig, mockLogger);
+
+    await expect(
+      client.probeOrganizationUserTeamsReport('2026-01-04'),
+    ).resolves.toBe('installation-unavailable');
+  });
+
+  it('fetches all organization teams and ALL child-team members in paginated GraphQL batches', async () => {
+    const rateLimit = {
+      cost: 1,
+      remaining: 12_000,
+      resetAt: '2026-10-22T00:00:00Z',
+    };
+    mockGraphql
+      .mockResolvedValueOnce({
+        organization: {
+          teams: {
+            nodes: [
+              {
+                id: 'team-node-1',
+                databaseId: 101,
+                slug: 'parent-team',
+                members: {
+                  nodes: [{ databaseId: 501 }],
+                  pageInfo: { hasNextPage: true, endCursor: 'member-cursor' },
+                },
+              },
+            ],
+            pageInfo: { hasNextPage: true, endCursor: 'team-cursor' },
+          },
+        },
+        rateLimit,
+      })
+      .mockResolvedValueOnce({
+        node: {
+          databaseId: 101,
+          slug: 'parent-team',
+          members: {
+            nodes: [{ databaseId: 502 }],
+            pageInfo: { hasNextPage: false, endCursor: null },
+          },
+        },
+        rateLimit,
+      })
+      .mockResolvedValueOnce({
+        organization: {
+          teams: {
+            nodes: [
+              {
+                id: 'team-node-2',
+                databaseId: 102,
+                slug: 'child-team',
+                members: {
+                  nodes: [{ databaseId: 503 }],
+                  pageInfo: { hasNextPage: false, endCursor: null },
+                },
+              },
+            ],
+            pageInfo: { hasNextPage: false, endCursor: null },
+          },
+        },
+        rateLimit,
+      });
+    const client = await GithubClientV2.fromConfig(mockConfig, mockLogger);
+
+    await expect(client.fetchOrganizationTeamMemberships()).resolves.toEqual([
+      { teamId: 101, teamSlug: 'parent-team', userId: 501 },
+      { teamId: 101, teamSlug: 'parent-team', userId: 502 },
+      { teamId: 102, teamSlug: 'child-team', userId: 503 },
+    ]);
+
+    expect(mockGraphql).toHaveBeenCalledTimes(3);
+    expect(mockGraphql.mock.calls[0][0]).toContain(
+      'members(first: 50, membership: ALL)',
+    );
+    expect(mockGraphql.mock.calls[0][1]).toEqual({
+      organization: 'my-org',
+      cursor: null,
+      teamPageSize: 25,
+    });
+    expect(mockGraphql.mock.calls[1][0]).toContain('membership: ALL');
+    expect(mockGraphql.mock.calls[1][1]).toEqual({
+      teamId: 'team-node-1',
+      cursor: 'member-cursor',
+    });
+    expect(mockGraphql.mock.calls[2][1]).toEqual({
+      organization: 'my-org',
+      cursor: 'team-cursor',
+      teamPageSize: 25,
+    });
+  });
+
+  it('resumes from a saved team cursor and checkpoints each GraphQL batch', async () => {
+    mockGraphql.mockResolvedValueOnce({
+      organization: {
+        teams: {
+          nodes: [
+            {
+              id: 'team-node-3',
+              databaseId: 103,
+              slug: 'resumed-team',
+              members: {
+                nodes: [{ databaseId: 601 }],
+                pageInfo: { hasNextPage: false, endCursor: null },
+              },
+            },
+          ],
+          pageInfo: { hasNextPage: false, endCursor: null },
+        },
+      },
+      rateLimit: {
+        cost: 1,
+        remaining: 12_000,
+        resetAt: '2026-10-22T00:00:00Z',
+      },
+    });
+    const onPage = jest.fn().mockResolvedValue(undefined);
+    const client = await GithubClientV2.fromConfig(mockConfig, mockLogger);
+
+    await expect(
+      client.fetchOrganizationTeamMemberships({
+        afterCursor: 'saved-team-cursor',
+        onPage,
+      }),
+    ).resolves.toEqual([]);
+
+    expect(mockGraphql).toHaveBeenCalledWith(expect.any(String), {
+      organization: 'my-org',
+      cursor: 'saved-team-cursor',
+      teamPageSize: 25,
+    });
+    expect(onPage).toHaveBeenCalledWith({
+      memberships: [{ teamId: 103, teamSlug: 'resumed-team', userId: 601 }],
+      cursor: null,
+      complete: true,
+    });
+  });
+
+  it('fails an incomplete member snapshot when GraphQL repeats a member cursor', async () => {
+    const rateLimit = {
+      cost: 1,
+      remaining: 12_000,
+      resetAt: '2026-10-22T00:00:00Z',
+    };
+    mockGraphql
+      .mockResolvedValueOnce({
+        organization: {
+          teams: {
+            nodes: [
+              {
+                id: 'team-node-1',
+                databaseId: 101,
+                slug: 'demo-team',
+                members: {
+                  nodes: [{ databaseId: 501 }],
+                  pageInfo: {
+                    hasNextPage: true,
+                    endCursor: 'member-cursor',
+                  },
+                },
+              },
+            ],
+            pageInfo: { hasNextPage: false, endCursor: null },
+          },
+        },
+        rateLimit,
+      })
+      .mockResolvedValueOnce({
+        node: {
+          databaseId: 101,
+          slug: 'demo-team',
+          members: {
+            nodes: [{ databaseId: 502 }],
+            pageInfo: {
+              hasNextPage: true,
+              endCursor: 'member-cursor',
+            },
+          },
+        },
+        rateLimit,
+      });
+    const onPage = jest.fn().mockResolvedValue(undefined);
+    const client = await GithubClientV2.fromConfig(mockConfig, mockLogger);
+
+    await expect(
+      client.fetchOrganizationTeamMemberships({ onPage }),
+    ).rejects.toThrow(
+      'GitHub repeated or omitted an organization team member cursor',
+    );
+    expect(onPage).not.toHaveBeenCalled();
+  });
+
+  it('fails an incomplete team snapshot when GraphQL repeats a team cursor', async () => {
+    const rateLimit = {
+      cost: 1,
+      remaining: 12_000,
+      resetAt: '2026-10-22T00:00:00Z',
+    };
+    mockGraphql
+      .mockResolvedValueOnce({
+        organization: {
+          teams: {
+            nodes: [],
+            pageInfo: { hasNextPage: true, endCursor: 'team-cursor' },
+          },
+        },
+        rateLimit,
+      })
+      .mockResolvedValueOnce({
+        organization: {
+          teams: {
+            nodes: [],
+            pageInfo: { hasNextPage: true, endCursor: 'team-cursor' },
+          },
+        },
+        rateLimit,
+      });
+    const onPage = jest.fn().mockResolvedValue(undefined);
+    const client = await GithubClientV2.fromConfig(mockConfig, mockLogger);
+
+    await expect(
+      client.fetchOrganizationTeamMemberships({ onPage }),
+    ).rejects.toThrow('GitHub repeated or omitted an organization team cursor');
+    expect(onPage).toHaveBeenCalledTimes(1);
+    expect(onPage).toHaveBeenCalledWith({
+      memberships: [],
+      cursor: 'team-cursor',
+      complete: false,
+    });
+  });
+
+  it('retries transient GraphQL 502 responses at the same team page size', async () => {
+    jest.useFakeTimers();
+    mockGraphql.mockRejectedValueOnce(httpError(502)).mockResolvedValueOnce({
+      organization: {
+        teams: {
+          nodes: [],
+          pageInfo: { hasNextPage: false, endCursor: null },
+        },
+      },
+      rateLimit: {
+        cost: 1,
+        remaining: 12_000,
+        resetAt: '2026-10-22T00:00:00Z',
+      },
+    });
+
+    try {
+      const client = await GithubClientV2.fromConfig(mockConfig, mockLogger);
+      const membershipsPromise = client.fetchOrganizationTeamMemberships();
+      await jest.runAllTimersAsync();
+      await expect(membershipsPromise).resolves.toEqual([]);
+
+      expect(mockGraphql).toHaveBeenCalledTimes(2);
+      expect(mockGraphql.mock.calls.map(([, variables]) => variables)).toEqual([
+        { organization: 'my-org', cursor: null, teamPageSize: 25 },
+        { organization: 'my-org', cursor: null, teamPageSize: 25 },
+      ]);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('halves the organization team page after repeated GraphQL 502 responses', async () => {
+    jest.useFakeTimers();
+    mockGraphql
+      .mockRejectedValueOnce(httpError(502))
+      .mockRejectedValueOnce(httpError(502))
+      .mockRejectedValueOnce(httpError(502))
+      .mockResolvedValueOnce({
+        organization: {
+          teams: {
+            nodes: [],
+            pageInfo: { hasNextPage: false, endCursor: null },
+          },
+        },
+        rateLimit: {
+          cost: 1,
+          remaining: 12_000,
+          resetAt: '2026-10-22T00:00:00Z',
+        },
+      });
+
+    try {
+      const client = await GithubClientV2.fromConfig(mockConfig, mockLogger);
+      const membershipsPromise = client.fetchOrganizationTeamMemberships();
+      await jest.runAllTimersAsync();
+      await expect(membershipsPromise).resolves.toEqual([]);
+
+      expect(mockGraphql.mock.calls.map(([, variables]) => variables)).toEqual([
+        { organization: 'my-org', cursor: null, teamPageSize: 25 },
+        { organization: 'my-org', cursor: null, teamPageSize: 25 },
+        { organization: 'my-org', cursor: null, teamPageSize: 25 },
+        { organization: 'my-org', cursor: null, teamPageSize: 12 },
+      ]);
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        expect.stringContaining(
+          'retrying the same cursor with a smaller page size',
+        ),
+      );
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('rejects organization App installations without members read permission', async () => {
+    const { getGithubCredentials } = jest.requireMock('../utils/GithubUtils');
+    getGithubCredentials.mockResolvedValueOnce({
+      enterprise: 'enterprise-pat',
+      organization: { appId: 123, privateKey: 'private-key' },
+    });
+    mockGetOrgInstallation.mockResolvedValueOnce({
+      data: { id: 999, permissions: { members: 'none' } },
+    });
+    const client = await GithubClientV2.fromConfig(mockConfig, mockLogger);
+
+    await expect(client.fetchOrganizationTeamMemberships()).rejects.toThrow(
+      'The GitHub App needs Members: read or higher permission',
+    );
+    expect(mockGraphql).not.toHaveBeenCalled();
+  });
+
+  it.each(['read', 'write', 'admin'])(
+    'accepts organization App Members: %s permission',
+    async permission => {
+      const { getGithubCredentials } = jest.requireMock('../utils/GithubUtils');
+      getGithubCredentials.mockResolvedValueOnce({
+        enterprise: 'enterprise-pat',
+        organization: { appId: 123, privateKey: 'private-key' },
+      });
+      mockGetOrgInstallation.mockResolvedValueOnce({
+        data: { id: 999, permissions: { members: permission } },
+      });
+      mockGraphql.mockResolvedValueOnce({
+        organization: {
+          teams: {
+            nodes: [],
+            pageInfo: { hasNextPage: false, endCursor: null },
+          },
+        },
+        rateLimit: {
+          cost: 1,
+          remaining: 12_000,
+          resetAt: '2026-10-22T00:00:00Z',
+        },
+      });
+      const client = await GithubClientV2.fromConfig(mockConfig, mockLogger);
+
+      await expect(client.fetchOrganizationTeamMemberships()).resolves.toEqual(
+        [],
+      );
+      expect(mockGraphql).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('rejects an incomplete GraphQL membership snapshot', async () => {
+    mockGraphql
+      .mockResolvedValueOnce({
+        organization: {
+          teams: {
+            nodes: [
+              {
+                id: 'team-node-1',
+                databaseId: 101,
+                slug: 'parent-team',
+                members: {
+                  nodes: [],
+                  pageInfo: { hasNextPage: false, endCursor: null },
+                },
+              },
+            ],
+            pageInfo: { hasNextPage: true, endCursor: 'team-cursor' },
+          },
+        },
+        rateLimit: {
+          cost: 1,
+          remaining: 12_000,
+          resetAt: '2026-10-22T00:00:00Z',
+        },
+      })
+      .mockRejectedValueOnce(
+        Object.assign(new Error('GraphQL failed'), {
+          status: 403,
+        }),
+      );
+    const client = await GithubClientV2.fromConfig(mockConfig, mockLogger);
+
+    await expect(client.fetchOrganizationTeamMemberships()).rejects.toThrow(
+      'GitHub GraphQL team membership request failed with HTTP 403.',
+    );
+  });
+
+  it('backs off before continuing GraphQL pagination when rate limit remaining is low', async () => {
+    jest.useFakeTimers().setSystemTime(new Date('2026-10-22T00:00:00Z'));
+    const rateLimit = {
+      cost: 1,
+      remaining: 99,
+      resetAt: '2026-10-22T00:00:01Z',
+    };
+    mockGraphql
+      .mockResolvedValueOnce({
+        organization: {
+          teams: {
+            nodes: [],
+            pageInfo: { hasNextPage: true, endCursor: 'teams-next' },
+          },
+        },
+        rateLimit,
+      })
+      .mockResolvedValueOnce({
+        organization: {
+          teams: {
+            nodes: [],
+            pageInfo: { hasNextPage: false, endCursor: null },
+          },
+        },
+        rateLimit: { ...rateLimit, remaining: 12_000 },
+      });
+
+    try {
+      const client = await GithubClientV2.fromConfig(mockConfig, mockLogger);
+      const membershipsPromise = client.fetchOrganizationTeamMemberships();
+      await jest.runOnlyPendingTimersAsync();
+      await expect(membershipsPromise).resolves.toEqual([]);
+
+      expect(mockGraphql).toHaveBeenCalledTimes(2);
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('GraphQL rate limit is low'),
+      );
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('retries GraphQL RATE_LIMITED errors with bounded exponential backoff', async () => {
+    jest.useFakeTimers();
+    mockGraphql
+      .mockRejectedValueOnce(
+        Object.assign(new Error('GraphQL request failed'), {
+          errors: [{ type: 'RATE_LIMITED', message: 'Rate limited' }],
+        }),
+      )
+      .mockResolvedValueOnce({
+        organization: {
+          teams: {
+            nodes: [],
+            pageInfo: { hasNextPage: false, endCursor: null },
+          },
+        },
+        rateLimit: {
+          cost: 1,
+          remaining: 12_000,
+          resetAt: '2026-10-22T00:00:00Z',
+        },
+      });
+
+    try {
+      const client = await GithubClientV2.fromConfig(mockConfig, mockLogger);
+      const membershipsPromise = client.fetchOrganizationTeamMemberships();
+      const membershipsResult = membershipsPromise.then(result => {
+        expect(result).toEqual([]);
+      });
+      await jest.runAllTimersAsync();
+      await membershipsResult;
+      expect(mockGraphql).toHaveBeenCalledTimes(2);
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('rate limit reached; retrying'),
+      );
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it.each([403, 429])(
+    'retries HTTP %s when GitHub provides Retry-After',
+    async status => {
+      jest.useFakeTimers();
+      mockGraphql
+        .mockRejectedValueOnce(
+          Object.assign(new Error('GitHub rate limit response'), {
+            status,
+            headers: { 'retry-after': '1' },
+          }),
+        )
+        .mockResolvedValueOnce({
+          organization: {
+            teams: {
+              nodes: [],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+          rateLimit: {
+            cost: 1,
+            remaining: 12_000,
+            resetAt: '2026-10-22T00:00:00Z',
+          },
+        });
+
+      try {
+        const client = await GithubClientV2.fromConfig(mockConfig, mockLogger);
+        const membershipsPromise = client.fetchOrganizationTeamMemberships();
+        const membershipsResult = membershipsPromise.then(result => {
+          expect(result).toEqual([]);
+        });
+        await jest.advanceTimersByTimeAsync(1_000);
+        await membershipsResult;
+        expect(mockGraphql).toHaveBeenCalledTimes(2);
+      } finally {
+        jest.useRealTimers();
+      }
+    },
+  );
+
+  it('stops retrying a persistent GraphQL rate-limit error after five attempts', async () => {
+    jest.useFakeTimers();
+    mockGraphql.mockRejectedValue(
+      Object.assign(new Error('GraphQL request failed'), {
+        errors: [{ type: 'RATE_LIMITED' }],
+      }),
+    );
+
+    try {
+      const client = await GithubClientV2.fromConfig(mockConfig, mockLogger);
+      const membershipsPromise = client.fetchOrganizationTeamMemberships();
+      const membershipsResult = membershipsPromise.then(
+        () => {
+          throw new Error('Expected the team membership request to reject.');
+        },
+        error => {
+          expect(error.message).toContain(
+            'GitHub GraphQL team membership request failed.',
+          );
+        },
+      );
+      await jest.runAllTimersAsync();
+      await membershipsResult;
+      expect(mockGraphql).toHaveBeenCalledTimes(5);
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   it('discovers enterprise GitHub App installations with the App-JWT endpoint', async () => {

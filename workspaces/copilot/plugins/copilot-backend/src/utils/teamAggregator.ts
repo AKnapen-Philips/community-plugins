@@ -38,6 +38,23 @@ export interface TeamAggregates {
   customizationMetrics: V2CustomizationMetricRow[];
 }
 
+type MetricGroup = {
+  teamSlug: string;
+  userIds: Set<number>;
+};
+
+function emptyAggregates(): TeamAggregates {
+  return {
+    dailyTotals: [],
+    byFeature: [],
+    byIde: [],
+    byLanguageFeature: [],
+    byModelFeature: [],
+    byLanguageModel: [],
+    customizationMetrics: [],
+  };
+}
+
 /**
  * Aggregate user metrics by team for a given day.
  * Joins userMetrics with userTeams to produce team-level aggregates.
@@ -51,23 +68,50 @@ export function aggregateTeamMetrics(
   metricsType: MetricsScope,
   entityId: string,
 ): TeamAggregates {
-  const filteredUserMetrics = userMetrics.filter(
+  const usersByTeam = new Map<string, Set<number>>();
+  const filteredUserTeams = userTeams.filter(
     row =>
       row.day === day &&
       row.metrics_type === metricsType &&
       row.entity_id === entityId,
   );
 
+  for (const row of filteredUserTeams) {
+    const users = usersByTeam.get(row.team_slug) ?? new Set<number>();
+    users.add(row.user_id);
+    usersByTeam.set(row.team_slug, users);
+  }
+
+  const groups = [...usersByTeam.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([teamSlug, userIds]) => ({ teamSlug, userIds }));
+
+  return aggregateMetricsByGroups(
+    userMetrics,
+    userBreakdowns,
+    day,
+    metricsType,
+    entityId,
+    groups,
+  );
+}
+
+function aggregateMetricsByGroups(
+  userMetrics: V2UserMetricRow[],
+  userBreakdowns: UserBreakdownData[],
+  day: string,
+  metricsType: MetricsScope,
+  entityId: string,
+  groups: MetricGroup[],
+): TeamAggregates {
+  const filteredUserMetrics = userMetrics.filter(
+    row =>
+      row.day === day &&
+      row.metrics_type === metricsType &&
+      row.entity_id === entityId,
+  );
   if (!filteredUserMetrics.length) {
-    return {
-      dailyTotals: [],
-      byFeature: [],
-      byIde: [],
-      byLanguageFeature: [],
-      byModelFeature: [],
-      byLanguageModel: [],
-      customizationMetrics: [],
-    };
+    return emptyAggregates();
   }
 
   const metricsByUserId = new Map<number, V2UserMetricRow>();
@@ -80,22 +124,6 @@ export function aggregateTeamMetrics(
     breakdownsByUserId.set(bd.user_id, bd);
   }
 
-  const usersByTeam = new Map<string, Set<number>>();
-  const filteredUserTeams = userTeams.filter(
-    row =>
-      row.day === day &&
-      row.metrics_type === metricsType &&
-      row.entity_id === entityId,
-  );
-
-  for (const row of filteredUserTeams) {
-    const teamSlug = row.team_slug;
-    if (!usersByTeam.has(teamSlug)) {
-      usersByTeam.set(teamSlug, new Set<number>());
-    }
-    usersByTeam.get(teamSlug)?.add(row.user_id);
-  }
-
   const dailyTotals: V2DailyTotal[] = [];
   const byFeature: V2MetricsByFeatureRow[] = [];
   const byIde: V2MetricsByIdeRow[] = [];
@@ -104,9 +132,7 @@ export function aggregateTeamMetrics(
   const byLanguageModel: V2MetricsByLanguageModelRow[] = [];
   const customizationMetrics: V2CustomizationMetricRow[] = [];
 
-  for (const [teamSlug, userIds] of [...usersByTeam.entries()].sort((a, b) =>
-    a[0].localeCompare(b[0]),
-  )) {
+  for (const { teamSlug, userIds } of groups) {
     let locAddedSum = 0;
     let locDeletedSum = 0;
     let locSuggestedToAddSum = 0;

@@ -118,6 +118,7 @@ Notes:
 - Use `defaultView` only when both enterprise and organization are configured.
 - Set `showLegacyView: true` during migration if you want an explicit sidebar entry for the old dashboard.
 - Set `ingestTeams: true` if you want team filtering in the V2 UI. This increases ingestion volume and storage because the backend will ingest `users-1-day` and `user-teams-1-day` reports.
+- When both `enterprise` and `organization` are configured, enterprise team views use native enterprise team reports when available and fall back to organization team membership when they are not. Membership snapshots are staged before activation; the backend returns to native reports when access is restored.
 
 ### 3. Backfill Historical Data
 

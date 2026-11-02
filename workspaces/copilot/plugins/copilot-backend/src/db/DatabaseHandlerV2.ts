@@ -41,9 +41,11 @@ import {
 } from '@backstage-community/plugin-copilot-common';
 import { DateTime } from 'luxon';
 import { Knex } from 'knex';
+import { randomUUID } from 'node:crypto';
 import { migrationsDir } from './DatabaseHandler';
 import { batchInsertInChunks } from '../utils/batchInsert';
 import { UserBreakdownData } from '../utils/reportParser';
+import type { TeamAggregates } from '../utils/teamAggregator';
 
 type Options = {
   database: DatabaseService;
@@ -58,6 +60,245 @@ type TeamActivityRow = {
   used_chat: boolean | number | null;
 };
 
+export type TeamAggregationSource = 'native' | 'organization-fallback';
+
+export type TeamAggregationState = {
+  activeSource: TeamAggregationSource;
+  activeGeneration: string;
+  pendingSource?: TeamAggregationSource;
+  pendingGeneration?: string;
+};
+
+export type TeamAggregationTransition = TeamAggregationState & {
+  pendingSource: TeamAggregationSource;
+  pendingGeneration: string;
+};
+
+export type TeamMembershipSnapshotAttempt = {
+  generation: string;
+  attemptToken: string;
+};
+
+export type TeamMembershipSnapshotState = TeamMembershipSnapshotAttempt & {
+  cursor: string | null;
+  complete: boolean;
+};
+
+type TeamAggregationStateRow = {
+  active_source: TeamAggregationSource;
+  active_generation: string;
+  pending_source: TeamAggregationSource | null;
+  pending_generation: string | null;
+};
+
+type TeamAggregationLogRow = {
+  day: string;
+  metrics_type: MetricsScope;
+  entity_id: string;
+  source: TeamAggregationSource;
+  generation: string;
+  status: 'staged' | 'complete' | 'failed' | 'abandoned' | 'unavailable';
+  error_message?: string | null;
+  completed_at?: Date | null;
+};
+
+type TeamMembershipStagingRow = Omit<V2UserTeamRow, 'id'> & {
+  generation: string;
+};
+
+type TeamAggregateStagingRow = {
+  day: string;
+  metrics_type: MetricsScope;
+  entity_id: string;
+  generation: string;
+  table_name: string;
+  row_key: string;
+  row_data: string;
+};
+
+type TeamMembershipSnapshotRow = {
+  id?: number;
+  generation: string;
+  metrics_type: MetricsScope;
+  entity_id: string;
+  team_id: number;
+  team_slug: string;
+  user_id: number;
+};
+
+type TeamMembershipSnapshotPageRow = TeamMembershipSnapshotRow & {
+  id: number;
+  user_login: string;
+};
+
+type TeamMembershipSnapshotStateRow = {
+  generation: string;
+  attempt_token: string;
+  cursor: string | null;
+  complete: boolean | number;
+};
+
+const teamAggregateTables = [
+  'copilot_daily_totals',
+  'copilot_pr_metrics',
+  'copilot_metrics_by_feature',
+  'copilot_metrics_by_ide',
+  'copilot_metrics_by_language_feature',
+  'copilot_metrics_by_model_feature',
+  'copilot_metrics_by_language_model',
+  'copilot_metrics_by_cli',
+  'copilot_metrics_by_vscode_agent',
+  'copilot_customization_metrics',
+] as const;
+
+const teamAggregationCopyBatchSize = 500;
+
+const teamMembershipPageSize = 500;
+
+const teamAggregateRowDimensions: Record<string, string[]> = {
+  copilot_daily_totals: ['team_slug'],
+  copilot_pr_metrics: ['team_slug'],
+  copilot_metrics_by_feature: ['team_slug', 'feature'],
+  copilot_metrics_by_ide: ['team_slug', 'ide'],
+  copilot_metrics_by_language_feature: ['team_slug', 'language', 'feature'],
+  copilot_metrics_by_model_feature: ['team_slug', 'model_id', 'feature'],
+  copilot_metrics_by_language_model: ['team_slug', 'language', 'model_id'],
+  copilot_metrics_by_cli: ['team_slug'],
+  copilot_metrics_by_vscode_agent: ['team_slug'],
+  copilot_customization_metrics: [
+    'scope',
+    'team_slug',
+    'user_id',
+    'category',
+    'item_name',
+  ],
+};
+
+const teamAggregateAdditiveColumns: Record<string, string[]> = {
+  copilot_daily_totals: [
+    'daily_active_users',
+    'daily_active_cli_users',
+    'daily_active_vscode_agent_users',
+    'monthly_active_agent_users',
+    'monthly_active_chat_users',
+    'code_acceptance_activity_count',
+    'code_generation_activity_count',
+    'loc_added_sum',
+    'loc_deleted_sum',
+    'loc_suggested_to_add_sum',
+    'loc_suggested_to_delete_sum',
+    'user_initiated_interaction_count',
+    'total_ai_credits_used',
+  ],
+  copilot_pr_metrics: [
+    'total_created',
+    'total_merged',
+    'total_reviewed',
+    'total_created_by_copilot',
+    'total_merged_created_by_copilot',
+    'total_merged_reviewed_by_copilot',
+    'total_reviewed_by_copilot',
+    'total_suggestions',
+    'total_applied_suggestions',
+    'total_copilot_suggestions',
+    'total_copilot_applied_suggestions',
+  ],
+  copilot_metrics_by_feature: [
+    'code_acceptance_activity_count',
+    'code_generation_activity_count',
+    'loc_added_sum',
+    'loc_deleted_sum',
+    'loc_suggested_to_add_sum',
+    'loc_suggested_to_delete_sum',
+    'user_initiated_interaction_count',
+  ],
+  copilot_metrics_by_ide: [
+    'code_acceptance_activity_count',
+    'code_generation_activity_count',
+    'loc_added_sum',
+    'loc_deleted_sum',
+    'loc_suggested_to_add_sum',
+    'loc_suggested_to_delete_sum',
+    'user_initiated_interaction_count',
+  ],
+  copilot_metrics_by_language_feature: [
+    'code_acceptance_activity_count',
+    'code_generation_activity_count',
+    'loc_added_sum',
+    'loc_deleted_sum',
+    'loc_suggested_to_add_sum',
+    'loc_suggested_to_delete_sum',
+  ],
+  copilot_metrics_by_model_feature: [
+    'code_acceptance_activity_count',
+    'code_generation_activity_count',
+    'loc_added_sum',
+    'loc_deleted_sum',
+    'loc_suggested_to_add_sum',
+    'loc_suggested_to_delete_sum',
+    'user_initiated_interaction_count',
+  ],
+  copilot_metrics_by_language_model: [
+    'request_count',
+    'code_acceptance_activity_count',
+    'code_generation_activity_count',
+    'loc_added_sum',
+    'loc_deleted_sum',
+    'loc_suggested_to_add_sum',
+    'loc_suggested_to_delete_sum',
+  ],
+  copilot_metrics_by_cli: [
+    'prompt_count',
+    'request_count',
+    'session_count',
+    'output_tokens_sum',
+    'prompt_tokens_sum',
+  ],
+  copilot_metrics_by_vscode_agent: ['session_count', 'total_user_messages'],
+  copilot_customization_metrics: ['interaction_count'],
+};
+
+const teamAggregateRowsByTable = (
+  aggregates: TeamAggregates,
+): Array<[string, object[]]> => [
+  ['copilot_daily_totals', aggregates.dailyTotals],
+  ['copilot_metrics_by_feature', aggregates.byFeature],
+  ['copilot_metrics_by_ide', aggregates.byIde],
+  ['copilot_metrics_by_language_feature', aggregates.byLanguageFeature],
+  ['copilot_metrics_by_model_feature', aggregates.byModelFeature],
+  ['copilot_metrics_by_language_model', aggregates.byLanguageModel],
+  ['copilot_customization_metrics', aggregates.customizationMetrics],
+];
+
+function getTeamAggregateRowKey(
+  tableName: string,
+  row: Record<string, unknown>,
+): string {
+  const dimensions = teamAggregateRowDimensions[tableName];
+  if (!dimensions) {
+    throw new Error(`Unexpected team aggregate staging table "${tableName}".`);
+  }
+  return JSON.stringify(dimensions.map(dimension => row[dimension] ?? ''));
+}
+
+function mergeTeamAggregateRows(
+  tableName: string,
+  existing: Record<string, unknown>,
+  next: Record<string, unknown>,
+): Record<string, unknown> {
+  const merged = { ...existing };
+  for (const column of teamAggregateAdditiveColumns[tableName] ?? []) {
+    const currentValue = merged[column];
+    const nextValue = next[column];
+    if (typeof currentValue === 'number' || typeof nextValue === 'number') {
+      merged[column] =
+        (typeof currentValue === 'number' ? currentValue : 0) +
+        (typeof nextValue === 'number' ? nextValue : 0);
+    }
+  }
+  return merged;
+}
+
 export class DatabaseHandlerV2 {
   static async create(options: Options): Promise<DatabaseHandlerV2> {
     const { database } = options;
@@ -71,6 +312,1781 @@ export class DatabaseHandlerV2 {
   }
 
   private constructor(private readonly db: Knex) {}
+
+  async getTeamAggregationState(
+    metricsType: MetricsScope,
+    entityId: string,
+  ): Promise<TeamAggregationState> {
+    const row = (await this.db('copilot_team_aggregation_state')
+      .where({ metrics_type: metricsType, entity_id: entityId })
+      .first()) as TeamAggregationStateRow | undefined;
+
+    return {
+      activeSource: row?.active_source ?? 'native',
+      activeGeneration: row?.active_generation ?? 'native-default',
+      ...(row?.pending_source ? { pendingSource: row.pending_source } : {}),
+      ...(row?.pending_generation
+        ? { pendingGeneration: row.pending_generation }
+        : {}),
+    };
+  }
+
+  private async ensureTeamAggregationStateRow(
+    transaction: Knex.Transaction,
+    metricsType: MetricsScope,
+    entityId: string,
+  ): Promise<void> {
+    await transaction('copilot_team_aggregation_state')
+      .insert({
+        metrics_type: metricsType,
+        entity_id: entityId,
+        active_source: 'native',
+        active_generation: 'native-default',
+        pending_source: null,
+        pending_generation: null,
+        updated_at: new Date(),
+      })
+      .onConflict(['metrics_type', 'entity_id'])
+      .ignore();
+  }
+
+  async beginTeamMembershipSnapshot(
+    metricsType: MetricsScope,
+    entityId: string,
+    generation?: string,
+  ): Promise<TeamMembershipSnapshotState> {
+    return this.db.transaction(async transaction => {
+      const snapshotGeneration = generation ?? randomUUID();
+      const attemptToken = randomUUID();
+      const now = new Date();
+      const aggregationState = await this.lockTeamAggregationState(
+        transaction,
+        metricsType,
+        entityId,
+      );
+
+      await transaction('copilot_team_membership_snapshot_state')
+        .insert({
+          metrics_type: metricsType,
+          entity_id: entityId,
+          generation: snapshotGeneration,
+          attempt_token: attemptToken,
+          cursor: null,
+          complete: false,
+          updated_at: now,
+        })
+        .onConflict(['metrics_type', 'entity_id'])
+        .merge({
+          generation: snapshotGeneration,
+          attempt_token: attemptToken,
+          cursor: null,
+          complete: false,
+          updated_at: now,
+        });
+      await transaction('copilot_team_membership_snapshot_staging')
+        .where({ metrics_type: metricsType, entity_id: entityId })
+        .del();
+      if (
+        aggregationState.pending_source === 'organization-fallback' &&
+        aggregationState.pending_generation === snapshotGeneration
+      ) {
+        await transaction('copilot_user_teams_staging')
+          .where({
+            metrics_type: metricsType,
+            entity_id: entityId,
+            generation: snapshotGeneration,
+          })
+          .del();
+        await transaction('copilot_team_aggregates_staging')
+          .where({
+            metrics_type: metricsType,
+            entity_id: entityId,
+            generation: snapshotGeneration,
+          })
+          .del();
+        await transaction('copilot_team_aggregation_log')
+          .where({
+            metrics_type: metricsType,
+            entity_id: entityId,
+            source: 'organization-fallback',
+            generation: snapshotGeneration,
+            status: 'staged',
+          })
+          .update({
+            status: 'failed',
+            error_message:
+              'Organization team membership snapshot attempt was superseded.',
+            completed_at: null,
+          });
+      }
+
+      return {
+        generation: snapshotGeneration,
+        attemptToken,
+        cursor: null,
+        complete: false,
+      };
+    });
+  }
+
+  async getTeamMembershipSnapshot(
+    metricsType: MetricsScope,
+    entityId: string,
+    attempt: TeamMembershipSnapshotAttempt,
+  ): Promise<{
+    state: TeamMembershipSnapshotState;
+    memberships: Array<{ teamId: number; teamSlug: string; userId: number }>;
+  }> {
+    return this.db.transaction(async transaction => {
+      const state = await this.assertCurrentTeamMembershipSnapshot(
+        transaction,
+        metricsType,
+        entityId,
+        attempt,
+        true,
+      );
+      const rows = await transaction<TeamMembershipSnapshotRow>(
+        'copilot_team_membership_snapshot_staging',
+      )
+        .where({
+          metrics_type: metricsType,
+          entity_id: entityId,
+          generation: attempt.generation,
+        })
+        .orderBy('team_id', 'asc')
+        .orderBy('user_id', 'asc')
+        .select('team_id', 'team_slug', 'user_id');
+
+      return {
+        state: this.mapTeamMembershipSnapshotState(state),
+        memberships: rows.map(row => ({
+          teamId: Number(row.team_id),
+          teamSlug: row.team_slug,
+          userId: Number(row.user_id),
+        })),
+      };
+    });
+  }
+
+  async getTeamMembershipSnapshotState(
+    metricsType: MetricsScope,
+    entityId: string,
+    attempt: TeamMembershipSnapshotAttempt,
+  ): Promise<TeamMembershipSnapshotState> {
+    return this.db.transaction(async transaction => {
+      const state = await this.assertCurrentTeamMembershipSnapshot(
+        transaction,
+        metricsType,
+        entityId,
+        attempt,
+      );
+      return this.mapTeamMembershipSnapshotState(state);
+    });
+  }
+
+  private mapTeamMembershipSnapshotState(
+    state: TeamMembershipSnapshotStateRow,
+  ): TeamMembershipSnapshotState {
+    return {
+      generation: state.generation,
+      attemptToken: state.attempt_token,
+      cursor: state.cursor ?? null,
+      complete: state.complete === true || Number(state.complete) === 1,
+    };
+  }
+
+  private async assertCurrentTeamMembershipSnapshot(
+    transaction: Knex.Transaction,
+    metricsType: MetricsScope,
+    entityId: string,
+    attempt: TeamMembershipSnapshotAttempt,
+    requireComplete = false,
+  ): Promise<TeamMembershipSnapshotStateRow> {
+    const state = (await transaction('copilot_team_membership_snapshot_state')
+      .where({ metrics_type: metricsType, entity_id: entityId })
+      .forUpdate()
+      .first('generation', 'attempt_token', 'cursor', 'complete')) as
+      | TeamMembershipSnapshotStateRow
+      | undefined;
+
+    if (
+      !state ||
+      state.generation !== attempt.generation ||
+      state.attempt_token !== attempt.attemptToken
+    ) {
+      throw new Error(
+        'Organization team membership snapshot attempt was superseded.',
+      );
+    }
+
+    if (
+      requireComplete &&
+      state.complete !== true &&
+      Number(state.complete) !== 1
+    ) {
+      throw new Error(
+        'Organization team membership snapshot is missing or incomplete.',
+      );
+    }
+
+    return state;
+  }
+
+  private async assertRequiredTeamMembershipSnapshot(
+    transaction: Knex.Transaction,
+    metricsType: MetricsScope,
+    entityId: string,
+    attempt?: TeamMembershipSnapshotAttempt,
+  ): Promise<void> {
+    if (!attempt) {
+      throw new Error(
+        'Organization team membership snapshot attempt is required.',
+      );
+    }
+
+    await this.assertCurrentTeamMembershipSnapshot(
+      transaction,
+      metricsType,
+      entityId,
+      attempt,
+      true,
+    );
+  }
+
+  async getTeamMembershipSnapshotBatchForDay(
+    metricsType: MetricsScope,
+    entityId: string,
+    attempt: TeamMembershipSnapshotAttempt,
+    day: string,
+    afterId: number = 0,
+    pageSize: number = teamMembershipPageSize,
+  ): Promise<{ memberships: V2UserTeamRow[]; nextCursor: number | null }> {
+    return this.db.transaction(async transaction => {
+      await this.assertCurrentTeamMembershipSnapshot(
+        transaction,
+        metricsType,
+        entityId,
+        attempt,
+        true,
+      );
+
+      const rows = await transaction<TeamMembershipSnapshotPageRow>(
+        'copilot_team_membership_snapshot_staging as s',
+      )
+        .join('copilot_user_metrics as m', function joinDailyMetrics() {
+          this.on('s.metrics_type', '=', 'm.metrics_type')
+            .andOn('s.entity_id', '=', 'm.entity_id')
+            .andOn('s.user_id', '=', 'm.user_id');
+        })
+        .where('s.metrics_type', metricsType)
+        .where('s.entity_id', entityId)
+        .where('s.generation', attempt.generation)
+        .where('m.day', day)
+        .where('s.id', '>', afterId)
+        .orderBy('s.id', 'asc')
+        .limit(pageSize)
+        .select(
+          's.id',
+          's.team_id',
+          's.team_slug',
+          's.user_id',
+          'm.user_login',
+        );
+
+      return {
+        memberships: rows.map(row => ({
+          day,
+          metrics_type: metricsType,
+          entity_id: entityId,
+          user_id: Number(row.user_id),
+          user_login: row.user_login,
+          team_id: Number(row.team_id),
+          team_slug: row.team_slug,
+        })),
+        nextCursor:
+          rows.length === pageSize ? Number(rows[rows.length - 1].id) : null,
+      };
+    });
+  }
+
+  async saveTeamMembershipSnapshotBatch(
+    metricsType: MetricsScope,
+    entityId: string,
+    attempt: TeamMembershipSnapshotAttempt,
+    memberships: Array<{ teamId: number; teamSlug: string; userId: number }>,
+    cursor: string | null,
+    complete: boolean,
+  ): Promise<void> {
+    await this.db.transaction(async transaction => {
+      const state = await this.assertCurrentTeamMembershipSnapshot(
+        transaction,
+        metricsType,
+        entityId,
+        attempt,
+      );
+      if (state.complete === true || Number(state.complete) === 1) {
+        throw new Error(
+          'Organization team membership snapshot is already complete.',
+        );
+      }
+
+      const rows: TeamMembershipSnapshotRow[] = memberships.map(
+        ({ teamId, teamSlug, userId }) => ({
+          generation: attempt.generation,
+          metrics_type: metricsType,
+          entity_id: entityId,
+          team_id: teamId,
+          team_slug: teamSlug,
+          user_id: userId,
+        }),
+      );
+      await batchInsertInChunks(rows, 100, async chunk => {
+        await transaction<TeamMembershipSnapshotRow>(
+          'copilot_team_membership_snapshot_staging',
+        )
+          .insert(chunk)
+          .onConflict([
+            'metrics_type',
+            'entity_id',
+            'generation',
+            'team_id',
+            'user_id',
+          ])
+          .merge(['team_slug']);
+      });
+
+      await transaction('copilot_team_membership_snapshot_state')
+        .where({
+          metrics_type: metricsType,
+          entity_id: entityId,
+          generation: attempt.generation,
+          attempt_token: attempt.attemptToken,
+        })
+        .update({
+          cursor,
+          complete,
+          updated_at: new Date(),
+        });
+    });
+  }
+
+  async beginTeamAggregationTransition(
+    metricsType: MetricsScope,
+    entityId: string,
+    source: TeamAggregationSource,
+  ): Promise<TeamAggregationTransition | null> {
+    return this.db.transaction(async transaction => {
+      await this.ensureTeamAggregationStateRow(
+        transaction,
+        metricsType,
+        entityId,
+      );
+      const state = (await transaction('copilot_team_aggregation_state')
+        .where({ metrics_type: metricsType, entity_id: entityId })
+        .forUpdate()
+        .first()) as TeamAggregationStateRow | undefined;
+      const activeSource = state?.active_source ?? 'native';
+      const activeGeneration = state?.active_generation ?? 'native-default';
+      const pendingSource = state?.pending_source ?? undefined;
+      const pendingGeneration = state?.pending_generation ?? undefined;
+
+      if (activeSource === source) {
+        if (pendingGeneration) {
+          await transaction('copilot_team_aggregation_log')
+            .where({
+              metrics_type: metricsType,
+              entity_id: entityId,
+              generation: pendingGeneration,
+            })
+            .update({ status: 'abandoned' });
+          await transaction('copilot_user_teams_staging')
+            .where({
+              metrics_type: metricsType,
+              entity_id: entityId,
+              generation: pendingGeneration,
+            })
+            .del();
+          await transaction('copilot_team_aggregates_staging')
+            .where({
+              metrics_type: metricsType,
+              entity_id: entityId,
+              generation: pendingGeneration,
+            })
+            .del();
+          await transaction('copilot_team_membership_snapshot_staging')
+            .where({
+              metrics_type: metricsType,
+              entity_id: entityId,
+              generation: pendingGeneration,
+            })
+            .del();
+          await transaction('copilot_team_membership_snapshot_state')
+            .where({
+              metrics_type: metricsType,
+              entity_id: entityId,
+              generation: pendingGeneration,
+            })
+            .del();
+          await transaction('copilot_team_aggregation_state')
+            .where({ metrics_type: metricsType, entity_id: entityId })
+            .update({
+              pending_source: null,
+              pending_generation: null,
+              updated_at: new Date(),
+            });
+        }
+        return null;
+      }
+
+      if (pendingSource === source && pendingGeneration) {
+        return {
+          activeSource,
+          activeGeneration,
+          pendingSource,
+          pendingGeneration,
+        };
+      }
+
+      if (pendingGeneration) {
+        await transaction('copilot_team_aggregation_log')
+          .where({
+            metrics_type: metricsType,
+            entity_id: entityId,
+            generation: pendingGeneration,
+          })
+          .update({ status: 'abandoned' });
+        await transaction('copilot_user_teams_staging')
+          .where({
+            metrics_type: metricsType,
+            entity_id: entityId,
+            generation: pendingGeneration,
+          })
+          .del();
+        await transaction('copilot_team_aggregates_staging')
+          .where({
+            metrics_type: metricsType,
+            entity_id: entityId,
+            generation: pendingGeneration,
+          })
+          .del();
+        await transaction('copilot_team_membership_snapshot_staging')
+          .where({
+            metrics_type: metricsType,
+            entity_id: entityId,
+            generation: pendingGeneration,
+          })
+          .del();
+        await transaction('copilot_team_membership_snapshot_state')
+          .where({
+            metrics_type: metricsType,
+            entity_id: entityId,
+            generation: pendingGeneration,
+          })
+          .del();
+      }
+
+      const nextGeneration = randomUUID();
+      const nextState = {
+        metrics_type: metricsType,
+        entity_id: entityId,
+        active_source: activeSource,
+        active_generation: activeGeneration,
+        pending_source: source,
+        pending_generation: nextGeneration,
+        updated_at: new Date(),
+      };
+
+      if (state) {
+        await transaction('copilot_team_aggregation_state')
+          .where({ metrics_type: metricsType, entity_id: entityId })
+          .update(nextState);
+      } else {
+        await transaction('copilot_team_aggregation_state').insert(nextState);
+      }
+
+      return {
+        activeSource,
+        activeGeneration,
+        pendingSource: source,
+        pendingGeneration: nextGeneration,
+      };
+    });
+  }
+
+  async getUserMetricDays(
+    metricsType: MetricsScope,
+    entityId: string,
+  ): Promise<string[]> {
+    const rows = await this.db('copilot_user_metrics')
+      .where({ metrics_type: metricsType, entity_id: entityId })
+      .distinct('day')
+      .orderBy('day', 'asc')
+      .select('day');
+
+    return rows
+      .map(row => this.normalizeDay(row.day))
+      .filter((day): day is string => Boolean(day));
+  }
+
+  async getMissingTeamAggregationDays(
+    metricsType: MetricsScope,
+    entityId: string,
+    source: TeamAggregationSource,
+    generation: string,
+  ): Promise<string[]> {
+    const [metricDays, stagedRows] = await Promise.all([
+      this.getUserMetricDays(metricsType, entityId),
+      this.db<TeamAggregationLogRow>('copilot_team_aggregation_log')
+        .where({
+          metrics_type: metricsType,
+          entity_id: entityId,
+          source,
+          generation,
+        })
+        .whereIn('status', ['staged', 'complete', 'unavailable'])
+        .select('day'),
+    ]);
+    const completedDays = new Set(
+      stagedRows
+        .map(row => this.normalizeDay(row.day))
+        .filter((day): day is string => Boolean(day)),
+    );
+
+    return metricDays.filter(day => !completedDays.has(day));
+  }
+
+  async recordTeamAggregationFailure(
+    day: string,
+    metricsType: MetricsScope,
+    entityId: string,
+    source: TeamAggregationSource,
+    generation: string,
+    errorMessage: string,
+    membershipAttempt?: TeamMembershipSnapshotAttempt,
+  ): Promise<void> {
+    await this.db.transaction(async transaction => {
+      if (source === 'organization-fallback') {
+        await this.assertRequiredTeamMembershipSnapshot(
+          transaction,
+          metricsType,
+          entityId,
+          membershipAttempt,
+        );
+      }
+
+      await transaction<TeamAggregationLogRow>('copilot_team_aggregation_log')
+        .insert({
+          day,
+          metrics_type: metricsType,
+          entity_id: entityId,
+          source,
+          generation,
+          status: 'failed',
+          error_message: errorMessage,
+        })
+        .onConflict([
+          'day',
+          'metrics_type',
+          'entity_id',
+          'source',
+          'generation',
+        ])
+        .merge({
+          status: 'failed',
+          error_message: errorMessage,
+          completed_at: null,
+        });
+    });
+  }
+
+  async markTeamAggregationUnavailable(
+    day: string,
+    metricsType: MetricsScope,
+    entityId: string,
+    source: TeamAggregationSource,
+    generation: string,
+    requiredDays: string[],
+    reason: string,
+    membershipAttempt?: TeamMembershipSnapshotAttempt,
+  ): Promise<boolean> {
+    return this.db.transaction(async transaction => {
+      const state = await this.assertTeamAggregationGeneration(
+        transaction,
+        metricsType,
+        entityId,
+        source,
+        generation,
+        false,
+      );
+      if (source === 'organization-fallback') {
+        await this.assertRequiredTeamMembershipSnapshot(
+          transaction,
+          metricsType,
+          entityId,
+          membershipAttempt,
+        );
+      }
+      if (
+        state.pending_source !== source ||
+        state.pending_generation !== generation
+      ) {
+        throw new Error('Team aggregation transition is no longer active.');
+      }
+
+      await transaction('copilot_user_teams_staging')
+        .where({
+          day,
+          metrics_type: metricsType,
+          entity_id: entityId,
+          generation,
+        })
+        .del();
+      await transaction('copilot_team_aggregates_staging')
+        .where({
+          day,
+          metrics_type: metricsType,
+          entity_id: entityId,
+          generation,
+        })
+        .del();
+      await transaction<TeamAggregationLogRow>('copilot_team_aggregation_log')
+        .insert({
+          day,
+          metrics_type: metricsType,
+          entity_id: entityId,
+          source,
+          generation,
+          status: 'unavailable',
+          error_message: reason,
+          completed_at: new Date(),
+        })
+        .onConflict([
+          'day',
+          'metrics_type',
+          'entity_id',
+          'source',
+          'generation',
+        ])
+        .merge({
+          status: 'unavailable',
+          error_message: reason,
+          completed_at: new Date(),
+        });
+
+      return this.tryActivateTeamAggregationSource(
+        transaction,
+        metricsType,
+        entityId,
+        source,
+        generation,
+        requiredDays,
+        membershipAttempt,
+      );
+    });
+  }
+
+  private async lockTeamAggregationState(
+    transaction: Knex.Transaction,
+    metricsType: MetricsScope,
+    entityId: string,
+  ): Promise<TeamAggregationStateRow> {
+    await this.ensureTeamAggregationStateRow(
+      transaction,
+      metricsType,
+      entityId,
+    );
+    const state = (await transaction('copilot_team_aggregation_state')
+      .where({ metrics_type: metricsType, entity_id: entityId })
+      .forUpdate()
+      .first()) as TeamAggregationStateRow | undefined;
+    if (!state) {
+      throw new Error('Team aggregation state could not be initialized.');
+    }
+    return state;
+  }
+
+  private async assertTeamAggregationGeneration(
+    transaction: Knex.Transaction,
+    metricsType: MetricsScope,
+    entityId: string,
+    source: TeamAggregationSource,
+    generation: string,
+    allowActiveGeneration: boolean,
+  ): Promise<TeamAggregationStateRow> {
+    const state = await this.lockTeamAggregationState(
+      transaction,
+      metricsType,
+      entityId,
+    );
+    const isPending =
+      state.pending_source === source &&
+      state.pending_generation === generation;
+    const isActive =
+      allowActiveGeneration &&
+      state.active_source === source &&
+      state.active_generation === generation &&
+      !state.pending_source;
+
+    if (!isPending && !isActive) {
+      throw new Error('Team aggregation transition is no longer active.');
+    }
+    return state;
+  }
+
+  async beginTeamAggregationDayStaging(
+    day: string,
+    metricsType: MetricsScope,
+    entityId: string,
+    source: TeamAggregationSource,
+    generation: string,
+    membershipAttempt?: TeamMembershipSnapshotAttempt,
+  ): Promise<void> {
+    await this.db.transaction(async transaction => {
+      await this.assertTeamAggregationGeneration(
+        transaction,
+        metricsType,
+        entityId,
+        source,
+        generation,
+        true,
+      );
+      if (source === 'organization-fallback') {
+        await this.assertRequiredTeamMembershipSnapshot(
+          transaction,
+          metricsType,
+          entityId,
+          membershipAttempt,
+        );
+      }
+      await transaction('copilot_user_teams_staging')
+        .where({
+          day,
+          metrics_type: metricsType,
+          entity_id: entityId,
+          generation,
+        })
+        .del();
+      await transaction('copilot_team_aggregates_staging')
+        .where({
+          day,
+          metrics_type: metricsType,
+          entity_id: entityId,
+          generation,
+        })
+        .del();
+    });
+  }
+
+  async stageTeamAggregationBatch(
+    day: string,
+    metricsType: MetricsScope,
+    entityId: string,
+    source: TeamAggregationSource,
+    generation: string,
+    userTeams: V2UserTeamRow[],
+    aggregates: TeamAggregates,
+    membershipAttempt?: TeamMembershipSnapshotAttempt,
+  ): Promise<void> {
+    this.validateTeamReplacementRows(
+      day,
+      metricsType,
+      entityId,
+      userTeams,
+      aggregates,
+    );
+
+    await this.db.transaction(async transaction => {
+      await this.assertTeamAggregationGeneration(
+        transaction,
+        metricsType,
+        entityId,
+        source,
+        generation,
+        true,
+      );
+      if (source === 'organization-fallback') {
+        await this.assertRequiredTeamMembershipSnapshot(
+          transaction,
+          metricsType,
+          entityId,
+          membershipAttempt,
+        );
+      }
+
+      const stagedMemberships: TeamMembershipStagingRow[] = userTeams.map(
+        row => ({ ...row, generation }),
+      );
+      await batchInsertInChunks(stagedMemberships, 100, async chunk => {
+        await transaction<TeamMembershipStagingRow>(
+          'copilot_user_teams_staging',
+        )
+          .insert(chunk)
+          .onConflict([
+            'day',
+            'metrics_type',
+            'entity_id',
+            'generation',
+            'user_id',
+            'team_id',
+          ])
+          .ignore();
+      });
+
+      const aggregateRows: TeamAggregateStagingRow[] = [];
+      for (const [tableName, rows] of teamAggregateRowsByTable(aggregates)) {
+        for (const rowValue of rows) {
+          const row = rowValue as Record<string, unknown>;
+          const rowData = row;
+          aggregateRows.push({
+            day,
+            metrics_type: metricsType,
+            entity_id: entityId,
+            generation,
+            table_name: tableName,
+            row_key: getTeamAggregateRowKey(tableName, rowData),
+            row_data: JSON.stringify(rowData),
+          });
+        }
+      }
+      await batchInsertInChunks(aggregateRows, 100, async chunk => {
+        await transaction<TeamAggregateStagingRow>(
+          'copilot_team_aggregates_staging',
+        ).insert(chunk);
+      });
+    });
+  }
+
+  private async compactTeamAggregateStagingRows(
+    transaction: Knex.Transaction,
+    day: string,
+    metricsType: MetricsScope,
+    entityId: string,
+    generation: string,
+  ): Promise<void> {
+    let cursor: { table_name: string; row_key: string; id: number } | undefined;
+    let current:
+      | {
+          id: number;
+          table_name: string;
+          row_key: string;
+          row_data: Record<string, unknown>;
+        }
+      | undefined;
+    let duplicateIds: number[] = [];
+
+    const flushCurrent = async () => {
+      if (!current) {
+        return;
+      }
+      await transaction('copilot_team_aggregates_staging')
+        .where({ id: current.id })
+        .update({
+          row_key: current.row_key,
+          row_data: JSON.stringify(current.row_data),
+        });
+      if (duplicateIds.length > 0) {
+        for (let index = 0; index < duplicateIds.length; index += 100) {
+          await transaction('copilot_team_aggregates_staging')
+            .whereIn('id', duplicateIds.slice(index, index + 100))
+            .del();
+        }
+        duplicateIds = [];
+      }
+    };
+
+    for (;;) {
+      const query = transaction<TeamAggregateStagingRow & { id: number }>(
+        'copilot_team_aggregates_staging',
+      ).where({
+        day,
+        metrics_type: metricsType,
+        entity_id: entityId,
+        generation,
+      });
+      const cursorForQuery = cursor;
+      if (cursorForQuery) {
+        const { table_name: cursorTableName, row_key: cursorRowKey } =
+          cursorForQuery;
+        const cursorId = cursorForQuery.id;
+        query.where(function afterCursor() {
+          this.where('table_name', '>', cursorTableName)
+            .orWhere(function sameTable() {
+              this.where('table_name', cursorTableName).andWhere(
+                'row_key',
+                '>',
+                cursorRowKey,
+              );
+            })
+            .orWhere(function sameGroup() {
+              this.where('table_name', cursorTableName)
+                .andWhere('row_key', cursorRowKey)
+                .andWhere('id', '>', cursorId);
+            });
+        });
+      }
+
+      const rows = await query
+        .orderBy('table_name', 'asc')
+        .orderBy('row_key', 'asc')
+        .orderBy('id', 'asc')
+        .limit(teamAggregationCopyBatchSize)
+        .select('id', 'table_name', 'row_key', 'row_data');
+      if (rows.length === 0) {
+        break;
+      }
+
+      for (const row of rows) {
+        if (
+          !teamAggregateTables.includes(
+            row.table_name as (typeof teamAggregateTables)[number],
+          )
+        ) {
+          throw new Error(
+            `Unexpected team aggregate staging table "${row.table_name}".`,
+          );
+        }
+        const rowData = JSON.parse(row.row_data) as Record<string, unknown>;
+        const rowKey =
+          row.row_key || getTeamAggregateRowKey(row.table_name, rowData);
+        if (
+          current &&
+          current.table_name === row.table_name &&
+          current.row_key === rowKey
+        ) {
+          current.row_data = mergeTeamAggregateRows(
+            row.table_name,
+            current.row_data,
+            rowData,
+          );
+          duplicateIds.push(Number(row.id));
+        } else {
+          await flushCurrent();
+          current = {
+            id: Number(row.id),
+            table_name: row.table_name,
+            row_key: rowKey,
+            row_data: rowData,
+          };
+        }
+        cursor = {
+          table_name: row.table_name,
+          row_key: row.row_key,
+          id: Number(row.id),
+        };
+      }
+    }
+
+    await flushCurrent();
+  }
+
+  async completeStagedTeamAggregationDay(
+    day: string,
+    metricsType: MetricsScope,
+    entityId: string,
+    source: TeamAggregationSource,
+    generation: string,
+    membershipAttempt: TeamMembershipSnapshotAttempt,
+    requiredDays: string[],
+  ): Promise<boolean> {
+    return this.db.transaction(async transaction => {
+      const state = await this.assertTeamAggregationGeneration(
+        transaction,
+        metricsType,
+        entityId,
+        source,
+        generation,
+        false,
+      );
+      if (
+        state.pending_source !== source ||
+        state.pending_generation !== generation
+      ) {
+        throw new Error('Team aggregation transition is no longer active.');
+      }
+      await this.assertRequiredTeamMembershipSnapshot(
+        transaction,
+        metricsType,
+        entityId,
+        membershipAttempt,
+      );
+
+      await this.compactTeamAggregateStagingRows(
+        transaction,
+        day,
+        metricsType,
+        entityId,
+        generation,
+      );
+      await transaction<TeamAggregationLogRow>('copilot_team_aggregation_log')
+        .insert({
+          day,
+          metrics_type: metricsType,
+          entity_id: entityId,
+          source,
+          generation,
+          status: 'staged',
+          error_message: null,
+          completed_at: new Date(),
+        })
+        .onConflict([
+          'day',
+          'metrics_type',
+          'entity_id',
+          'source',
+          'generation',
+        ])
+        .merge({
+          status: 'staged',
+          error_message: null,
+          completed_at: new Date(),
+        });
+
+      return this.tryActivateTeamAggregationSource(
+        transaction,
+        metricsType,
+        entityId,
+        source,
+        generation,
+        requiredDays,
+        membershipAttempt,
+      );
+    });
+  }
+
+  async replaceStagedTeamAggregates(
+    day: string,
+    metricsType: MetricsScope,
+    entityId: string,
+    source: TeamAggregationSource,
+    generation: string,
+    membershipAttempt: TeamMembershipSnapshotAttempt,
+  ): Promise<void> {
+    await this.db.transaction(async transaction => {
+      const state = await this.assertTeamAggregationGeneration(
+        transaction,
+        metricsType,
+        entityId,
+        source,
+        generation,
+        true,
+      );
+      if (
+        state.active_source !== source ||
+        state.active_generation !== generation ||
+        state.pending_source
+      ) {
+        throw new Error(
+          'Cannot replace team aggregates while a different source is active or transitioning.',
+        );
+      }
+      await this.assertRequiredTeamMembershipSnapshot(
+        transaction,
+        metricsType,
+        entityId,
+        membershipAttempt,
+      );
+
+      await this.compactTeamAggregateStagingRows(
+        transaction,
+        day,
+        metricsType,
+        entityId,
+        generation,
+      );
+      await transaction('copilot_user_teams')
+        .where({ day, metrics_type: metricsType, entity_id: entityId })
+        .del();
+
+      let lastMembershipId = 0;
+      for (;;) {
+        const stagedMemberships = await transaction<
+          TeamMembershipStagingRow & { id: number }
+        >('copilot_user_teams_staging')
+          .where({
+            day,
+            metrics_type: metricsType,
+            entity_id: entityId,
+            generation,
+          })
+          .where('id', '>', lastMembershipId)
+          .orderBy('id', 'asc')
+          .limit(teamAggregationCopyBatchSize)
+          .select(
+            'id',
+            'day',
+            'metrics_type',
+            'entity_id',
+            'user_id',
+            'user_login',
+            'team_id',
+            'team_slug',
+          );
+        if (stagedMemberships.length === 0) {
+          break;
+        }
+
+        const memberships: V2UserTeamRow[] = stagedMemberships.map(row => ({
+          day: this.normalizeRequiredDay(row.day),
+          metrics_type: row.metrics_type,
+          entity_id: row.entity_id,
+          user_id: Number(row.user_id),
+          user_login: row.user_login,
+          team_id: Number(row.team_id),
+          team_slug: row.team_slug,
+        }));
+        await batchInsertInChunks(memberships, 100, async chunk => {
+          await transaction<V2UserTeamRow>('copilot_user_teams').insert(chunk);
+        });
+        lastMembershipId = Number(
+          stagedMemberships[stagedMemberships.length - 1].id,
+        );
+      }
+
+      await this.deleteTeamAggregateRows(
+        transaction,
+        day,
+        metricsType,
+        entityId,
+      );
+
+      let lastAggregateId = 0;
+      for (;;) {
+        const aggregateRows = await transaction<
+          TeamAggregateStagingRow & { id: number }
+        >('copilot_team_aggregates_staging')
+          .where({
+            day,
+            metrics_type: metricsType,
+            entity_id: entityId,
+            generation,
+          })
+          .where('id', '>', lastAggregateId)
+          .orderBy('id', 'asc')
+          .limit(teamAggregationCopyBatchSize)
+          .select('id', 'table_name', 'row_data');
+        if (aggregateRows.length === 0) {
+          break;
+        }
+
+        const rowsByTable = new Map<string, object[]>();
+        for (const row of aggregateRows) {
+          if (
+            !teamAggregateTables.includes(
+              row.table_name as (typeof teamAggregateTables)[number],
+            )
+          ) {
+            throw new Error(
+              `Unexpected team aggregate staging table "${row.table_name}".`,
+            );
+          }
+          const tableRows = rowsByTable.get(row.table_name) ?? [];
+          tableRows.push(JSON.parse(row.row_data) as object);
+          rowsByTable.set(row.table_name, tableRows);
+        }
+        for (const [tableName, tableRows] of rowsByTable) {
+          await batchInsertInChunks(tableRows, 100, async chunk => {
+            await transaction(tableName).insert(chunk);
+          });
+        }
+        lastAggregateId = Number(aggregateRows[aggregateRows.length - 1].id);
+      }
+
+      await transaction<TeamAggregationLogRow>('copilot_team_aggregation_log')
+        .insert({
+          day,
+          metrics_type: metricsType,
+          entity_id: entityId,
+          source,
+          generation,
+          status: 'complete',
+          error_message: null,
+          completed_at: new Date(),
+        })
+        .onConflict([
+          'day',
+          'metrics_type',
+          'entity_id',
+          'source',
+          'generation',
+        ])
+        .merge({
+          status: 'complete',
+          error_message: null,
+          completed_at: new Date(),
+        });
+      await transaction('copilot_user_teams_staging')
+        .where({
+          day,
+          metrics_type: metricsType,
+          entity_id: entityId,
+          generation,
+        })
+        .del();
+      await transaction('copilot_team_aggregates_staging')
+        .where({
+          day,
+          metrics_type: metricsType,
+          entity_id: entityId,
+          generation,
+        })
+        .del();
+    });
+  }
+
+  private validateTeamReplacementRows(
+    day: string,
+    metricsType: MetricsScope,
+    entityId: string,
+    userTeams: V2UserTeamRow[],
+    aggregates: TeamAggregates,
+  ): void {
+    if (
+      userTeams.some(
+        row =>
+          row.day !== day ||
+          row.metrics_type !== metricsType ||
+          row.entity_id !== entityId,
+      )
+    ) {
+      throw new Error(
+        'Team replacement memberships must match the requested day and scope.',
+      );
+    }
+
+    for (const [, rows] of teamAggregateRowsByTable(aggregates)) {
+      for (const rowValue of rows) {
+        const row = rowValue as {
+          day?: string;
+          metrics_type?: MetricsScope;
+          entity_id?: string;
+          team_slug?: string;
+        };
+        if (
+          row.day !== day ||
+          row.metrics_type !== metricsType ||
+          row.entity_id !== entityId ||
+          !row.team_slug
+        ) {
+          throw new Error(
+            'Team replacement aggregates must match the requested day and scope.',
+          );
+        }
+      }
+    }
+  }
+
+  private async insertTeamAggregateRows(
+    transaction: Knex.Transaction,
+    aggregates: TeamAggregates,
+  ): Promise<void> {
+    for (const [tableName, rows] of teamAggregateRowsByTable(aggregates)) {
+      if (!rows.length) {
+        continue;
+      }
+      await batchInsertInChunks(rows, 100, async chunk => {
+        await transaction(tableName).insert(chunk);
+      });
+    }
+  }
+
+  private async deleteTeamAggregateRows(
+    transaction: Knex.Transaction,
+    day: string | undefined,
+    metricsType: MetricsScope,
+    entityId: string,
+  ): Promise<void> {
+    for (const tableName of teamAggregateTables) {
+      const query = transaction(tableName).where({
+        metrics_type: metricsType,
+        entity_id: entityId,
+      });
+      if (day) {
+        query.where({ day });
+      }
+      query.whereNot('team_slug', '');
+      if (tableName === 'copilot_customization_metrics') {
+        query.where('scope', 'team');
+      }
+      await query.del();
+    }
+  }
+
+  private async tryActivateTeamAggregationSource(
+    transaction: Knex.Transaction,
+    metricsType: MetricsScope,
+    entityId: string,
+    source: TeamAggregationSource,
+    generation: string,
+    requiredDays: string[],
+    membershipAttempt?: TeamMembershipSnapshotAttempt,
+  ): Promise<boolean> {
+    const state = await this.lockTeamAggregationState(
+      transaction,
+      metricsType,
+      entityId,
+    );
+    if (source === 'organization-fallback') {
+      await this.assertRequiredTeamMembershipSnapshot(
+        transaction,
+        metricsType,
+        entityId,
+        membershipAttempt,
+      );
+    }
+    if (
+      state.pending_source !== source ||
+      state.pending_generation !== generation
+    ) {
+      throw new Error('Team aggregation transition is no longer active.');
+    }
+
+    const metricRows = await transaction('copilot_user_metrics')
+      .where({ metrics_type: metricsType, entity_id: entityId })
+      .distinct('day')
+      .select('day');
+    const currentDays = metricRows
+      .map(row => this.normalizeDay(row.day))
+      .filter((day): day is string => Boolean(day));
+    const allRequiredDays = [...new Set([...requiredDays, ...currentDays])];
+    const stagedRows = await transaction<TeamAggregationLogRow>(
+      'copilot_team_aggregation_log',
+    )
+      .where({
+        metrics_type: metricsType,
+        entity_id: entityId,
+        source,
+        generation,
+      })
+      .whereIn('status', ['staged', 'unavailable'])
+      .select('day');
+    const stagedDays = new Set(
+      stagedRows
+        .map(row => this.normalizeDay(row.day))
+        .filter((day): day is string => Boolean(day)),
+    );
+
+    if (allRequiredDays.some(day => !stagedDays.has(day))) {
+      return false;
+    }
+
+    await transaction('copilot_user_teams')
+      .where({ metrics_type: metricsType, entity_id: entityId })
+      .del();
+
+    let lastMembershipId = 0;
+    for (;;) {
+      const stagedMemberships = await transaction<
+        TeamMembershipStagingRow & { id: number }
+      >('copilot_user_teams_staging')
+        .where({
+          metrics_type: metricsType,
+          entity_id: entityId,
+          generation,
+        })
+        .where('id', '>', lastMembershipId)
+        .orderBy('id', 'asc')
+        .limit(teamAggregationCopyBatchSize)
+        .select(
+          'id',
+          'day',
+          'metrics_type',
+          'entity_id',
+          'user_id',
+          'user_login',
+          'team_id',
+          'team_slug',
+        );
+      if (stagedMemberships.length === 0) break;
+
+      const memberships: V2UserTeamRow[] = stagedMemberships.map(row => ({
+        day: this.normalizeRequiredDay(row.day),
+        metrics_type: row.metrics_type,
+        entity_id: row.entity_id,
+        user_id: Number(row.user_id),
+        user_login: row.user_login,
+        team_id: Number(row.team_id),
+        team_slug: row.team_slug,
+      }));
+      await batchInsertInChunks(memberships, 100, async chunk => {
+        await transaction<V2UserTeamRow>('copilot_user_teams').insert(chunk);
+      });
+      lastMembershipId = Number(
+        stagedMemberships[stagedMemberships.length - 1].id,
+      );
+    }
+
+    await this.deleteTeamAggregateRows(
+      transaction,
+      undefined,
+      metricsType,
+      entityId,
+    );
+
+    let lastAggregateId = 0;
+    for (;;) {
+      const aggregateRows = await transaction<
+        TeamAggregateStagingRow & { id: number }
+      >('copilot_team_aggregates_staging')
+        .where({
+          metrics_type: metricsType,
+          entity_id: entityId,
+          generation,
+        })
+        .where('id', '>', lastAggregateId)
+        .orderBy('id', 'asc')
+        .limit(teamAggregationCopyBatchSize)
+        .select('id', 'table_name', 'row_data');
+      if (aggregateRows.length === 0) break;
+
+      const rowsByTable = new Map<string, object[]>();
+      for (const row of aggregateRows) {
+        if (
+          !teamAggregateTables.includes(
+            row.table_name as (typeof teamAggregateTables)[number],
+          )
+        ) {
+          throw new Error(
+            `Unexpected team aggregate staging table "${row.table_name}".`,
+          );
+        }
+        const rows = rowsByTable.get(row.table_name) ?? [];
+        rows.push(JSON.parse(row.row_data) as object);
+        rowsByTable.set(row.table_name, rows);
+      }
+      for (const [tableName, rows] of rowsByTable) {
+        await batchInsertInChunks(rows, 100, async chunk => {
+          await transaction(tableName).insert(chunk);
+        });
+      }
+      lastAggregateId = Number(aggregateRows[aggregateRows.length - 1].id);
+    }
+
+    await transaction('copilot_team_aggregation_log')
+      .where({
+        metrics_type: metricsType,
+        entity_id: entityId,
+        source,
+        generation,
+        status: 'staged',
+      })
+      .update({
+        status: 'complete',
+        completed_at: new Date(),
+        error_message: null,
+      });
+    await transaction('copilot_team_aggregation_state')
+      .where({ metrics_type: metricsType, entity_id: entityId })
+      .update({
+        active_source: source,
+        active_generation: generation,
+        pending_source: null,
+        pending_generation: null,
+        updated_at: new Date(),
+      });
+    await transaction('copilot_user_teams_staging')
+      .where({
+        metrics_type: metricsType,
+        entity_id: entityId,
+        generation,
+      })
+      .del();
+    await transaction('copilot_team_aggregates_staging')
+      .where({
+        metrics_type: metricsType,
+        entity_id: entityId,
+        generation,
+      })
+      .del();
+    if (source === 'native') {
+      await transaction('copilot_team_membership_snapshot_staging')
+        .where({ metrics_type: metricsType, entity_id: entityId })
+        .del();
+      await transaction('copilot_team_membership_snapshot_state')
+        .where({ metrics_type: metricsType, entity_id: entityId })
+        .del();
+    }
+
+    return true;
+  }
+
+  async stageTeamAggregates(
+    day: string,
+    metricsType: MetricsScope,
+    entityId: string,
+    source: TeamAggregationSource,
+    generation: string,
+    requiredDays: string[],
+    userTeams: V2UserTeamRow[],
+    aggregates: TeamAggregates,
+    membershipAttempt?: TeamMembershipSnapshotAttempt,
+  ): Promise<boolean> {
+    this.validateTeamReplacementRows(
+      day,
+      metricsType,
+      entityId,
+      userTeams,
+      aggregates,
+    );
+
+    return this.db.transaction(async transaction => {
+      const state = await this.assertTeamAggregationGeneration(
+        transaction,
+        metricsType,
+        entityId,
+        source,
+        generation,
+        false,
+      );
+      if (
+        state.pending_source !== source ||
+        state.pending_generation !== generation
+      ) {
+        throw new Error('Team aggregation transition is no longer active.');
+      }
+      if (source === 'organization-fallback') {
+        await this.assertRequiredTeamMembershipSnapshot(
+          transaction,
+          metricsType,
+          entityId,
+          membershipAttempt,
+        );
+      }
+
+      await transaction('copilot_user_teams_staging')
+        .where({
+          day,
+          metrics_type: metricsType,
+          entity_id: entityId,
+          generation,
+        })
+        .del();
+      const stagedMemberships: TeamMembershipStagingRow[] = userTeams.map(
+        row => ({ ...row, generation }),
+      );
+      await batchInsertInChunks(stagedMemberships, 100, async chunk => {
+        await transaction<TeamMembershipStagingRow>(
+          'copilot_user_teams_staging',
+        ).insert(chunk);
+      });
+
+      await transaction('copilot_team_aggregates_staging')
+        .where({
+          day,
+          metrics_type: metricsType,
+          entity_id: entityId,
+          generation,
+        })
+        .del();
+      const aggregateRows: TeamAggregateStagingRow[] = [];
+      for (const [tableName, rows] of teamAggregateRowsByTable(aggregates)) {
+        for (const rowValue of rows) {
+          const row = rowValue as Record<string, unknown>;
+          const rowData = row;
+          aggregateRows.push({
+            day,
+            metrics_type: metricsType,
+            entity_id: entityId,
+            generation,
+            table_name: tableName,
+            row_key: getTeamAggregateRowKey(tableName, rowData),
+            row_data: JSON.stringify(rowData),
+          });
+        }
+      }
+      await batchInsertInChunks(aggregateRows, 100, async chunk => {
+        await transaction<TeamAggregateStagingRow>(
+          'copilot_team_aggregates_staging',
+        ).insert(chunk);
+      });
+
+      await transaction<TeamAggregationLogRow>('copilot_team_aggregation_log')
+        .insert({
+          day,
+          metrics_type: metricsType,
+          entity_id: entityId,
+          source,
+          generation,
+          status: 'staged',
+          error_message: null,
+          completed_at: new Date(),
+        })
+        .onConflict([
+          'day',
+          'metrics_type',
+          'entity_id',
+          'source',
+          'generation',
+        ])
+        .merge({
+          status: 'staged',
+          error_message: null,
+          completed_at: new Date(),
+        });
+
+      return this.tryActivateTeamAggregationSource(
+        transaction,
+        metricsType,
+        entityId,
+        source,
+        generation,
+        requiredDays,
+        membershipAttempt,
+      );
+    });
+  }
+
+  async activateTeamAggregationSource(
+    metricsType: MetricsScope,
+    entityId: string,
+    source: TeamAggregationSource,
+    generation: string,
+    requiredDays: string[],
+    membershipAttempt?: TeamMembershipSnapshotAttempt,
+  ): Promise<boolean> {
+    return this.db.transaction(transaction =>
+      this.tryActivateTeamAggregationSource(
+        transaction,
+        metricsType,
+        entityId,
+        source,
+        generation,
+        requiredDays,
+        membershipAttempt,
+      ),
+    );
+  }
+
+  async replaceTeamAggregates(
+    day: string,
+    metricsType: MetricsScope,
+    entityId: string,
+    source: TeamAggregationSource,
+    userTeams: V2UserTeamRow[],
+    aggregates: TeamAggregates,
+    membershipAttempt?: TeamMembershipSnapshotAttempt,
+  ): Promise<void> {
+    this.validateTeamReplacementRows(
+      day,
+      metricsType,
+      entityId,
+      userTeams,
+      aggregates,
+    );
+
+    await this.db.transaction(async transaction => {
+      const state = await this.lockTeamAggregationState(
+        transaction,
+        metricsType,
+        entityId,
+      );
+      if (state.active_source !== source || state.pending_source) {
+        throw new Error(
+          'Cannot replace team aggregates while a different source is active or transitioning.',
+        );
+      }
+      if (source === 'organization-fallback') {
+        await this.assertRequiredTeamMembershipSnapshot(
+          transaction,
+          metricsType,
+          entityId,
+          membershipAttempt,
+        );
+      }
+
+      await transaction('copilot_user_teams')
+        .where({ day, metrics_type: metricsType, entity_id: entityId })
+        .del();
+      const memberships: V2UserTeamRow[] = userTeams.map(row => ({
+        ...row,
+      }));
+      await batchInsertInChunks(memberships, 100, async chunk => {
+        await transaction<V2UserTeamRow>('copilot_user_teams').insert(chunk);
+      });
+
+      await this.deleteTeamAggregateRows(
+        transaction,
+        day,
+        metricsType,
+        entityId,
+      );
+      await this.insertTeamAggregateRows(transaction, aggregates);
+
+      await transaction('copilot_team_aggregation_log')
+        .insert({
+          day,
+          metrics_type: metricsType,
+          entity_id: entityId,
+          source,
+          generation: state.active_generation,
+          status: 'complete',
+          error_message: null,
+          completed_at: new Date(),
+        })
+        .onConflict([
+          'day',
+          'metrics_type',
+          'entity_id',
+          'source',
+          'generation',
+        ])
+        .merge({
+          status: 'complete',
+          error_message: null,
+          completed_at: new Date(),
+        });
+    });
+  }
+
+  async getBackfillStatus(
+    metricsType: MetricsScope,
+    entityId: string,
+    from?: string,
+    to?: string,
+  ): Promise<V2IngestionLogRow[]> {
+    const rows = await this.getIngestionLog(metricsType, entityId, from, to);
+    if (rows.length === 0) {
+      return rows;
+    }
+
+    const { activeSource, activeGeneration } =
+      await this.getTeamAggregationState(metricsType, entityId);
+    const unavailableRows = await this.db<TeamAggregationLogRow>(
+      'copilot_team_aggregation_log',
+    )
+      .where({
+        metrics_type: metricsType,
+        entity_id: entityId,
+        source: activeSource,
+        generation: activeGeneration,
+        status: 'unavailable',
+      })
+      .whereIn(
+        'day',
+        rows.map(row => row.day),
+      )
+      .select('day');
+    const unavailableDays = new Set(
+      unavailableRows
+        .map(row => this.normalizeDay(row.day))
+        .filter((day): day is string => Boolean(day)),
+    );
+
+    return rows.map(row => {
+      if (!unavailableDays.has(row.day)) {
+        return row;
+      }
+
+      const componentsLoaded = this.parseComponentsLoaded(
+        row.components_loaded,
+      );
+      return {
+        ...row,
+        components_loaded: JSON.stringify(
+          componentsLoaded.filter(component => component !== 'teams'),
+        ),
+      };
+    });
+  }
 
   async insertDailyTotals(rows: V2DailyTotal[]): Promise<void> {
     if (!rows.length) {
@@ -314,11 +2330,43 @@ export class DatabaseHandlerV2 {
       return;
     }
 
-    await batchInsertInChunks(rows, 100, async chunk => {
-      await this.db<V2UserTeamRow>('copilot_user_teams')
-        .insert(chunk)
-        .onConflict(['day', 'metrics_type', 'entity_id', 'user_id', 'team_id'])
-        .ignore();
+    const scopes = new Map<
+      string,
+      { metricsType: MetricsScope; entityId: string }
+    >();
+    for (const row of rows) {
+      scopes.set(JSON.stringify([row.metrics_type, row.entity_id]), {
+        metricsType: row.metrics_type,
+        entityId: row.entity_id,
+      });
+    }
+
+    await this.db.transaction(async transaction => {
+      for (const { metricsType, entityId } of scopes.values()) {
+        const state = await this.lockTeamAggregationState(
+          transaction,
+          metricsType,
+          entityId,
+        );
+        if (state.active_source !== 'native' || state.pending_source) {
+          throw new Error(
+            'Cannot insert native team memberships while a different source is active or transitioning.',
+          );
+        }
+      }
+
+      await batchInsertInChunks(rows, 100, async chunk => {
+        await transaction<V2UserTeamRow>('copilot_user_teams')
+          .insert(chunk)
+          .onConflict([
+            'day',
+            'metrics_type',
+            'entity_id',
+            'user_id',
+            'team_id',
+          ])
+          .ignore();
+      });
     });
   }
 

@@ -19,8 +19,14 @@ import { DateTime } from 'luxon';
 import {
   MetricsScope,
   V2UserMetricRow,
+  V2UserTeamRow,
 } from '@backstage-community/plugin-copilot-common';
 import { DatabaseHandlerV2 } from '../db/DatabaseHandlerV2';
+import type {
+  TeamAggregationSource,
+  TeamAggregationTransition,
+  TeamMembershipSnapshotAttempt,
+} from '../db/DatabaseHandlerV2';
 import { GithubClientV2 } from '../client/GithubClientV2';
 import {
   parseEnterpriseDocument,
@@ -37,6 +43,15 @@ type IngestSource = 'scheduled' | 'backfill';
 type IngestContext = {
   ingestTeams: boolean;
   source: IngestSource;
+  teamAggregationSource?: TeamAggregationSource;
+  teamAggregationGeneration?: string;
+  organizationTeamMembershipSnapshot?: TeamMembershipSnapshotAttempt;
+};
+
+type EnterpriseTeamAggregationContext = {
+  source: TeamAggregationSource;
+  activeGeneration: string;
+  organizationMembershipSnapshot?: TeamMembershipSnapshotAttempt;
 };
 
 export type TaskManagementV2Options = {
@@ -48,6 +63,47 @@ export type TaskManagementV2Options = {
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const GITHUB_REPORTS_EARLIEST_DATE = '2025-10-10';
+const scopeRunQueues = new Map<string, Promise<void>>();
+
+async function withScopeRunLocks(
+  scopes: Array<{ metricsType: MetricsScope; entityId: string }>,
+  run: () => Promise<void>,
+): Promise<void> {
+  const keys = [
+    ...new Set(
+      scopes.map(({ metricsType, entityId }) =>
+        JSON.stringify([metricsType, entityId]),
+      ),
+    ),
+  ].sort();
+
+  const acquire = async (index: number): Promise<void> => {
+    if (index === keys.length) {
+      await run();
+      return;
+    }
+
+    const key = keys[index];
+    const previous = scopeRunQueues.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const lock = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    scopeRunQueues.set(key, lock);
+
+    try {
+      await previous;
+      await acquire(index + 1);
+    } finally {
+      release();
+      if (scopeRunQueues.get(key) === lock) {
+        scopeRunQueues.delete(key);
+      }
+    }
+  };
+
+  await acquire(0);
+}
 
 function getRequiredComponents(ingestTeams: boolean): string[] {
   return ingestTeams ? ['totals', 'users', 'teams'] : ['totals'];
@@ -105,6 +161,21 @@ export class TaskManagementV2 {
   private constructor(private readonly options: TaskManagementV2Options) {}
 
   async runAsync(): Promise<void> {
+    const { config } = this.options;
+    const scopes: Array<{ metricsType: MetricsScope; entityId: string }> = [];
+    const enterprise = config.getOptionalString('copilot.enterprise');
+    const organization = config.getOptionalString('copilot.organization');
+    if (enterprise) {
+      scopes.push({ metricsType: 'enterprise', entityId: enterprise });
+    }
+    if (organization) {
+      scopes.push({ metricsType: 'organization', entityId: organization });
+    }
+
+    await withScopeRunLocks(scopes, () => this.runAsyncUnlocked());
+  }
+
+  private async runAsyncUnlocked(): Promise<void> {
     const { config, logger } = this.options;
     const enterprise = config.getOptionalString('copilot.enterprise');
     const organization = config.getOptionalString('copilot.organization');
@@ -176,6 +247,16 @@ export class TaskManagementV2 {
         );
       }
 
+      const teamAggregationContext =
+        entity.metricsType === 'enterprise' && ingestTeams && enterprise
+          ? await this.prepareEnterpriseTeamAggregation(
+              enterprise,
+              organization,
+              yesterday,
+              missingDays.some(day => day >= reportWindowStartDate),
+            )
+          : undefined;
+
       if (!missingDays.length) {
         logger.info(
           `[TaskManagementV2] No missing days for ${entity.metricsType}:${entity.entityId}.`,
@@ -191,6 +272,18 @@ export class TaskManagementV2 {
         await this.ingestDay(day, entity.metricsType, entity.entityId, {
           ingestTeams: ingestTeams && day >= reportWindowStartDate,
           source: 'scheduled',
+          teamAggregationSource:
+            entity.metricsType === 'enterprise'
+              ? teamAggregationContext?.source
+              : undefined,
+          teamAggregationGeneration:
+            entity.metricsType === 'enterprise'
+              ? teamAggregationContext?.activeGeneration
+              : undefined,
+          organizationTeamMembershipSnapshot:
+            entity.metricsType === 'enterprise'
+              ? teamAggregationContext?.organizationMembershipSnapshot
+              : undefined,
         });
 
         if (backfillDelayMs > 0) {
@@ -208,10 +301,24 @@ export class TaskManagementV2 {
     metricsType: MetricsScope,
     entityId: string,
   ): Promise<void> {
+    await withScopeRunLocks([{ metricsType, entityId }], () =>
+      this.runBackfillUnlocked(fromDate, toDate, metricsType, entityId),
+    );
+  }
+
+  private async runBackfillUnlocked(
+    fromDate: string,
+    toDate: string,
+    metricsType: MetricsScope,
+    entityId: string,
+  ): Promise<void> {
+    const { config } = this.options;
     const ingestTeams =
-      this.options.config.getOptionalBoolean('copilot.ingestTeams') ?? false;
+      config.getOptionalBoolean('copilot.ingestTeams') ?? false;
+    const enterprise = config.getOptionalString('copilot.enterprise');
+    const organization = config.getOptionalString('copilot.organization');
     const backfillDelayMs =
-      this.options.config.getOptionalNumber('copilot.backfillDelayMs') ?? 200;
+      config.getOptionalNumber('copilot.backfillDelayMs') ?? 200;
     const requiredComponents = getRequiredComponents(ingestTeams);
     const reportWindowStartDate = getReportWindowStartDate();
 
@@ -246,6 +353,19 @@ export class TaskManagementV2 {
       );
     }
 
+    const teamAggregationContext =
+      metricsType === 'enterprise' &&
+      entityId === enterprise &&
+      ingestTeams &&
+      enterprise
+        ? await this.prepareEnterpriseTeamAggregation(
+            enterprise,
+            organization,
+            toDate,
+            missingDays.some(day => day >= reportWindowStartDate),
+          )
+        : undefined;
+
     if (!missingDays.length) {
       this.options.logger.info(
         `[TaskManagementV2] No missing days for backfill ${metricsType}:${entityId} in range ${fromDate}..${toDate}.`,
@@ -261,10 +381,385 @@ export class TaskManagementV2 {
       await this.ingestDay(day, metricsType, entityId, {
         ingestTeams: ingestTeams && day >= reportWindowStartDate,
         source: 'backfill',
+        teamAggregationSource:
+          metricsType === 'enterprise'
+            ? teamAggregationContext?.source
+            : undefined,
+        teamAggregationGeneration:
+          metricsType === 'enterprise'
+            ? teamAggregationContext?.activeGeneration
+            : undefined,
+        organizationTeamMembershipSnapshot:
+          metricsType === 'enterprise'
+            ? teamAggregationContext?.organizationMembershipSnapshot
+            : undefined,
       });
 
       if (backfillDelayMs > 0) {
         await delay(backfillDelayMs);
+      }
+    }
+  }
+
+  private async prepareEnterpriseTeamAggregation(
+    enterprise: string,
+    organization: string | undefined,
+    probeDay: string,
+    loadActiveFallbackSnapshot: boolean,
+  ): Promise<EnterpriseTeamAggregationContext> {
+    const { api, db, logger } = this.options;
+    const initialState = await db.getTeamAggregationState(
+      'enterprise',
+      enterprise,
+    );
+    let desiredSource = initialState.pendingSource ?? initialState.activeSource;
+    let organizationMembershipSnapshot:
+      | TeamMembershipSnapshotAttempt
+      | undefined;
+
+    if (!organization) {
+      desiredSource = 'native';
+    } else {
+      try {
+        const access = await api.probeOrganizationUserTeamsReport(probeDay);
+        if (access === 'available' || access === 'installation-unavailable') {
+          desiredSource = 'native';
+        } else {
+          desiredSource = 'organization-fallback';
+        }
+      } catch (error) {
+        logger.warn(
+          `[TaskManagementV2] Unable to verify organization Copilot team-report access; keeping the active enterprise team source (${desiredSource}).`,
+          error,
+        );
+        desiredSource = initialState.pendingSource ?? initialState.activeSource;
+      }
+    }
+
+    let transition: TeamAggregationTransition | null = null;
+    if (
+      desiredSource !== initialState.activeSource ||
+      initialState.pendingSource
+    ) {
+      try {
+        transition = await db.beginTeamAggregationTransition(
+          'enterprise',
+          enterprise,
+          desiredSource,
+        );
+      } catch (error) {
+        logger.error(
+          `[TaskManagementV2] Unable to start the ${desiredSource} enterprise team aggregation transition.`,
+          error,
+        );
+      }
+    }
+
+    if (transition?.pendingSource === 'organization-fallback') {
+      try {
+        organizationMembershipSnapshot =
+          await this.loadOrganizationTeamMembershipSnapshot(
+            enterprise,
+            transition.pendingGeneration,
+          );
+        await this.rebuildEnterpriseTeamAggregates(
+          enterprise,
+          transition,
+          organizationMembershipSnapshot,
+        );
+      } catch (error) {
+        organizationMembershipSnapshot = undefined;
+        logger.warn(
+          '[TaskManagementV2] Unable to complete the organization team membership snapshot; the active enterprise team source will remain unchanged.',
+          error,
+        );
+      }
+    } else if (transition) {
+      try {
+        await this.rebuildEnterpriseTeamAggregates(
+          enterprise,
+          transition,
+          undefined,
+        );
+      } catch (error) {
+        logger.error(
+          `[TaskManagementV2] Failed to transition enterprise team aggregation to ${desiredSource}; the previously active source will remain in use.`,
+          error,
+        );
+      }
+    } else if (
+      desiredSource === 'organization-fallback' &&
+      initialState.activeSource === 'organization-fallback' &&
+      loadActiveFallbackSnapshot
+    ) {
+      try {
+        organizationMembershipSnapshot =
+          await this.loadOrganizationTeamMembershipSnapshot(enterprise);
+      } catch (error) {
+        organizationMembershipSnapshot = undefined;
+        logger.warn(
+          '[TaskManagementV2] Unable to refresh organization team membership; fallback team aggregation will be retried.',
+          error,
+        );
+      }
+    }
+
+    const state = await db.getTeamAggregationState('enterprise', enterprise);
+    if (
+      state.activeSource === 'organization-fallback' &&
+      loadActiveFallbackSnapshot &&
+      !organizationMembershipSnapshot
+    ) {
+      try {
+        organizationMembershipSnapshot =
+          await this.loadOrganizationTeamMembershipSnapshot(enterprise);
+      } catch (error) {
+        organizationMembershipSnapshot = undefined;
+        logger.warn(
+          '[TaskManagementV2] Unable to load organization team membership; fallback team aggregation will be retried.',
+          error,
+        );
+      }
+    }
+
+    return {
+      source: state.activeSource,
+      activeGeneration: state.activeGeneration,
+      organizationMembershipSnapshot,
+    };
+  }
+
+  private async loadOrganizationTeamMembershipSnapshot(
+    enterprise: string,
+    transitionGeneration?: string,
+  ): Promise<TeamMembershipSnapshotAttempt> {
+    const { api, db } = this.options;
+    const snapshotState = await db.beginTeamMembershipSnapshot(
+      'enterprise',
+      enterprise,
+      transitionGeneration,
+    );
+
+    if (!snapshotState.complete) {
+      await api.fetchOrganizationTeamMemberships({
+        afterCursor: snapshotState.cursor,
+        onPage: async batch => {
+          await db.saveTeamMembershipSnapshotBatch(
+            'enterprise',
+            enterprise,
+            snapshotState,
+            batch.memberships,
+            batch.cursor,
+            batch.complete,
+          );
+        },
+      });
+    }
+
+    const completedState = await db.getTeamMembershipSnapshotState(
+      'enterprise',
+      enterprise,
+      snapshotState,
+    );
+    if (!completedState.complete) {
+      throw new Error('Organization team membership snapshot is incomplete.');
+    }
+    return {
+      generation: completedState.generation,
+      attemptToken: completedState.attemptToken,
+    };
+  }
+
+  private async rebuildEnterpriseTeamAggregates(
+    enterprise: string,
+    transition: TeamAggregationTransition,
+    organizationMembershipSnapshot?: TeamMembershipSnapshotAttempt,
+  ): Promise<boolean> {
+    const { api, db, logger } = this.options;
+    const source = transition.pendingSource;
+    const generation = transition.pendingGeneration;
+    const reportWindowStartDate = getReportWindowStartDate();
+
+    for (;;) {
+      const requiredDays = await db.getUserMetricDays('enterprise', enterprise);
+      const missingDays = await db.getMissingTeamAggregationDays(
+        'enterprise',
+        enterprise,
+        source,
+        generation,
+      );
+
+      for (const day of missingDays) {
+        try {
+          if (source === 'native' && day < reportWindowStartDate) {
+            const activatedDuringSkip = await db.markTeamAggregationUnavailable(
+              day,
+              'enterprise',
+              enterprise,
+              source,
+              generation,
+              requiredDays,
+              `GitHub user-team reports are only available from ${reportWindowStartDate}.`,
+            );
+            if (activatedDuringSkip) {
+              return true;
+            }
+            continue;
+          }
+
+          const userMetrics = await db.getUserMetricsForDay(
+            'enterprise',
+            enterprise,
+            day,
+          );
+          const userBreakdowns = await db.getUserBreakdownsForDay(
+            'enterprise',
+            enterprise,
+            day,
+          );
+
+          if (source === 'organization-fallback') {
+            if (!organizationMembershipSnapshot) {
+              throw new Error(
+                'Organization team membership is unavailable for fallback aggregation.',
+              );
+            }
+            await db.beginTeamAggregationDayStaging(
+              day,
+              'enterprise',
+              enterprise,
+              source,
+              generation,
+              organizationMembershipSnapshot,
+            );
+            let cursor = 0;
+            for (;;) {
+              const batch = await db.getTeamMembershipSnapshotBatchForDay(
+                'enterprise',
+                enterprise,
+                organizationMembershipSnapshot,
+                day,
+                cursor,
+              );
+              if (batch.memberships.length > 0) {
+                const aggregates = aggregateTeamMetrics(
+                  userMetrics,
+                  batch.memberships,
+                  userBreakdowns,
+                  day,
+                  'enterprise',
+                  enterprise,
+                );
+                await db.stageTeamAggregationBatch(
+                  day,
+                  'enterprise',
+                  enterprise,
+                  source,
+                  generation,
+                  batch.memberships,
+                  aggregates,
+                  organizationMembershipSnapshot,
+                );
+              }
+              if (batch.nextCursor === null) {
+                break;
+              }
+              cursor = batch.nextCursor;
+            }
+
+            const activatedDuringStage =
+              await db.completeStagedTeamAggregationDay(
+                day,
+                'enterprise',
+                enterprise,
+                source,
+                generation,
+                organizationMembershipSnapshot,
+                requiredDays,
+              );
+            if (activatedDuringStage) {
+              return true;
+            }
+          } else {
+            const envelope = await api.fetchEnterpriseUserTeamsLinks(day);
+            const userTeams: V2UserTeamRow[] = [];
+            for (const url of envelope.download_links ?? []) {
+              const rows = await api.downloadNdjsonDocument(url);
+              userTeams.push(
+                ...parseUserTeamsDocument(rows, 'enterprise', enterprise),
+              );
+            }
+
+            const aggregates = aggregateTeamMetrics(
+              userMetrics,
+              userTeams,
+              userBreakdowns,
+              day,
+              'enterprise',
+              enterprise,
+            );
+            const activatedDuringStage = await db.stageTeamAggregates(
+              day,
+              'enterprise',
+              enterprise,
+              source,
+              generation,
+              requiredDays,
+              userTeams,
+              aggregates,
+            );
+            if (activatedDuringStage) {
+              return true;
+            }
+          }
+        } catch (error) {
+          const message =
+            error instanceof Error ? error.message : String(error);
+          await db
+            .recordTeamAggregationFailure(
+              day,
+              'enterprise',
+              enterprise,
+              source,
+              generation,
+              message,
+              organizationMembershipSnapshot,
+            )
+            .catch(() => undefined);
+          logger.error(
+            `[TaskManagementV2] Failed to rebuild ${source} team aggregation for enterprise:${enterprise} on ${day}; the active source remains unchanged.`,
+            error,
+          );
+          return false;
+        }
+      }
+
+      const activated = await db.activateTeamAggregationSource(
+        'enterprise',
+        enterprise,
+        source,
+        generation,
+        requiredDays,
+        organizationMembershipSnapshot,
+      );
+      if (activated) {
+        return true;
+      }
+
+      const state = await db.getTeamAggregationState('enterprise', enterprise);
+      if (
+        state.activeSource === source &&
+        state.activeGeneration === generation &&
+        !state.pendingGeneration
+      ) {
+        return true;
+      }
+
+      if (
+        state.pendingSource !== source ||
+        state.pendingGeneration !== generation
+      ) {
+        return false;
       }
     }
   }
@@ -382,13 +877,101 @@ export class TaskManagementV2 {
     entityId: string,
     userMetrics: V2UserMetricRow[],
     userBreakdowns: UserBreakdownData[],
+    teamAggregationSource: TeamAggregationSource,
+    teamAggregationGeneration?: string,
+    organizationTeamMembershipSnapshot?: TeamMembershipSnapshotAttempt,
   ): Promise<boolean> {
     const { api, db, logger } = this.options;
+    const source =
+      metricsType === 'enterprise' ? teamAggregationSource : 'native';
+
+    if (source === 'organization-fallback') {
+      if (!teamAggregationGeneration || !organizationTeamMembershipSnapshot) {
+        logger.warn(
+          `[TaskManagementV2] Organization team membership is unavailable for enterprise:${entityId} on ${day}; fallback aggregation will be retried.`,
+        );
+        return false;
+      }
+
+      let aggregateUserMetrics = userMetrics;
+      let aggregateUserBreakdowns = userBreakdowns;
+      if (aggregateUserMetrics.length === 0) {
+        aggregateUserMetrics = await db.getUserMetricsForDay(
+          metricsType,
+          entityId,
+          day,
+        );
+        if (aggregateUserMetrics.length === 0) {
+          logger.warn(
+            `[TaskManagementV2] No stored per-user metrics for enterprise:${entityId} on ${day}; fallback team aggregation will be retried without replacing the day.`,
+          );
+          return false;
+        }
+        aggregateUserBreakdowns = await db.getUserBreakdownsForDay(
+          metricsType,
+          entityId,
+          day,
+        );
+      }
+
+      await db.beginTeamAggregationDayStaging(
+        day,
+        metricsType,
+        entityId,
+        source,
+        teamAggregationGeneration,
+        organizationTeamMembershipSnapshot,
+      );
+      let cursor = 0;
+      for (;;) {
+        const batch = await db.getTeamMembershipSnapshotBatchForDay(
+          metricsType,
+          entityId,
+          organizationTeamMembershipSnapshot,
+          day,
+          cursor,
+        );
+        if (batch.memberships.length > 0) {
+          const aggregates = aggregateTeamMetrics(
+            aggregateUserMetrics,
+            batch.memberships,
+            aggregateUserBreakdowns,
+            day,
+            metricsType,
+            entityId,
+          );
+          await db.stageTeamAggregationBatch(
+            day,
+            metricsType,
+            entityId,
+            source,
+            teamAggregationGeneration,
+            batch.memberships,
+            aggregates,
+            organizationTeamMembershipSnapshot,
+          );
+        }
+        if (batch.nextCursor === null) {
+          break;
+        }
+        cursor = batch.nextCursor;
+      }
+
+      await db.replaceStagedTeamAggregates(
+        day,
+        metricsType,
+        entityId,
+        source,
+        teamAggregationGeneration,
+        organizationTeamMembershipSnapshot,
+      );
+      return true;
+    }
+
     const userTeamsEnvelope =
       metricsType === 'enterprise'
         ? await api.fetchEnterpriseUserTeamsLinks(day)
         : await api.fetchOrganizationUserTeamsLinks(day);
-
     const userTeamLinks = userTeamsEnvelope.download_links ?? [];
     if (userTeamLinks.length === 0) {
       logger.warn(
@@ -397,16 +980,10 @@ export class TaskManagementV2 {
       return false;
     }
 
-    const userTeams: ReturnType<typeof parseUserTeamsDocument> = [];
+    const userTeams: V2UserTeamRow[] = [];
     for (const url of userTeamLinks) {
       const rows = await api.downloadNdjsonDocument(url);
       userTeams.push(...parseUserTeamsDocument(rows, metricsType, entityId));
-    }
-
-    await db.insertUserTeams(userTeams);
-
-    if (userMetrics.length === 0) {
-      return false;
     }
 
     const teamAggregates = aggregateTeamMetrics(
@@ -418,15 +995,16 @@ export class TaskManagementV2 {
       entityId,
     );
 
-    await db.insertDailyTotals(teamAggregates.dailyTotals);
-    await db.insertByFeature(teamAggregates.byFeature);
-    await db.insertByIde(teamAggregates.byIde);
-    await db.insertByLanguageFeature(teamAggregates.byLanguageFeature);
-    await db.insertByModelFeature(teamAggregates.byModelFeature);
-    await db.insertByLanguageModel(teamAggregates.byLanguageModel);
-    await db.insertCustomizationMetrics(teamAggregates.customizationMetrics);
+    await db.replaceTeamAggregates(
+      day,
+      metricsType,
+      entityId,
+      source,
+      userTeams,
+      teamAggregates,
+    );
 
-    return true;
+    return userMetrics.length > 0;
   }
 
   private async logIngestionOutcome(
@@ -481,10 +1059,11 @@ export class TaskManagementV2 {
     metricsType: MetricsScope,
     entityId: string,
     context: IngestContext,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const { db, logger } = this.options;
     const requiredComponents = getRequiredComponents(context.ingestTeams);
     const componentsLoaded = new Set<string>();
+    let userReportsLoaded = false;
 
     try {
       const previousLog = (
@@ -520,18 +1099,23 @@ export class TaskManagementV2 {
               ),
             }
           : await this.ingestUserReports(day, metricsType, entityId);
+        userReportsLoaded = userReport.loaded;
         if (userReport.loaded) {
           componentsLoaded.add('users');
         }
 
         if (
-          await this.ingestTeamAggregates(
+          context.ingestTeams &&
+          (await this.ingestTeamAggregates(
             day,
             metricsType,
             entityId,
             userReport.userMetrics,
             userReport.userBreakdowns,
-          )
+            context.teamAggregationSource ?? 'native',
+            context.teamAggregationGeneration,
+            context.organizationTeamMembershipSnapshot,
+          ))
         ) {
           componentsLoaded.add('teams');
         }
@@ -545,6 +1129,7 @@ export class TaskManagementV2 {
         [...componentsLoaded],
         requiredComponents,
       );
+      return userReportsLoaded;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       logger.error(
@@ -561,6 +1146,7 @@ export class TaskManagementV2 {
         error_message: message,
         source: context.source,
       });
+      return userReportsLoaded;
     }
   }
 }

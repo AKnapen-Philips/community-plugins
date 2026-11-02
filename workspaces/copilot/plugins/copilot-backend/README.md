@@ -79,6 +79,11 @@ Configure the following `app-config.yaml` values:
 - `copilot.ingestTeams`: Optional flag that enables user and user-team ingestion so V2 team filtering can be derived. Default: `false`.
 
 At least one of `copilot.enterprise` or `copilot.organization` must be configured.
+When team ingestion is enabled and both scopes are configured, enterprise team
+views use the enterprise user-team report when available. If it is unavailable,
+the backend can derive enterprise teams from a complete organization team
+membership snapshot. The switch is staged atomically, and native reports are
+used again when they become available.
 
 Example:
 
