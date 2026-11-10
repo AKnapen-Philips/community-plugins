@@ -114,6 +114,14 @@ function rawFetchResponse(data: unknown, link?: string) {
   };
 }
 
+function timedReportRequestOptions() {
+  return expect.objectContaining({
+    request: expect.objectContaining({
+      signal: expect.any(AbortSignal),
+    }),
+  });
+}
+
 function httpError(status: number): Error & { status: number } {
   return Object.assign(new Error(`HTTP ${status}`), { status });
 }
@@ -423,7 +431,43 @@ describe('GithubClientV2', () => {
     expect(mockFetch).toHaveBeenNthCalledWith(
       3,
       'https://my-bucket.s3.amazonaws.com/report.json',
-      { redirect: 'manual' },
+      {
+        redirect: 'manual',
+        signal: expect.any(AbortSignal),
+      },
+    );
+  });
+
+  it('times out a stalled report-link request', async () => {
+    mockRequest.mockImplementationOnce(
+      (_route: string, options: { request: { signal: AbortSignal } }) =>
+        new Promise((_, reject) => {
+          options.request.signal.addEventListener(
+            'abort',
+            () => reject(options.request.signal.reason),
+            { once: true },
+          );
+        }),
+    );
+    const client = new GithubClientV2(
+      {
+        host: 'github.com',
+        enterprise: 'my-enterprise',
+        apiBaseUrl: 'https://api.github.com',
+      },
+      mockConfig,
+      mockLogger,
+      10,
+    );
+
+    await expect(
+      client.fetchEnterpriseReportLinks('2026-01-01'),
+    ).rejects.toMatchObject({
+      name: 'TimeoutError',
+    });
+    expect(mockRequest).toHaveBeenCalledWith(
+      'GET /enterprises/my-enterprise/copilot/metrics/reports/enterprise-1-day?day=2026-01-01',
+      timedReportRequestOptions(),
     );
   });
 
@@ -485,7 +529,10 @@ describe('GithubClientV2', () => {
     expect(mockFetch).toHaveBeenNthCalledWith(
       2,
       'https://my-bucket.s3.eu-north-1.amazonaws.com/reports/final.json',
-      { redirect: 'manual' },
+      {
+        redirect: 'manual',
+        signal: expect.any(AbortSignal),
+      },
     );
 
     // A redirect without a Location header is an error, not a silent retry.
@@ -547,6 +594,7 @@ describe('GithubClientV2', () => {
     // Assert
     expect(mockRequest).toHaveBeenCalledWith(
       `GET /enterprises/my-enterprise/copilot/metrics/reports/enterprise-1-day?day=2026-01-01`,
+      timedReportRequestOptions(),
     );
 
     expect(mockOutgoingHeaders[0]).toEqual({
@@ -569,6 +617,7 @@ describe('GithubClientV2', () => {
 
     expect(mockRequest).toHaveBeenCalledWith(
       `GET /orgs/my-org/copilot/metrics/reports/organization-1-day?day=2026-01-02`,
+      timedReportRequestOptions(),
     );
     expect(res.download_links[0]).toContain('raw.githubusercontent.com');
   });
@@ -585,6 +634,7 @@ describe('GithubClientV2', () => {
 
     expect(mockRequest).toHaveBeenCalledWith(
       `GET /enterprises/my-enterprise/copilot/metrics/reports/users-1-day?day=2026-01-03`,
+      timedReportRequestOptions(),
     );
     expect(res.download_links[0]).toContain('raw.githubusercontent.com');
   });
@@ -634,6 +684,7 @@ describe('GithubClientV2', () => {
     expect(mockRequest).toHaveBeenNthCalledWith(
       2,
       'GET /orgs/my-org/copilot/metrics/reports/users-1-day?day=2026-01-03',
+      timedReportRequestOptions(),
     );
   });
 
@@ -651,6 +702,7 @@ describe('GithubClientV2', () => {
 
     expect(mockRequest).toHaveBeenCalledWith(
       `GET /enterprises/my-enterprise/copilot/metrics/reports/user-teams-1-day?day=2026-01-04`,
+      timedReportRequestOptions(),
     );
     expect(res.download_links[0]).toContain('raw.githubusercontent.com');
   });
@@ -663,6 +715,7 @@ describe('GithubClientV2', () => {
 
     expect(mockRequest).toHaveBeenCalledWith(
       'GET /orgs/my-org/copilot/metrics/reports/user-teams-1-day?day=2026-01-04',
+      timedReportRequestOptions(),
     );
   });
 
@@ -1752,6 +1805,7 @@ describe('GithubClientV2', () => {
     });
     expect(mockRequest).toHaveBeenCalledWith(
       'GET /orgs/my-org/copilot/metrics/reports/organization-1-day?day=2026-01-02',
+      timedReportRequestOptions(),
     );
     expect(mockCreateAppAuth).not.toHaveBeenCalled();
   });

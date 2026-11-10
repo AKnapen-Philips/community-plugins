@@ -390,6 +390,84 @@ describe('TaskManagementV2', () => {
     expect(db.replaceTeamAggregates).toHaveBeenCalledTimes(2);
   });
 
+  it('releases the ingestion queue when a report download times out', async () => {
+    jest.useRealTimers();
+    const db = createDbMock();
+    const api = createApiMock();
+    const logger = createLoggerMock();
+    const day = DateTime.utc().minus({ days: 1 }).toISODate()!;
+    const config = createConfigMock({
+      'copilot.enterprise': 'ent-1',
+      'copilot.backfillFromDate': DateTime.utc()
+        .minus({ days: 3 })
+        .toISODate()!,
+      'copilot.backfillDelayMs': 0,
+      'copilot.ingestTeams': false,
+    });
+    const client = new GithubClientV2(
+      {
+        host: 'github.com',
+        enterprise: 'ent-1',
+        apiBaseUrl: 'https://api.github.com',
+      },
+      config,
+      logger,
+      50,
+    );
+    const originalFetch = global.fetch;
+    let startDownload!: () => void;
+    const downloadStarted = new Promise<void>(resolve => {
+      startDownload = resolve;
+    });
+    global.fetch = jest.fn(
+      (_input: RequestInfo | URL, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          startDownload();
+          const signal = init?.signal;
+          if (signal) {
+            signal.addEventListener('abort', () => reject(signal.reason), {
+              once: true,
+            });
+          }
+        }),
+    ) as typeof fetch;
+
+    db.getMissingDays.mockResolvedValue([]);
+    api.fetchEnterpriseReportLinks.mockResolvedValue({
+      download_links: ['https://downloads.github.com/totals.json'],
+    });
+    let downloadCount = 0;
+    api.downloadDocument.mockImplementation((url: string) => {
+      downloadCount += 1;
+      return downloadCount === 1
+        ? client.downloadDocument(url)
+        : Promise.resolve({});
+    });
+
+    const options = {
+      db: db as unknown as DatabaseHandlerV2,
+      api: api as unknown as GithubClientV2,
+      config,
+      logger,
+    };
+
+    try {
+      const task = TaskManagementV2.create(options);
+      const scheduledRun = task.runAsync();
+      await downloadStarted;
+
+      const backfillRun = runBackfill(options, day, day, 'enterprise', 'ent-1');
+      expect(api.fetchEnterpriseReportLinks).toHaveBeenCalledTimes(1);
+
+      await Promise.all([scheduledRun, backfillRun]);
+
+      expect(api.fetchEnterpriseReportLinks).toHaveBeenCalledTimes(4);
+      expect(db.replaceRawReportDay).not.toHaveBeenCalled();
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
   it('does not fetch a cost-center snapshot when no days need processing', async () => {
     const db = createDbMock();
     const api = createApiMock();
@@ -1939,6 +2017,7 @@ describe('TaskManagementV2', () => {
     'download failure',
     'empty report',
     'malformed totals',
+    'malformed customization',
     '404',
   ])(
     'preserves existing data when a refetch fails with %s and replaces it on retry',
@@ -1967,6 +2046,12 @@ describe('TaskManagementV2', () => {
       db.getUserBreakdownsForDay.mockResolvedValue([
         makeStoredUserBreakdown(1, 'octocat'),
       ]);
+      const storedCustomizationMetrics = [
+        { category: 'skill', item_name: 'existing', interaction_count: 1 },
+      ];
+      db.replaceRawReportDay.mockImplementation(() => {
+        storedCustomizationMetrics.length = 0;
+      });
       api.fetchCostCenterMemberships.mockResolvedValue(
         makeCostCenterSnapshot(
           new Map([[1, { costCenterId: 'cc-1', login: 'octocat' }]]),
@@ -1997,6 +2082,12 @@ describe('TaskManagementV2', () => {
           day,
           totals_by_feature: 'invalid',
         });
+      } else if (failure === 'malformed customization') {
+        const document = makeEnterpriseDocument(day);
+        Object.assign(document[0].day_totals[0], {
+          totals_by_skill: [{ bad: true }],
+        });
+        api.downloadDocument.mockResolvedValueOnce(document);
       } else if (failure === '404') {
         api.fetchEnterpriseUserReportLinks.mockRejectedValueOnce(
           Object.assign(new Error('Not Found'), { status: 404 }),
@@ -2017,6 +2108,9 @@ describe('TaskManagementV2', () => {
       await task.runBackfill(day, day, 'enterprise', 'ent-1');
 
       expect(db.replaceRawReportDay).not.toHaveBeenCalled();
+      expect(storedCustomizationMetrics).toEqual([
+        { category: 'skill', item_name: 'existing', interaction_count: 1 },
+      ]);
       expect(db.replaceCostCenterAggregates).not.toHaveBeenCalled();
       expect(db.replaceTeamAggregates).not.toHaveBeenCalled();
       expect(db.upsertIngestionLog).not.toHaveBeenCalled();
@@ -2024,7 +2118,9 @@ describe('TaskManagementV2', () => {
       await task.runBackfill(day, day, 'enterprise', 'ent-1');
 
       expect(api.fetchEnterpriseUserReportLinks).toHaveBeenCalledTimes(
-        failure === 'malformed totals' ? 1 : 2,
+        failure === 'malformed totals' || failure === 'malformed customization'
+          ? 1
+          : 2,
       );
       expect(api.fetchEnterpriseUserReportLinks).toHaveBeenLastCalledWith(day);
       expect(db.replaceRawReportDay).toHaveBeenCalledTimes(1);

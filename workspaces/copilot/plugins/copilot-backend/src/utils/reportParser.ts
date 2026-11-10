@@ -171,6 +171,7 @@ type CustomizationContext = {
   metrics_type: MetricsScope;
   entity_id: string;
   scope: 'aggregate' | 'user';
+  strict: boolean;
   user_id?: number;
   user_login?: string;
 };
@@ -229,7 +230,10 @@ function parseCustomizationData(
 
     for (const row of value) {
       if (!isRecord(row)) {
-        logWarn(`Skipping ${field} row because it is not an object.`);
+        logWarn(
+          `Skipping ${field} row because it is not an object.`,
+          context.strict,
+        );
         continue;
       }
 
@@ -241,7 +245,10 @@ function parseCustomizationData(
         typeof interactionCount !== 'number' ||
         !Number.isFinite(interactionCount)
       ) {
-        logWarn(`Skipping ${field} row with invalid customization data.`);
+        logWarn(
+          `Skipping ${field} row with invalid customization data.`,
+          context.strict,
+        );
         continue;
       }
 
@@ -429,6 +436,7 @@ export function parseEnterpriseDocument(
         metrics_type: metricsType,
         entity_id: entityId,
         scope: 'aggregate',
+        strict,
       });
       parsed.customizationMetrics.push(...customizationData.metrics);
       parsed.customizationSummaries.push(...customizationData.summaries);
@@ -845,6 +853,7 @@ export function parseOrganizationDocument(
       metrics_type: metricsType,
       entity_id: entityId,
       scope: 'aggregate',
+      strict,
     });
     parsed.customizationMetrics.push(...customizationData.metrics);
     parsed.customizationSummaries.push(...customizationData.summaries);
@@ -1162,6 +1171,7 @@ export function parseUserDocument(
       metrics_type: metricsType,
       entity_id: entityId,
       scope: 'user',
+      strict,
       user_id: userId,
       user_login: userLogin,
     });
