@@ -119,9 +119,39 @@ export interface ParsedUserDocument {
   customizationSummaries: V2CustomizationSummaryRow[];
 }
 
-function logWarn(message: string): void {
+function logWarn(message: string, strict: boolean = false): void {
+  if (strict) {
+    throw new Error(`[reportParser] ${message}`);
+  }
+
   // eslint-disable-next-line no-console
   console.warn(`[reportParser] ${message}`);
+}
+
+function validateOptionalArrayFields(
+  record: Record<string, unknown>,
+  fields: string[],
+  strict: boolean,
+): void {
+  for (const field of fields) {
+    const value = record[field];
+    if (value !== undefined && value !== null && !Array.isArray(value)) {
+      logWarn(`Expected ${field} to be an array.`, strict);
+    }
+  }
+}
+
+function validateOptionalObjectFields(
+  record: Record<string, unknown>,
+  fields: string[],
+  strict: boolean,
+): void {
+  for (const field of fields) {
+    const value = record[field];
+    if (value !== undefined && value !== null && !isRecord(value)) {
+      logWarn(`Expected ${field} to be an object.`, strict);
+    }
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -151,6 +181,8 @@ const TYPED_BREAKDOWN_CATEGORIES = new Set([
   'language_feature',
   'model_feature',
   'language_model',
+  'cli',
+  'vscode_agent',
 ]);
 
 function isCustomizationCategory(category: string): boolean {
@@ -166,6 +198,7 @@ function isCustomizationCategory(category: string): boolean {
 function parseCustomizationData(
   record: Record<string, unknown>,
   context: CustomizationContext,
+  strict: boolean,
 ): {
   metrics: V2CustomizationMetricRow[];
   summaries: V2CustomizationSummaryRow[];
@@ -175,7 +208,7 @@ function parseCustomizationData(
   const categories = new Set<string>();
 
   for (const [field, value] of Object.entries(record)) {
-    if (!field.startsWith('totals_by_') || !Array.isArray(value)) {
+    if (!field.startsWith('totals_by_')) {
       continue;
     }
 
@@ -187,8 +220,17 @@ function parseCustomizationData(
       continue;
     }
 
+    if (value !== undefined && value !== null && !Array.isArray(value)) {
+      logWarn(`Expected ${field} to be an array.`, strict);
+      continue;
+    }
+    if (!Array.isArray(value)) {
+      continue;
+    }
+
     for (const row of value) {
       if (!isRecord(row)) {
+        logWarn(`Skipping ${field} row because it is not an object.`, strict);
         continue;
       }
 
@@ -200,6 +242,10 @@ function parseCustomizationData(
         typeof interactionCount !== 'number' ||
         !Number.isFinite(interactionCount)
       ) {
+        logWarn(
+          `Skipping ${field} row with invalid customization data.`,
+          strict,
+        );
         continue;
       }
 
@@ -221,12 +267,11 @@ function parseCustomizationData(
 
   for (const [field, value] of Object.entries(record)) {
     const match = /^distinct_([a-z][a-z0-9_]*)_use_count$/.exec(field);
-    if (
-      !match ||
-      typeof value !== 'number' ||
-      !Number.isFinite(value) ||
-      !isCustomizationCategory(match[1])
-    ) {
+    if (!match || !isCustomizationCategory(match[1])) {
+      continue;
+    }
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+      logWarn(`Skipping ${field} with an invalid count.`, strict);
       continue;
     }
 
@@ -262,7 +307,9 @@ export function parseEnterpriseDocument(
   doc: unknown,
   metricsType: MetricsScope,
   entityId: string,
+  options: { strict?: boolean } = {},
 ): ParsedEnterpriseDocument {
+  const strict = options.strict ?? false;
   const parsed: ParsedEnterpriseDocument = {
     dailyTotals: [],
     prMetrics: [],
@@ -292,6 +339,7 @@ export function parseEnterpriseDocument(
   if (rawDocs.length === 0) {
     logWarn(
       'Expected enterprise document object or array, received invalid or empty payload.',
+      strict,
     );
     return parsed;
   }
@@ -300,10 +348,14 @@ export function parseEnterpriseDocument(
     // Unwrap V2EnterpriseDocument (day_totals wrapper) if present;
     // otherwise treat the item itself as the day's metrics object.
     if (!isRecord(rawDoc)) {
-      logWarn('Skipping enterprise document item because it is not an object.');
+      logWarn(
+        'Skipping enterprise document item because it is not an object.',
+        strict,
+      );
       continue;
     }
 
+    validateOptionalArrayFields(rawDoc, ['day_totals'], strict);
     const dayTotals: unknown[] = Array.isArray(rawDoc.day_totals)
       ? (rawDoc.day_totals as unknown[])
       : [rawDoc];
@@ -312,13 +364,34 @@ export function parseEnterpriseDocument(
       if (!isRecord(dayTotal)) {
         logWarn(
           'Skipping enterprise document item because it is not an object.',
+          strict,
         );
         continue;
       }
 
+      validateOptionalArrayFields(
+        dayTotal,
+        [
+          'totals_by_feature',
+          'totals_by_ide',
+          'totals_by_language_feature',
+          'totals_by_model_feature',
+          'totals_by_language_model',
+        ],
+        strict,
+      );
+      validateOptionalObjectFields(
+        dayTotal,
+        ['pull_requests', 'totals_by_cli', 'totals_by_vscode_agent'],
+        strict,
+      );
+
       const day = toStringValue(dayTotal.day);
       if (!day) {
-        logWarn('Skipping enterprise document item with missing day field.');
+        logWarn(
+          'Skipping enterprise document item with missing day field.',
+          strict,
+        );
         continue;
       }
 
@@ -355,12 +428,16 @@ export function parseEnterpriseDocument(
         ),
       });
 
-      const customizationData = parseCustomizationData(dayTotal, {
-        day,
-        metrics_type: metricsType,
-        entity_id: entityId,
-        scope: 'aggregate',
-      });
+      const customizationData = parseCustomizationData(
+        dayTotal,
+        {
+          day,
+          metrics_type: metricsType,
+          entity_id: entityId,
+          scope: 'aggregate',
+        },
+        strict,
+      );
       parsed.customizationMetrics.push(...customizationData.metrics);
       parsed.customizationSummaries.push(...customizationData.summaries);
 
@@ -410,7 +487,10 @@ export function parseEnterpriseDocument(
       if (Array.isArray(dayTotal.totals_by_feature)) {
         for (const row of dayTotal.totals_by_feature) {
           if (!isRecord(row) || !toStringValue(row.feature)) {
-            logWarn('Skipping totals_by_feature row with missing feature.');
+            logWarn(
+              'Skipping totals_by_feature row with missing feature.',
+              strict,
+            );
             continue;
           }
 
@@ -442,7 +522,7 @@ export function parseEnterpriseDocument(
       if (Array.isArray(dayTotal.totals_by_ide)) {
         for (const row of dayTotal.totals_by_ide) {
           if (!isRecord(row) || !toStringValue(row.ide)) {
-            logWarn('Skipping totals_by_ide row with missing ide.');
+            logWarn('Skipping totals_by_ide row with missing ide.', strict);
             continue;
           }
 
@@ -480,6 +560,7 @@ export function parseEnterpriseDocument(
           ) {
             logWarn(
               'Skipping totals_by_language_feature row with missing language or feature.',
+              strict,
             );
             continue;
           }
@@ -517,6 +598,7 @@ export function parseEnterpriseDocument(
           ) {
             logWarn(
               'Skipping totals_by_model_feature row with missing model or feature.',
+              strict,
             );
             continue;
           }
@@ -556,6 +638,7 @@ export function parseEnterpriseDocument(
           ) {
             logWarn(
               'Skipping totals_by_language_model row with missing language or model.',
+              strict,
             );
             continue;
           }
@@ -638,7 +721,9 @@ export function parseOrganizationDocument(
   doc: unknown,
   metricsType: MetricsScope,
   entityId: string,
+  options: { strict?: boolean } = {},
 ): ParsedEnterpriseDocument {
+  const strict = options.strict ?? false;
   const parsed: ParsedEnterpriseDocument = {
     dailyTotals: [],
     prMetrics: [],
@@ -664,7 +749,10 @@ export function parseOrganizationDocument(
   }
 
   if (orgDocs.length === 0) {
-    logWarn('Expected organization document object, received invalid payload.');
+    logWarn(
+      'Expected organization document object, received invalid payload.',
+      strict,
+    );
     return parsed;
   }
 
@@ -672,13 +760,34 @@ export function parseOrganizationDocument(
     if (!isRecord(orgDoc)) {
       logWarn(
         'Skipping organization document item because it is not an object.',
+        strict,
       );
       continue;
     }
 
+    validateOptionalArrayFields(
+      orgDoc,
+      [
+        'totals_by_feature',
+        'totals_by_ide',
+        'totals_by_language_feature',
+        'totals_by_model_feature',
+        'totals_by_language_model',
+      ],
+      strict,
+    );
+    validateOptionalObjectFields(
+      orgDoc,
+      ['totals_by_cli', 'totals_by_vscode_agent'],
+      strict,
+    );
+
     const day = toStringValue(orgDoc.day);
     if (!day) {
-      logWarn('Skipping organization document item with missing day field.');
+      logWarn(
+        'Skipping organization document item with missing day field.',
+        strict,
+      );
       continue;
     }
 
@@ -739,12 +848,16 @@ export function parseOrganizationDocument(
       ),
     });
 
-    const customizationData = parseCustomizationData(orgDoc, {
-      day,
-      metrics_type: metricsType,
-      entity_id: entityId,
-      scope: 'aggregate',
-    });
+    const customizationData = parseCustomizationData(
+      orgDoc,
+      {
+        day,
+        metrics_type: metricsType,
+        entity_id: entityId,
+        scope: 'aggregate',
+      },
+      strict,
+    );
     parsed.customizationMetrics.push(...customizationData.metrics);
     parsed.customizationSummaries.push(...customizationData.summaries);
 
@@ -753,7 +866,10 @@ export function parseOrganizationDocument(
     if (Array.isArray(orgDoc.totals_by_feature)) {
       for (const row of orgDoc.totals_by_feature) {
         if (!isRecord(row) || !toStringValue(row.feature)) {
-          logWarn('Skipping totals_by_feature row with missing feature.');
+          logWarn(
+            'Skipping totals_by_feature row with missing feature.',
+            strict,
+          );
           continue;
         }
 
@@ -784,7 +900,7 @@ export function parseOrganizationDocument(
 
     for (const row of ideRows) {
       if (!isRecord(row) || !toStringValue(row.ide)) {
-        logWarn('Skipping totals_by_ide row with missing ide.');
+        logWarn('Skipping totals_by_ide row with missing ide.', strict);
         continue;
       }
 
@@ -819,6 +935,7 @@ export function parseOrganizationDocument(
         ) {
           logWarn(
             'Skipping totals_by_language_feature row with missing language or feature.',
+            strict,
           );
           continue;
         }
@@ -856,6 +973,7 @@ export function parseOrganizationDocument(
         ) {
           logWarn(
             'Skipping totals_by_model_feature row with missing model or feature.',
+            strict,
           );
           continue;
         }
@@ -895,6 +1013,7 @@ export function parseOrganizationDocument(
         ) {
           logWarn(
             'Skipping totals_by_language_model row with missing language or model.',
+            strict,
           );
           continue;
         }
@@ -973,10 +1092,13 @@ export function parseUserDocument(
   doc: unknown,
   metricsType: MetricsScope,
   entityId: string,
+  options: { strict?: boolean } = {},
 ): ParsedUserDocument {
+  const strict = options.strict ?? false;
   if (!Array.isArray(doc)) {
     logWarn(
       'Expected user metrics document array, received non-array payload.',
+      strict,
     );
     return {
       userMetrics: [],
@@ -993,16 +1115,31 @@ export function parseUserDocument(
 
   for (const metric of doc as V2UserMetric[]) {
     if (!isRecord(metric)) {
-      logWarn('Skipping user metrics row because it is not an object.');
+      logWarn('Skipping user metrics row because it is not an object.', strict);
       continue;
     }
+
+    validateOptionalArrayFields(
+      metric,
+      [
+        'totals_by_feature',
+        'totals_by_ide',
+        'totals_by_language_feature',
+        'totals_by_model_feature',
+        'totals_by_language_model',
+      ],
+      strict,
+    );
 
     const day = toStringValue(metric.day);
     const userLogin = toStringValue(metric.user_login);
     const userId = toNumber(metric.user_id);
 
     if (!day || !userLogin || userId <= 0) {
-      logWarn('Skipping user metrics row with missing required fields.');
+      logWarn(
+        'Skipping user metrics row with missing required fields.',
+        strict,
+      );
       continue;
     }
 
@@ -1032,14 +1169,18 @@ export function parseUserDocument(
       ai_credits_used: toNumber(metric.ai_credits_used),
     });
 
-    const customizationData = parseCustomizationData(metric, {
-      day,
-      metrics_type: metricsType,
-      entity_id: entityId,
-      scope: 'user',
-      user_id: userId,
-      user_login: userLogin,
-    });
+    const customizationData = parseCustomizationData(
+      metric,
+      {
+        day,
+        metrics_type: metricsType,
+        entity_id: entityId,
+        scope: 'user',
+        user_id: userId,
+        user_login: userLogin,
+      },
+      strict,
+    );
     customizationMetrics.push(...customizationData.metrics);
     customizationSummaries.push(...customizationData.summaries);
 
@@ -1060,7 +1201,13 @@ export function parseUserDocument(
 
     if (Array.isArray(metric.totals_by_feature)) {
       for (const row of metric.totals_by_feature) {
-        if (!isRecord(row) || !toStringValue(row.feature)) continue;
+        if (!isRecord(row) || !toStringValue(row.feature)) {
+          logWarn(
+            'Skipping user totals_by_feature row with missing feature.',
+            strict,
+          );
+          continue;
+        }
         breakdown.byFeature.push({
           feature: toStringValue(row.feature) as string,
           user_initiated_interaction_count: toNumber(
@@ -1084,7 +1231,10 @@ export function parseUserDocument(
 
     if (Array.isArray(metric.totals_by_ide)) {
       for (const row of metric.totals_by_ide) {
-        if (!isRecord(row) || !toStringValue(row.ide)) continue;
+        if (!isRecord(row) || !toStringValue(row.ide)) {
+          logWarn('Skipping user totals_by_ide row with missing ide.', strict);
+          continue;
+        }
         breakdown.byIde.push({
           ide: toStringValue(row.ide) as string,
           user_initiated_interaction_count: toNumber(
@@ -1112,8 +1262,13 @@ export function parseUserDocument(
           !isRecord(row) ||
           !toStringValue(row.language) ||
           !toStringValue(row.feature)
-        )
+        ) {
+          logWarn(
+            'Skipping user totals_by_language_feature row with missing language or feature.',
+            strict,
+          );
           continue;
+        }
         breakdown.byLanguageFeature.push({
           language: toStringValue(row.language) as string,
           feature: toStringValue(row.feature) as string,
@@ -1140,8 +1295,13 @@ export function parseUserDocument(
           !isRecord(row) ||
           !toStringValue(row.model) ||
           !toStringValue(row.feature)
-        )
+        ) {
+          logWarn(
+            'Skipping user totals_by_model_feature row with missing model or feature.',
+            strict,
+          );
           continue;
+        }
         breakdown.byModelFeature.push({
           model_id: toStringValue(row.model) as string,
           feature: toStringValue(row.feature) as string,
@@ -1171,8 +1331,13 @@ export function parseUserDocument(
           !isRecord(row) ||
           !toStringValue(row.language) ||
           !toStringValue(row.model)
-        )
+        ) {
+          logWarn(
+            'Skipping user totals_by_language_model row with missing language or model.',
+            strict,
+          );
           continue;
+        }
         breakdown.byLanguageModel.push({
           language: toStringValue(row.language) as string,
           model_id: toStringValue(row.model) as string,
@@ -1211,9 +1376,14 @@ export function parseUserTeamsDocument(
   doc: unknown,
   metricsType: MetricsScope,
   entityId: string,
+  options: { strict?: boolean } = {},
 ): V2UserTeamRow[] {
+  const strict = options.strict ?? false;
   if (!Array.isArray(doc)) {
-    logWarn('Expected user teams document array, received non-array payload.');
+    logWarn(
+      'Expected user teams document array, received non-array payload.',
+      strict,
+    );
     return [];
   }
 
@@ -1221,7 +1391,7 @@ export function parseUserTeamsDocument(
 
   for (const teamMembership of doc as V2UserTeam[]) {
     if (!isRecord(teamMembership)) {
-      logWarn('Skipping user teams row because it is not an object.');
+      logWarn('Skipping user teams row because it is not an object.', strict);
       continue;
     }
 
@@ -1232,7 +1402,7 @@ export function parseUserTeamsDocument(
     const teamId = toNumber(teamMembership.team_id);
 
     if (!day || !userLogin || !teamSlug || userId <= 0 || teamId <= 0) {
-      logWarn('Skipping user teams row with missing required fields.');
+      logWarn('Skipping user teams row with missing required fields.', strict);
       continue;
     }
 

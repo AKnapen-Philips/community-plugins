@@ -30,8 +30,21 @@ import {
   V2UserMetricsByLanguageModelRow,
   V2UserTeamRow,
 } from '@backstage-community/plugin-copilot-common';
+import {
+  aggregateCostCenterMetrics,
+  aggregateTeamMetrics,
+} from '../utils/teamAggregator';
+import type {
+  ParsedEnterpriseDocument,
+  UserBreakdownData,
+} from '../utils/reportParser';
+import { buildUserBreakdownRows } from '../utils/userBreakdownRows';
 import { migrationsDir } from './DatabaseHandler';
-import type { CostCenterAggregateRows } from './DatabaseHandlerV2';
+import type {
+  CostCenterAggregateRows,
+  V2RawReportDayData,
+  V2RawUserReportData,
+} from './DatabaseHandlerV2';
 import { DatabaseHandlerV2 } from './DatabaseHandlerV2';
 
 const costCenterMigration = jest.requireActual<{
@@ -975,6 +988,654 @@ describe('DatabaseHandlerV2', () => {
       await expect(
         knex('copilot_cost_center_aggregation_log').where(scope),
       ).resolves.toHaveLength(1);
+    });
+
+    it('replaces revised raw reports while preserving other days and rebuilding derived slices', async () => {
+      const day = '2026-05-10';
+      const otherDay = '2026-05-11';
+      const metricsType = 'enterprise' as const;
+      const entityId = 'ent-1';
+      const makeTotals = (
+        targetDay: string,
+        activeUsers: number,
+        locAdded: number,
+        feature: string,
+        ide: string,
+        customizationItem: string,
+      ): ParsedEnterpriseDocument => ({
+        dailyTotals: [
+          buildDailyTotal({
+            day: targetDay,
+            metrics_type: metricsType,
+            entity_id: entityId,
+            team_slug: '',
+            daily_active_users: activeUsers,
+            loc_added_sum: locAdded,
+          }),
+        ],
+        prMetrics: [],
+        byFeature: [
+          {
+            day: targetDay,
+            metrics_type: metricsType,
+            entity_id: entityId,
+            team_slug: '',
+            feature,
+            code_acceptance_activity_count: activeUsers,
+            code_generation_activity_count: activeUsers,
+            loc_added_sum: locAdded,
+            loc_deleted_sum: 0,
+            loc_suggested_to_add_sum: 0,
+            loc_suggested_to_delete_sum: 0,
+            user_initiated_interaction_count: activeUsers,
+          },
+        ],
+        byIde: [
+          {
+            day: targetDay,
+            metrics_type: metricsType,
+            entity_id: entityId,
+            team_slug: '',
+            ide,
+            code_acceptance_activity_count: activeUsers,
+            code_generation_activity_count: activeUsers,
+            loc_added_sum: locAdded,
+            loc_deleted_sum: 0,
+            loc_suggested_to_add_sum: 0,
+            loc_suggested_to_delete_sum: 0,
+            user_initiated_interaction_count: activeUsers,
+          },
+        ],
+        byLanguageFeature: [],
+        byModelFeature: [],
+        byLanguageModel: [],
+        byCli: [],
+        byVscodeAgent: [],
+        customizationMetrics: [
+          buildCustomizationMetric({
+            day: targetDay,
+            metrics_type: metricsType,
+            entity_id: entityId,
+            scope: 'aggregate',
+            team_slug: '',
+            user_id: 0,
+            user_login: '',
+            item_name: customizationItem,
+            interaction_count: activeUsers,
+          }),
+        ],
+        customizationSummaries: [
+          buildCustomizationSummary({
+            day: targetDay,
+            metrics_type: metricsType,
+            entity_id: entityId,
+            scope: 'aggregate',
+            team_slug: '',
+            user_id: 0,
+            user_login: '',
+            distinct_item_count: activeUsers,
+          }),
+        ],
+      });
+      const makeMetric = (
+        targetDay: string,
+        userId: number,
+        userLogin: string,
+        locAdded: number,
+      ) =>
+        buildUserMetric({
+          day: targetDay,
+          metrics_type: metricsType,
+          entity_id: entityId,
+          user_id: userId,
+          user_login: userLogin,
+          loc_added_sum: locAdded,
+        });
+      const makeBreakdown = (
+        userId: number,
+        userLogin: string,
+        feature: string,
+        ide: string,
+        locAdded: number,
+        customizationItem: string,
+      ): UserBreakdownData => ({
+        user_id: userId,
+        user_login: userLogin,
+        byFeature: [
+          {
+            feature,
+            user_initiated_interaction_count: 1,
+            code_generation_activity_count: 1,
+            code_acceptance_activity_count: 1,
+            loc_added_sum: locAdded,
+            loc_deleted_sum: 0,
+            loc_suggested_to_add_sum: 0,
+            loc_suggested_to_delete_sum: 0,
+          },
+        ],
+        byIde: [
+          {
+            ide,
+            user_initiated_interaction_count: 1,
+            code_generation_activity_count: 1,
+            code_acceptance_activity_count: 1,
+            loc_added_sum: locAdded,
+            loc_deleted_sum: 0,
+            loc_suggested_to_add_sum: 0,
+            loc_suggested_to_delete_sum: 0,
+          },
+        ],
+        byLanguageFeature: [],
+        byModelFeature: [],
+        byLanguageModel: [],
+        customizations: [
+          {
+            category: 'skill',
+            item_name: customizationItem,
+            interaction_count: 1,
+          },
+        ],
+      });
+      const makeUserReport = (
+        targetDay: string,
+        userMetrics: V2UserMetricRow[],
+        userBreakdowns: UserBreakdownData[],
+        customizationItem: string,
+      ): V2RawUserReportData => ({
+        userMetrics,
+        breakdowns: buildUserBreakdownRows(
+          userBreakdowns,
+          targetDay,
+          metricsType,
+          entityId,
+        ),
+        customizationMetrics: userMetrics.map(metric =>
+          buildCustomizationMetric({
+            day: targetDay,
+            metrics_type: metricsType,
+            entity_id: entityId,
+            scope: 'user',
+            team_slug: '',
+            user_id: metric.user_id,
+            user_login: metric.user_login,
+            item_name:
+              metric.user_id === 1 ? customizationItem : 'removed-user-skill',
+            interaction_count: 1,
+          }),
+        ),
+        customizationSummaries: userMetrics.map(metric =>
+          buildCustomizationSummary({
+            day: targetDay,
+            metrics_type: metricsType,
+            entity_id: entityId,
+            scope: 'user',
+            team_slug: '',
+            user_id: metric.user_id,
+            user_login: metric.user_login,
+            distinct_item_count: 1,
+          }),
+        ),
+      });
+      const makeTeamRows = (
+        targetDay: string,
+        memberships: Array<{
+          userId: number;
+          login: string;
+          teamId: number;
+          teamSlug: string;
+        }>,
+      ) =>
+        memberships.map(({ userId, login, teamId, teamSlug }) =>
+          buildUserTeam({
+            day: targetDay,
+            metrics_type: metricsType,
+            entity_id: entityId,
+            user_id: userId,
+            user_login: login,
+            team_id: teamId,
+            team_slug: teamSlug,
+          }),
+        );
+      const makeCostCenterMemberships = (
+        targetDay: string,
+        userMetrics: V2UserMetricRow[],
+        costCenterId: string,
+      ) =>
+        userMetrics.map(metric => ({
+          day: targetDay,
+          metrics_type: metricsType,
+          entity_id: entityId,
+          user_id: metric.user_id,
+          user_login: metric.user_login,
+          cost_center_id: costCenterId,
+        }));
+      const makeCostCenterAggregates = (
+        targetDay: string,
+        userMetrics: V2UserMetricRow[],
+        userBreakdowns: UserBreakdownData[],
+        membershipMap: ReadonlyMap<number, string>,
+      ): CostCenterAggregateRows => {
+        const aggregates = aggregateCostCenterMetrics(
+          userMetrics,
+          userBreakdowns,
+          membershipMap,
+          targetDay,
+          metricsType,
+          entityId,
+        );
+        return {
+          dailyTotals: aggregates.dailyTotals,
+          prMetrics: [],
+          byFeature: aggregates.byFeature,
+          byIde: aggregates.byIde,
+          byLanguageFeature: aggregates.byLanguageFeature,
+          byModelFeature: aggregates.byModelFeature,
+          byLanguageModel: aggregates.byLanguageModel,
+          byCli: aggregates.byCli,
+          byVscodeAgent: aggregates.byVscodeAgent,
+          customizationMetrics: aggregates.costCenterCustomizationMetrics,
+        };
+      };
+
+      const oldMetrics = [
+        makeMetric(day, 1, 'user-one', 10),
+        makeMetric(day, 2, 'user-two', 20),
+      ];
+      const oldBreakdowns = [
+        makeBreakdown(1, 'user-one', 'old-feature', 'old-ide', 10, 'old-skill'),
+        makeBreakdown(
+          2,
+          'user-two',
+          'removed-user-feature',
+          'removed-user-ide',
+          20,
+          'removed-user-skill',
+        ),
+      ];
+      const revisedMetrics = [makeMetric(day, 1, 'user-one', 30)];
+      const revisedBreakdowns = [
+        makeBreakdown(1, 'user-one', 'new-feature', 'new-ide', 30, 'new-skill'),
+      ];
+      const otherMetrics = [makeMetric(otherDay, 3, 'user-three', 70)];
+      const otherBreakdowns = [
+        makeBreakdown(
+          3,
+          'user-three',
+          'other-day-feature',
+          'other-day-ide',
+          70,
+          'other-day-skill',
+        ),
+      ];
+      const oldTeams = makeTeamRows(day, [
+        { userId: 1, login: 'user-one', teamId: 10, teamSlug: 'old-team' },
+        { userId: 2, login: 'user-two', teamId: 20, teamSlug: 'removed-team' },
+      ]);
+      const revisedTeams = makeTeamRows(day, [
+        { userId: 1, login: 'user-one', teamId: 30, teamSlug: 'new-team' },
+      ]);
+      const otherTeams = makeTeamRows(otherDay, [
+        { userId: 3, login: 'user-three', teamId: 40, teamSlug: 'other-team' },
+      ]);
+      const oldTotals = makeTotals(
+        day,
+        2,
+        30,
+        'old-feature',
+        'old-ide',
+        'old-aggregate-skill',
+      );
+      const revisedTotals = makeTotals(
+        day,
+        1,
+        30,
+        'new-feature',
+        'new-ide',
+        'new-aggregate-skill',
+      );
+      const otherTotals = makeTotals(
+        otherDay,
+        1,
+        70,
+        'other-day-feature',
+        'other-day-ide',
+        'other-day-aggregate-skill',
+      );
+      const oldUsers = makeUserReport(
+        day,
+        oldMetrics,
+        oldBreakdowns,
+        'old-user-skill',
+      );
+      const revisedUsers = makeUserReport(
+        day,
+        revisedMetrics,
+        revisedBreakdowns,
+        'new-user-skill',
+      );
+      const otherUsers = makeUserReport(
+        otherDay,
+        otherMetrics,
+        otherBreakdowns,
+        'other-day-user-skill',
+      );
+
+      await handler.insertDailyTotals([
+        ...oldTotals.dailyTotals,
+        ...otherTotals.dailyTotals,
+      ]);
+      await handler.insertByFeature([
+        ...oldTotals.byFeature,
+        ...otherTotals.byFeature,
+      ]);
+      await handler.insertByIde([...oldTotals.byIde, ...otherTotals.byIde]);
+      await handler.insertCustomizationMetrics([
+        ...oldTotals.customizationMetrics,
+        ...oldUsers.customizationMetrics,
+        ...otherTotals.customizationMetrics,
+        ...otherUsers.customizationMetrics,
+      ]);
+      await handler.insertCustomizationSummaries([
+        ...oldTotals.customizationSummaries,
+        ...oldUsers.customizationSummaries,
+        ...otherTotals.customizationSummaries,
+        ...otherUsers.customizationSummaries,
+      ]);
+      await handler.insertUserMetrics([...oldMetrics, ...otherMetrics]);
+      await handler.insertUserMetricsByFeature([
+        ...oldUsers.breakdowns.byFeature,
+        ...otherUsers.breakdowns.byFeature,
+      ]);
+      await handler.insertUserMetricsByIde([
+        ...oldUsers.breakdowns.byIde,
+        ...otherUsers.breakdowns.byIde,
+      ]);
+      await handler.upsertCostCenters([
+        {
+          metrics_type: metricsType,
+          entity_id: entityId,
+          cost_center_id: 'cc-old',
+          name: 'Old center',
+        },
+        {
+          metrics_type: metricsType,
+          entity_id: entityId,
+          cost_center_id: 'cc-new',
+          name: 'New center',
+        },
+        {
+          metrics_type: metricsType,
+          entity_id: entityId,
+          cost_center_id: 'cc-other',
+          name: 'Other center',
+        },
+      ]);
+      const oldCostCenterMap = new Map([
+        [1, 'cc-old'],
+        [2, 'cc-old'],
+      ]);
+      const otherCostCenterMap = new Map([[3, 'cc-other']]);
+      await handler.replaceTeamAggregates(
+        day,
+        metricsType,
+        entityId,
+        oldTeams,
+        aggregateTeamMetrics(
+          oldMetrics,
+          oldTeams,
+          oldBreakdowns,
+          day,
+          metricsType,
+          entityId,
+        ),
+      );
+      await handler.replaceTeamAggregates(
+        otherDay,
+        metricsType,
+        entityId,
+        otherTeams,
+        aggregateTeamMetrics(
+          otherMetrics,
+          otherTeams,
+          otherBreakdowns,
+          otherDay,
+          metricsType,
+          entityId,
+        ),
+      );
+      await handler.replaceCostCenterAggregates(
+        day,
+        metricsType,
+        entityId,
+        makeCostCenterMemberships(day, oldMetrics, 'cc-old'),
+        makeCostCenterAggregates(
+          day,
+          oldMetrics,
+          oldBreakdowns,
+          oldCostCenterMap,
+        ),
+      );
+      await handler.replaceCostCenterAggregates(
+        otherDay,
+        metricsType,
+        entityId,
+        makeCostCenterMemberships(otherDay, otherMetrics, 'cc-other'),
+        makeCostCenterAggregates(
+          otherDay,
+          otherMetrics,
+          otherBreakdowns,
+          otherCostCenterMap,
+        ),
+      );
+
+      const revisedReport: V2RawReportDayData = {
+        totals: revisedTotals,
+        users: revisedUsers,
+        markCostCenterPending: true,
+      };
+      await handler.replaceRawReportDay(
+        day,
+        metricsType,
+        entityId,
+        revisedReport,
+      );
+
+      const pendingLog = await knex('copilot_cost_center_aggregation_log')
+        .where({ day, metrics_type: metricsType, entity_id: entityId })
+        .first();
+      expect(Boolean(pendingLog.needs_reaggregation)).toBe(true);
+      await expect(
+        knex('copilot_daily_totals').where({
+          day,
+          metrics_type: metricsType,
+          entity_id: entityId,
+          team_slug: 'old-team',
+          cost_center_id: '',
+        }),
+      ).resolves.toHaveLength(1);
+      await expect(
+        knex('copilot_daily_totals').where({
+          day,
+          metrics_type: metricsType,
+          entity_id: entityId,
+          team_slug: '',
+          cost_center_id: 'cc-old',
+        }),
+      ).resolves.toHaveLength(1);
+
+      await handler.replaceTeamAggregates(
+        day,
+        metricsType,
+        entityId,
+        revisedTeams,
+        aggregateTeamMetrics(
+          revisedMetrics,
+          revisedTeams,
+          revisedBreakdowns,
+          day,
+          metricsType,
+          entityId,
+        ),
+      );
+      const revisedCostCenterMap = new Map([[1, 'cc-new']]);
+      await handler.replaceCostCenterAggregates(
+        day,
+        metricsType,
+        entityId,
+        makeCostCenterMemberships(day, revisedMetrics, 'cc-new'),
+        makeCostCenterAggregates(
+          day,
+          revisedMetrics,
+          revisedBreakdowns,
+          revisedCostCenterMap,
+        ),
+      );
+
+      const rawScope = {
+        day,
+        metrics_type: metricsType,
+        entity_id: entityId,
+        team_slug: '',
+        cost_center_id: '',
+        without_cost_center: false,
+      };
+      const rawTotals = await knex('copilot_daily_totals').where(rawScope);
+      const rawFeatures = await knex('copilot_metrics_by_feature').where(
+        rawScope,
+      );
+      const rawIdes = await knex('copilot_metrics_by_ide').where(rawScope);
+      const userMetrics = await handler.getUserMetricsForDay(
+        metricsType,
+        entityId,
+        day,
+      );
+      const userBreakdowns = await handler.getUserBreakdownsForDay(
+        metricsType,
+        entityId,
+        day,
+      );
+      const userCustomizations = await knex('copilot_customization_metrics')
+        .where({
+          day,
+          metrics_type: metricsType,
+          entity_id: entityId,
+          scope: 'user',
+          team_slug: '',
+        })
+        .orderBy('user_id');
+      const aggregateCustomizations = await knex(
+        'copilot_customization_metrics',
+      ).where({
+        day,
+        metrics_type: metricsType,
+        entity_id: entityId,
+        scope: 'aggregate',
+        team_slug: '',
+      });
+      const teamRows = await knex('copilot_daily_totals').where({
+        day,
+        metrics_type: metricsType,
+        entity_id: entityId,
+        team_slug: 'new-team',
+        cost_center_id: '',
+        without_cost_center: false,
+      });
+      const teamMemberships = await knex('copilot_user_teams')
+        .where({ day, metrics_type: metricsType, entity_id: entityId })
+        .select('user_id', 'team_slug');
+      const costCenterRows = await knex('copilot_daily_totals').where({
+        day,
+        metrics_type: metricsType,
+        entity_id: entityId,
+        team_slug: '',
+        cost_center_id: 'cc-new',
+        without_cost_center: false,
+      });
+      const costCenterMemberships = await knex('copilot_user_cost_centers')
+        .where({ day, metrics_type: metricsType, entity_id: entityId })
+        .select('user_id', 'cost_center_id');
+      const otherDayRawTotals = await knex('copilot_daily_totals').where({
+        day: otherDay,
+        metrics_type: metricsType,
+        entity_id: entityId,
+        team_slug: '',
+        cost_center_id: '',
+        without_cost_center: false,
+      });
+      const otherDayUserMetrics = await handler.getUserMetricsForDay(
+        metricsType,
+        entityId,
+        otherDay,
+      );
+      const otherDayFeatures = await knex('copilot_metrics_by_feature').where({
+        day: otherDay,
+        metrics_type: metricsType,
+        entity_id: entityId,
+        team_slug: '',
+        cost_center_id: '',
+        without_cost_center: false,
+      });
+      const otherDayTeamMemberships = await knex('copilot_user_teams')
+        .where({
+          day: otherDay,
+          metrics_type: metricsType,
+          entity_id: entityId,
+        })
+        .select('user_id', 'team_slug');
+      const otherDayCostCenterMemberships = await knex(
+        'copilot_user_cost_centers',
+      )
+        .where({
+          day: otherDay,
+          metrics_type: metricsType,
+          entity_id: entityId,
+        })
+        .select('user_id', 'cost_center_id');
+
+      expect(rawTotals).toHaveLength(1);
+      expect(Number(rawTotals[0].daily_active_users)).toBe(1);
+      expect(Number(rawTotals[0].loc_added_sum)).toBe(30);
+      expect(rawFeatures.map(row => row.feature)).toEqual(['new-feature']);
+      expect(rawIdes.map(row => row.ide)).toEqual(['new-ide']);
+      expect(userMetrics.map(row => row.user_id)).toEqual([1]);
+      expect(userMetrics[0].loc_added_sum).toBe(30);
+      expect(userBreakdowns).toHaveLength(1);
+      expect(userBreakdowns[0].byFeature.map(row => row.feature)).toEqual([
+        'new-feature',
+      ]);
+      expect(userBreakdowns[0].byIde.map(row => row.ide)).toEqual(['new-ide']);
+      expect(userCustomizations.map(row => row.item_name)).toEqual([
+        'new-user-skill',
+      ]);
+      expect(aggregateCustomizations.map(row => row.item_name)).toEqual([
+        'new-aggregate-skill',
+      ]);
+      expect(teamRows).toHaveLength(1);
+      expect(Number(teamRows[0].loc_added_sum)).toBe(30);
+      expect(teamMemberships).toHaveLength(1);
+      expect(Number(teamMemberships[0].user_id)).toBe(1);
+      expect(teamMemberships[0].team_slug).toBe('new-team');
+      expect(costCenterRows).toHaveLength(1);
+      expect(Number(costCenterRows[0].loc_added_sum)).toBe(30);
+      expect(costCenterMemberships).toHaveLength(1);
+      expect(Number(costCenterMemberships[0].user_id)).toBe(1);
+      expect(costCenterMemberships[0].cost_center_id).toBe('cc-new');
+      expect(otherDayRawTotals).toHaveLength(1);
+      expect(Number(otherDayRawTotals[0].loc_added_sum)).toBe(70);
+      expect(otherDayUserMetrics.map(row => row.user_id)).toEqual([3]);
+      expect(otherDayFeatures.map(row => row.feature)).toEqual([
+        'other-day-feature',
+      ]);
+      expect(otherDayTeamMemberships).toHaveLength(1);
+      expect(Number(otherDayTeamMemberships[0].user_id)).toBe(3);
+      expect(otherDayTeamMemberships[0].team_slug).toBe('other-team');
+      expect(otherDayCostCenterMemberships).toHaveLength(1);
+      expect(Number(otherDayCostCenterMemberships[0].user_id)).toBe(3);
+      expect(otherDayCostCenterMemberships[0].cost_center_id).toBe('cc-other');
+      const completedLog = await knex('copilot_cost_center_aggregation_log')
+        .where({ day, metrics_type: metricsType, entity_id: entityId })
+        .first();
+      expect(Boolean(completedLog.needs_reaggregation)).toBe(false);
     });
 
     it('serves unassigned users from the explicit no-cost-center scope', async () => {
