@@ -250,13 +250,29 @@ export async function runBackfill(
 }
 
 export class TaskManagementV2 {
+  // Class-wide so scheduled and manual work serialize across task instances.
+  private static ingestionQueue: Promise<void> = Promise.resolve();
+
+  private static runSerialized<T>(work: () => Promise<T>): Promise<T> {
+    const result = TaskManagementV2.ingestionQueue.then(work);
+    TaskManagementV2.ingestionQueue = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
   static create(options: TaskManagementV2Options): TaskManagementV2 {
     return new TaskManagementV2(options);
   }
 
   private constructor(private readonly options: TaskManagementV2Options) {}
 
-  async runAsync(): Promise<void> {
+  runAsync(): Promise<void> {
+    return TaskManagementV2.runSerialized(() => this.runAsyncUnlocked());
+  }
+
+  private async runAsyncUnlocked(): Promise<void> {
     const { config, db, logger } = this.options;
     const enterprise = config.getOptionalString('copilot.enterprise');
     const organization = config.getOptionalString('copilot.organization');
@@ -489,7 +505,18 @@ export class TaskManagementV2 {
     logger.info('[TaskManagementV2] Completed gap-fill ingestion run.');
   }
 
-  async runBackfill(
+  runBackfill(
+    fromDate: string,
+    toDate: string,
+    metricsType: MetricsScope,
+    entityId: string,
+  ): Promise<void> {
+    return TaskManagementV2.runSerialized(() =>
+      this.runBackfillUnlocked(fromDate, toDate, metricsType, entityId),
+    );
+  }
+
+  private async runBackfillUnlocked(
     fromDate: string,
     toDate: string,
     metricsType: MetricsScope,
@@ -1280,7 +1307,8 @@ export class TaskManagementV2 {
         customizationMetrics: userReport.customizationMetrics,
         customizationSummaries: userReport.customizationSummaries,
       };
-      reports.markCostCenterPending = context.ingestCostCenters;
+      // Rebuild any existing cost-center slices after their source users change.
+      reports.markCostCenterPending = true;
     }
 
     await db.replaceRawReportDay(day, metricsType, entityId, reports);

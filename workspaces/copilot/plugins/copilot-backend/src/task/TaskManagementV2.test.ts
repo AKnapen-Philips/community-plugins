@@ -323,6 +323,73 @@ describe('TaskManagementV2', () => {
     expect(db.replaceRawReportDay.mock.calls.map(([day]) => day)).toEqual(days);
   });
 
+  it('waits to backfill until scheduled raw and team replacement completes', async () => {
+    const db = createDbMock();
+    const api = createApiMock();
+    const day = DateTime.utc().minus({ days: 1 }).toISODate()!;
+    const config = createConfigMock({
+      'copilot.enterprise': 'ent-1',
+      'copilot.backfillFromDate': day,
+      'copilot.backfillDelayMs': 0,
+      'copilot.ingestTeams': true,
+    });
+    const logger = createLoggerMock();
+    let startTeamReplacement!: () => void;
+    let finishTeamReplacement!: () => void;
+    const teamReplacementStarted = new Promise<void>(resolve => {
+      startTeamReplacement = resolve;
+    });
+    const teamReplacementGate = new Promise<void>(resolve => {
+      finishTeamReplacement = resolve;
+    });
+
+    db.getMissingDays.mockResolvedValue([]);
+    db.replaceTeamAggregates.mockImplementationOnce(async () => {
+      startTeamReplacement();
+      await teamReplacementGate;
+    });
+    api.fetchEnterpriseReportLinks.mockResolvedValue({
+      download_links: ['https://downloads.github.com/totals.json'],
+    });
+    api.fetchEnterpriseUserReportLinks.mockResolvedValue({
+      download_links: ['https://downloads.github.com/users.json'],
+    });
+    api.fetchEnterpriseUserTeamsLinks.mockResolvedValue({
+      download_links: ['https://downloads.github.com/teams.json'],
+    });
+    api.downloadDocument.mockResolvedValue(makeEnterpriseDocument(day));
+    api.downloadNdjsonDocument.mockImplementation(async (url: string) =>
+      url.endsWith('/teams.json')
+        ? makeUserTeamsDocument(day)
+        : makeUserMetricsDocument(day),
+    );
+
+    const options = {
+      db: db as unknown as DatabaseHandlerV2,
+      api: api as unknown as GithubClientV2,
+      config,
+      logger,
+    };
+    const task = TaskManagementV2.create(options);
+    const scheduledRun = task.runAsync();
+    await teamReplacementStarted;
+
+    const backfillRun = runBackfill(options, day, day, 'enterprise', 'ent-1');
+    await Promise.resolve();
+    const plannerCallsWhileScheduledWasPaused =
+      db.getMissingDays.mock.calls.length;
+    const rawReplacementsWhileScheduledWasPaused =
+      db.replaceRawReportDay.mock.calls.length;
+
+    finishTeamReplacement();
+    await Promise.all([scheduledRun, backfillRun]);
+
+    expect(plannerCallsWhileScheduledWasPaused).toBe(1);
+    expect(rawReplacementsWhileScheduledWasPaused).toBe(1);
+    expect(db.replaceRawReportDay).toHaveBeenCalledTimes(2);
+    expect(db.replaceTeamAggregates).toHaveBeenCalledTimes(2);
+  });
+
   it('does not fetch a cost-center snapshot when no days need processing', async () => {
     const db = createDbMock();
     const api = createApiMock();
@@ -1769,6 +1836,102 @@ describe('TaskManagementV2', () => {
       true,
     );
     expect(db.markCostCenterAggregationDone).not.toHaveBeenCalled();
+  });
+
+  it('marks existing cost-center aggregates pending during a team-only refetch', async () => {
+    const db = createDbMock();
+    const api = createApiMock();
+    const day = DateTime.utc().minus({ days: 30 }).toISODate()!;
+    const config = createConfigMock({
+      'copilot.enterprise': 'ent-1',
+      'copilot.backfillDelayMs': 0,
+      'copilot.ingestTeams': true,
+      'copilot.ingestCostCenters': false,
+    });
+
+    db.getMissingDays.mockResolvedValue([]);
+    api.fetchEnterpriseReportLinks.mockResolvedValue({
+      download_links: ['https://downloads.github.com/totals.json'],
+    });
+    api.fetchEnterpriseUserReportLinks.mockResolvedValue({
+      download_links: ['https://downloads.github.com/users.json'],
+    });
+    api.fetchEnterpriseUserTeamsLinks.mockResolvedValue({
+      download_links: ['https://downloads.github.com/teams.json'],
+    });
+    api.downloadDocument.mockResolvedValue(makeEnterpriseDocument(day));
+    api.downloadNdjsonDocument.mockImplementation(async (url: string) =>
+      url.endsWith('/teams.json')
+        ? makeUserTeamsDocument(day)
+        : makeUserMetricsDocument(day),
+    );
+
+    const task = TaskManagementV2.create({
+      db: db as unknown as DatabaseHandlerV2,
+      api: api as unknown as GithubClientV2,
+      config,
+      logger: createLoggerMock(),
+    });
+
+    await task.runBackfill(day, day, 'enterprise', 'ent-1');
+
+    expect(db.replaceRawReportDay).toHaveBeenCalledWith(
+      day,
+      'enterprise',
+      'ent-1',
+      expect.objectContaining({ markCostCenterPending: true }),
+    );
+    expect(db.replaceCostCenterAggregates).not.toHaveBeenCalled();
+  });
+
+  it('replaces reports when an unknown optional totals field has an object shape', async () => {
+    const db = createDbMock();
+    const api = createApiMock();
+    const day = DateTime.utc().minus({ days: 30 }).toISODate()!;
+    const config = createConfigMock({
+      'copilot.enterprise': 'ent-1',
+      'copilot.backfillDelayMs': 0,
+      'copilot.ingestTeams': false,
+      'copilot.ingestCostCenters': false,
+    });
+    const report = makeEnterpriseDocument(day);
+    (
+      report[0].day_totals[0] as unknown as Record<string, unknown>
+    ).totals_by_future_dimension = { total: 3 };
+
+    db.getMissingDays.mockResolvedValue([]);
+    api.fetchEnterpriseReportLinks.mockResolvedValue({
+      download_links: ['https://downloads.github.com/totals.json'],
+    });
+    api.downloadDocument.mockResolvedValue(report);
+
+    const task = TaskManagementV2.create({
+      db: db as unknown as DatabaseHandlerV2,
+      api: api as unknown as GithubClientV2,
+      config,
+      logger: createLoggerMock(),
+    });
+
+    await task.runBackfill(day, day, 'enterprise', 'ent-1');
+
+    expect(db.replaceRawReportDay).toHaveBeenCalledWith(
+      day,
+      'enterprise',
+      'ent-1',
+      expect.objectContaining({
+        totals: expect.objectContaining({
+          dailyTotals: [expect.objectContaining({ day, loc_added_sum: 10 })],
+        }),
+      }),
+    );
+    expect(db.upsertIngestionLog).toHaveBeenCalledWith(
+      expect.objectContaining({
+        day,
+        status: 'success',
+        components_loaded: '["totals"]',
+      }),
+      { replaceComponents: true },
+    );
   });
 
   it.each([

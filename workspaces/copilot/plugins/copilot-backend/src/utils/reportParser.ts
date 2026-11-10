@@ -198,7 +198,6 @@ function isCustomizationCategory(category: string): boolean {
 function parseCustomizationData(
   record: Record<string, unknown>,
   context: CustomizationContext,
-  strict: boolean,
 ): {
   metrics: V2CustomizationMetricRow[];
   summaries: V2CustomizationSummaryRow[];
@@ -221,7 +220,7 @@ function parseCustomizationData(
     }
 
     if (value !== undefined && value !== null && !Array.isArray(value)) {
-      logWarn(`Expected ${field} to be an array.`, strict);
+      logWarn(`Expected ${field} to be an array.`);
       continue;
     }
     if (!Array.isArray(value)) {
@@ -230,7 +229,7 @@ function parseCustomizationData(
 
     for (const row of value) {
       if (!isRecord(row)) {
-        logWarn(`Skipping ${field} row because it is not an object.`, strict);
+        logWarn(`Skipping ${field} row because it is not an object.`);
         continue;
       }
 
@@ -242,10 +241,7 @@ function parseCustomizationData(
         typeof interactionCount !== 'number' ||
         !Number.isFinite(interactionCount)
       ) {
-        logWarn(
-          `Skipping ${field} row with invalid customization data.`,
-          strict,
-        );
+        logWarn(`Skipping ${field} row with invalid customization data.`);
         continue;
       }
 
@@ -271,7 +267,7 @@ function parseCustomizationData(
       continue;
     }
     if (typeof value !== 'number' || !Number.isFinite(value)) {
-      logWarn(`Skipping ${field} with an invalid count.`, strict);
+      logWarn(`Skipping ${field} with an invalid count.`);
       continue;
     }
 
@@ -428,16 +424,12 @@ export function parseEnterpriseDocument(
         ),
       });
 
-      const customizationData = parseCustomizationData(
-        dayTotal,
-        {
-          day,
-          metrics_type: metricsType,
-          entity_id: entityId,
-          scope: 'aggregate',
-        },
-        strict,
-      );
+      const customizationData = parseCustomizationData(dayTotal, {
+        day,
+        metrics_type: metricsType,
+        entity_id: entityId,
+        scope: 'aggregate',
+      });
       parsed.customizationMetrics.push(...customizationData.metrics);
       parsed.customizationSummaries.push(...customizationData.summaries);
 
@@ -848,16 +840,12 @@ export function parseOrganizationDocument(
       ),
     });
 
-    const customizationData = parseCustomizationData(
-      orgDoc,
-      {
-        day,
-        metrics_type: metricsType,
-        entity_id: entityId,
-        scope: 'aggregate',
-      },
-      strict,
-    );
+    const customizationData = parseCustomizationData(orgDoc, {
+      day,
+      metrics_type: metricsType,
+      entity_id: entityId,
+      scope: 'aggregate',
+    });
     parsed.customizationMetrics.push(...customizationData.metrics);
     parsed.customizationSummaries.push(...customizationData.summaries);
 
@@ -1169,18 +1157,14 @@ export function parseUserDocument(
       ai_credits_used: toNumber(metric.ai_credits_used),
     });
 
-    const customizationData = parseCustomizationData(
-      metric,
-      {
-        day,
-        metrics_type: metricsType,
-        entity_id: entityId,
-        scope: 'user',
-        user_id: userId,
-        user_login: userLogin,
-      },
-      strict,
-    );
+    const customizationData = parseCustomizationData(metric, {
+      day,
+      metrics_type: metricsType,
+      entity_id: entityId,
+      scope: 'user',
+      user_id: userId,
+      user_login: userLogin,
+    });
     customizationMetrics.push(...customizationData.metrics);
     customizationSummaries.push(...customizationData.summaries);
 
