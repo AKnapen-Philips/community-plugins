@@ -188,7 +188,7 @@ describe('TaskManagementV2', () => {
     expect(db.replaceCostCenterAggregates).not.toHaveBeenCalled();
   });
 
-  it('re-ingests the three recent scheduled days as well as missing gaps', async () => {
+  it('re-ingests recent scheduled days with typed adoption phases and missing gaps', async () => {
     jest.useFakeTimers().setSystemTime(new Date('2026-11-10T12:00:00Z'));
     try {
       const db = createDbMock();
@@ -234,7 +234,21 @@ describe('TaskManagementV2', () => {
       );
       api.downloadDocument.mockImplementation(async (url: string) => {
         const day = url.split('/').pop()?.replace('.json', '') ?? '';
-        return makeEnterpriseDocument(day);
+        const document = makeEnterpriseDocument(day);
+        if (recentDays.includes(day)) {
+          Object.assign(document[0].day_totals[0], {
+            totals_by_ai_adoption_phase: [
+              {
+                phase: 'Code first',
+                phase_number: 1,
+                total_engaged_users: 2,
+                users_in_phase_28d: 3,
+                avg_code_generation_activities: 1,
+              },
+            ],
+          });
+        }
+        return document;
       });
 
       const task = TaskManagementV2.create({

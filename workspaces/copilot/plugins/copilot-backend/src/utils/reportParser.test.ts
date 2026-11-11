@@ -285,6 +285,131 @@ describe('reportParser', () => {
         }),
       ]);
     });
+
+    it('ignores documented typed totals fields in strict aggregate reports', () => {
+      const doc = {
+        day: '2026-10-23',
+        totals_by_ai_adoption_phase: [
+          {
+            phase: 'Code first',
+            phase_number: 1,
+            total_engaged_users: 2,
+            users_in_phase_28d: 3,
+            avg_user_initiated_interactions: 1,
+            avg_code_generation_activities: 1,
+            avg_code_acceptance_activities: 0,
+            avg_loc_added: 2,
+            avg_loc_deleted: 1,
+            avg_pull_requests_reviewed: 0,
+            avg_pull_requests_created: 0,
+            avg_pull_requests_merged: 0,
+            total_pull_requests_merged: 0,
+            avg_pull_requests_median_minutes_to_merge: 0,
+            avg_pull_requests_minutes_to_review: 0,
+          },
+        ],
+        totals_by_local_byok: [
+          {
+            byok_kind: 'local_managed',
+            surface: 'copilot_cli',
+            session_count: 1,
+            request_count: 1,
+            prompt_count: 1,
+            token_usage: {
+              output_tokens_sum: 1,
+              prompt_tokens_sum: 1,
+              avg_tokens_per_request: 2,
+            },
+          },
+        ],
+        totals_by_3rd_party_agent: [
+          {
+            agent_id: 'synthetic-agent',
+            agent_name: 'Synthetic Agent',
+            user_initiated_interaction_count: 1,
+            session_count: 1,
+          },
+        ],
+        totals_by_client: [
+          {
+            client: 'synthetic-client',
+            request_count: 1,
+            session_count: 1,
+            token_usage: {
+              prompt_tokens_sum: 1,
+              output_tokens_sum: 1,
+              avg_tokens_per_request: 2,
+            },
+            totals_by_model: [],
+          },
+        ],
+        totals_by_copilot_app: {
+          session_count: 1,
+          request_count: 1,
+          prompt_count: 1,
+          token_usage: {
+            output_tokens_sum: 1,
+            prompt_tokens_sum: 1,
+            avg_tokens_per_request: 2,
+          },
+        },
+        totals_by_skill: [{ skill: 'synthetic-skill', interaction_count: 3 }],
+        totals_by_mcp: [{ mcp: 'synthetic-mcp', interaction_count: 2 }],
+        distinct_skill_use_count: 1,
+        distinct_mcp_use_count: 1,
+      };
+      const expectedMetrics = [
+        expect.objectContaining({
+          category: 'skill',
+          item_name: 'synthetic-skill',
+          interaction_count: 3,
+        }),
+        expect.objectContaining({
+          category: 'mcp',
+          item_name: 'synthetic-mcp',
+          interaction_count: 2,
+        }),
+      ];
+      const expectedSummaries = [
+        expect.objectContaining({
+          category: 'skill',
+          distinct_item_count: 1,
+        }),
+        expect.objectContaining({
+          category: 'mcp',
+          distinct_item_count: 1,
+        }),
+      ];
+
+      const results = [
+        parseEnterpriseDocument(doc, 'enterprise', 'ent-1', { strict: true }),
+        parseOrganizationDocument(doc, 'organization', 'org-1', {
+          strict: true,
+        }),
+      ];
+      for (const result of results) {
+        expect(result.customizationMetrics).toEqual(expectedMetrics);
+        expect(result.customizationSummaries).toEqual(expectedSummaries);
+      }
+    });
+
+    it('strictly validates documented AI adoption phase arrays', () => {
+      const doc = {
+        day: '2026-10-23',
+        totals_by_ai_adoption_phase: {},
+      };
+      expect(() =>
+        parseEnterpriseDocument(doc, 'enterprise', 'ent-1', {
+          strict: true,
+        }),
+      ).toThrow('Expected totals_by_ai_adoption_phase to be an array.');
+      expect(() =>
+        parseOrganizationDocument(doc, 'organization', 'org-1', {
+          strict: true,
+        }),
+      ).toThrow('Expected totals_by_ai_adoption_phase to be an array.');
+    });
+
     it('parses a flat V2EnterpriseDayTotal object (GitHub 2026-03-10 API shape)', () => {
       // Regression test for: https://github.com/backstage/community-plugins/issues/9458
       // GitHub's report API returns a single flat object per download URL, not a
@@ -728,12 +853,29 @@ describe('reportParser', () => {
               loc_deleted_sum: 15,
             },
           ],
+          totals_by_local_byok: [
+            { byok_kind: 'local_managed', surface: 'copilot_cli' },
+          ],
+          totals_by_3rd_party_agent: [{ agent_id: 'synthetic-agent' }],
+          totals_by_client: [{ client: 'synthetic-client' }],
+          totals_by_copilot_app: {
+            session_count: 1,
+            request_count: 1,
+            prompt_count: 1,
+            token_usage: {
+              output_tokens_sum: 1,
+              prompt_tokens_sum: 1,
+              avg_tokens_per_request: 2,
+            },
+          },
           totals_by_mcp: [{ mcp: 'docs-search', interaction_count: 4 }],
           distinct_mcp_use_count: 1,
         },
       ];
 
-      const result = parseUserDocument(doc, 'enterprise', 'ent-1');
+      const result = parseUserDocument(doc, 'enterprise', 'ent-1', {
+        strict: true,
+      });
       const bd = result.userBreakdowns[0];
 
       expect(bd.byFeature).toHaveLength(1);

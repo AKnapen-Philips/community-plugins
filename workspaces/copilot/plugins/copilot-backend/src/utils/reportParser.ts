@@ -176,14 +176,19 @@ type CustomizationContext = {
   user_login?: string;
 };
 
-const TYPED_BREAKDOWN_CATEGORIES = new Set([
-  'feature',
-  'ide',
-  'language_feature',
-  'model_feature',
-  'language_model',
-  'cli',
-  'vscode_agent',
+const TYPED_TOTALS_FIELDS = new Set([
+  'totals_by_feature',
+  'totals_by_ide',
+  'totals_by_language_feature',
+  'totals_by_model_feature',
+  'totals_by_language_model',
+  'totals_by_cli',
+  'totals_by_copilot_app',
+  'totals_by_local_byok',
+  'totals_by_3rd_party_agent',
+  'totals_by_client',
+  'totals_by_vscode_agent',
+  'totals_by_ai_adoption_phase',
 ]);
 
 function isCustomizationCategory(category: string): boolean {
@@ -208,15 +213,12 @@ function parseCustomizationData(
   const categories = new Set<string>();
 
   for (const [field, value] of Object.entries(record)) {
-    if (!field.startsWith('totals_by_')) {
+    if (!field.startsWith('totals_by_') || TYPED_TOTALS_FIELDS.has(field)) {
       continue;
     }
 
     const category = field.slice('totals_by_'.length);
-    if (
-      !isCustomizationCategory(category) ||
-      TYPED_BREAKDOWN_CATEGORIES.has(category)
-    ) {
+    if (!isCustomizationCategory(category)) {
       continue;
     }
 
@@ -380,12 +382,21 @@ export function parseEnterpriseDocument(
           'totals_by_language_feature',
           'totals_by_model_feature',
           'totals_by_language_model',
+          'totals_by_local_byok',
+          'totals_by_3rd_party_agent',
+          'totals_by_client',
+          'totals_by_ai_adoption_phase',
         ],
         strict,
       );
       validateOptionalObjectFields(
         dayTotal,
-        ['pull_requests', 'totals_by_cli', 'totals_by_vscode_agent'],
+        [
+          'pull_requests',
+          'totals_by_cli',
+          'totals_by_copilot_app',
+          'totals_by_vscode_agent',
+        ],
         strict,
       );
 
@@ -773,12 +784,16 @@ export function parseOrganizationDocument(
         'totals_by_language_feature',
         'totals_by_model_feature',
         'totals_by_language_model',
+        'totals_by_local_byok',
+        'totals_by_3rd_party_agent',
+        'totals_by_client',
+        'totals_by_ai_adoption_phase',
       ],
       strict,
     );
     validateOptionalObjectFields(
       orgDoc,
-      ['totals_by_cli', 'totals_by_vscode_agent'],
+      ['totals_by_cli', 'totals_by_copilot_app', 'totals_by_vscode_agent'],
       strict,
     );
 
@@ -1124,9 +1139,13 @@ export function parseUserDocument(
         'totals_by_language_feature',
         'totals_by_model_feature',
         'totals_by_language_model',
+        'totals_by_local_byok',
+        'totals_by_3rd_party_agent',
+        'totals_by_client',
       ],
       strict,
     );
+    validateOptionalObjectFields(metric, ['totals_by_copilot_app'], strict);
 
     const day = toStringValue(metric.day);
     const userLogin = toStringValue(metric.user_login);
