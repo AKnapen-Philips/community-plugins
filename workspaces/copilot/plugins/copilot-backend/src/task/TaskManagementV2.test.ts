@@ -273,6 +273,66 @@ describe('TaskManagementV2', () => {
     }
   });
 
+  it('preserves scheduled data when known customization totals are not arrays', async () => {
+    jest.useFakeTimers().setSystemTime(new Date('2026-11-10T12:00:00Z'));
+    try {
+      const db = createDbMock();
+      const api = createApiMock();
+      const day = DateTime.utc().minus({ days: 1 }).toISODate()!;
+      const config = createConfigMock({
+        'copilot.enterprise': 'ent-1',
+        'copilot.backfillFromDate': day,
+        'copilot.backfillDelayMs': 0,
+        'copilot.ingestTeams': false,
+        'copilot.ingestCostCenters': false,
+      });
+      const logger = createLoggerMock();
+      const previousLog = {
+        day,
+        metrics_type: 'enterprise',
+        entity_id: 'ent-1',
+        status: 'success',
+        components_loaded: '["totals"]',
+        source: 'scheduled',
+      };
+
+      db.getMissingDays.mockResolvedValue([]);
+      db.getIngestionLog.mockResolvedValue([previousLog]);
+      api.fetchEnterpriseReportLinks.mockResolvedValue({
+        download_links: [`https://downloads.github.com/${day}.json`],
+      });
+      const report = makeEnterpriseDocument(day);
+      Object.assign(report[0].day_totals[0], {
+        totals_by_skill: { skill: 'synthetic-skill' },
+      });
+      api.downloadDocument.mockResolvedValue(report);
+
+      const task = TaskManagementV2.create({
+        db: db as unknown as DatabaseHandlerV2,
+        api: api as unknown as GithubClientV2,
+        config,
+        logger,
+      });
+
+      await task.runAsync();
+
+      expect(db.getIngestionLog).toHaveBeenCalledWith(
+        'enterprise',
+        'ent-1',
+        day,
+        day,
+      );
+      expect(api.fetchEnterpriseReportLinks).toHaveBeenCalledWith(day);
+      expect(api.downloadDocument).toHaveBeenCalledWith(
+        `https://downloads.github.com/${day}.json`,
+      );
+      expect(db.replaceRawReportDay).not.toHaveBeenCalled();
+      expect(db.upsertIngestionLog).not.toHaveBeenCalled();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   it('manual backfill re-ingests every requested day even when already logged', async () => {
     const db = createDbMock();
     const api = createApiMock();

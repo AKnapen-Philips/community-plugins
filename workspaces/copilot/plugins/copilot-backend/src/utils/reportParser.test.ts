@@ -286,6 +286,28 @@ describe('reportParser', () => {
       ]);
     });
 
+    it('rejects object-shaped known customization totals in strict mode', () => {
+      const day = '2026-10-23';
+
+      expect(() =>
+        parseEnterpriseDocument(
+          { day, totals_by_skill: { skill: 'synthetic-skill' } },
+          'enterprise',
+          'ent-1',
+          { strict: true },
+        ),
+      ).toThrow('Expected totals_by_skill to be an array.');
+
+      const result = parseEnterpriseDocument(
+        { day, totals_by_skill: null },
+        'enterprise',
+        'ent-1',
+        { strict: true },
+      );
+      expect(result.dailyTotals).toHaveLength(1);
+      expect(result.customizationMetrics).toEqual([]);
+    });
+
     it('ignores documented typed totals fields in strict aggregate reports', () => {
       const doc = {
         day: '2026-10-23',

@@ -191,6 +191,14 @@ const TYPED_TOTALS_FIELDS = new Set([
   'totals_by_ai_adoption_phase',
 ]);
 
+const KNOWN_CUSTOMIZATION_CATEGORIES = new Set([
+  'skill',
+  'custom_agent',
+  'mcp',
+  'slash_cmd',
+  'plugin',
+]);
+
 function isCustomizationCategory(category: string): boolean {
   return /^[a-z][a-z0-9_]{0,63}$/.test(category);
 }
@@ -223,7 +231,10 @@ function parseCustomizationData(
     }
 
     if (value !== undefined && value !== null && !Array.isArray(value)) {
-      logWarn(`Expected ${field} to be an array.`);
+      logWarn(
+        `Expected ${field} to be an array.`,
+        context.strict && KNOWN_CUSTOMIZATION_CATEGORIES.has(category),
+      );
       continue;
     }
     if (!Array.isArray(value)) {
