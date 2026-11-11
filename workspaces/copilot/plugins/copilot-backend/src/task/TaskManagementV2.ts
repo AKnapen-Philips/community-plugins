@@ -555,7 +555,6 @@ export class TaskManagementV2 {
     const ingestUsers = ingestTeams || costCenterIngestionAvailable;
     const backfillDelayMs =
       config.getOptionalNumber('copilot.backfillDelayMs') ?? 200;
-    const requiredComponents = getRequiredComponents(ingestUsers, ingestTeams);
     const reportWindowStartDate = getReportWindowStartDate();
     const missingFromDate =
       ingestUsers && fromDate < reportWindowStartDate
@@ -567,15 +566,6 @@ export class TaskManagementV2 {
       );
     }
 
-    const { missingDays } = await this.getMissingIngestionDays(
-      metricsType,
-      entityId,
-      fromDate,
-      missingFromDate,
-      toDate,
-      requiredComponents,
-      ingestUsers,
-    );
     const ingestionDays = getDaysInRange(fromDate, toDate);
     const missingCostCenterDays = costCenterIngestionAvailable
       ? await db.getDaysMissingCostCenterAggregation(
@@ -593,11 +583,8 @@ export class TaskManagementV2 {
           toDate,
         )
       : [];
-    const costCenterDays = uniqueDays(
-      ingestionDays.filter(day => day >= reportWindowStartDate),
-      missingDays.filter(day => day >= reportWindowStartDate),
-      missingCostCenterDays.filter(day => day >= reportWindowStartDate),
-      incompleteCostCenterDays.filter(day => day >= reportWindowStartDate),
+    const costCenterDays = ingestionDays.filter(
+      day => day >= reportWindowStartDate,
     );
 
     if (
@@ -631,9 +618,7 @@ export class TaskManagementV2 {
       }
     }
 
-    const loadedUserReportDays = new Set<string>();
-    const refreshedUserReportDays = new Set<string>();
-    const failedRefetchDays = new Set<string>();
+    const successfulUserRefreshDays = new Set<string>();
     for (const day of ingestionDays) {
       const userReport = await this.ingestDay(day, metricsType, entityId, {
         ingestTeams: ingestTeams && day >= reportWindowStartDate,
@@ -642,14 +627,12 @@ export class TaskManagementV2 {
         refetch: true,
         source: 'backfill',
       });
-      if (userReport.loaded) {
-        loadedUserReportDays.add(day);
-      }
-      if (userReport.refreshed) {
-        refreshedUserReportDays.add(day);
-      }
-      if (!userReport.succeeded) {
-        failedRefetchDays.add(day);
+      if (
+        day >= reportWindowStartDate &&
+        userReport.refreshed &&
+        userReport.succeeded
+      ) {
+        successfulUserRefreshDays.add(day);
       }
 
       if (backfillDelayMs > 0) {
@@ -661,27 +644,11 @@ export class TaskManagementV2 {
       return;
     }
 
-    const retryIncompleteDays = costCenterSnapshot.unassignedComplete
-      ? incompleteCostCenterDays
-      : [];
-    for (const day of costCenterDays) {
-      if (failedRefetchDays.has(day)) {
-        continue;
-      }
+    for (const day of successfulUserRefreshDays) {
       if (
         incompleteCostCenterDays.includes(day) &&
         !missingCostCenterDays.includes(day) &&
-        !retryIncompleteDays.includes(day)
-      ) {
-        continue;
-      }
-      if (missingDays.includes(day) && !loadedUserReportDays.has(day)) {
-        continue;
-      }
-      if (
-        !missingCostCenterDays.includes(day) &&
-        !retryIncompleteDays.includes(day) &&
-        !refreshedUserReportDays.has(day)
+        !costCenterSnapshot.unassignedComplete
       ) {
         continue;
       }
@@ -692,9 +659,7 @@ export class TaskManagementV2 {
           metricsType,
           entityId,
           costCenterSnapshot,
-          missingCostCenterDays.includes(day) ||
-            retryIncompleteDays.includes(day) ||
-            loadedUserReportDays.has(day),
+          true,
         );
       } catch (error) {
         logger.error(

@@ -108,9 +108,6 @@ describe('TaskManagementV2', () => {
       'copilot.ingestTeams': true,
     });
 
-    db.getMissingDays
-      .mockResolvedValueOnce([])
-      .mockResolvedValueOnce([outsideWindowDay]);
     api.fetchEnterpriseReportLinks.mockResolvedValue({
       download_links: ['https://downloads.github.com/totals.json'],
     });
@@ -132,22 +129,7 @@ describe('TaskManagementV2', () => {
       'ent-1',
     );
 
-    expect(db.getMissingDays).toHaveBeenNthCalledWith(
-      1,
-      'enterprise',
-      'ent-1',
-      reportWindowStart,
-      outsideWindowDay,
-      ['totals', 'users', 'teams'],
-    );
-    expect(db.getMissingDays).toHaveBeenNthCalledWith(
-      2,
-      'enterprise',
-      'ent-1',
-      outsideWindowDay,
-      outsideWindowDay,
-      ['totals'],
-    );
+    expect(db.getMissingDays).not.toHaveBeenCalled();
     expect(api.fetchEnterpriseReportLinks).toHaveBeenCalledWith(
       outsideWindowDay,
     );
@@ -480,7 +462,6 @@ describe('TaskManagementV2', () => {
     });
     const logger = createLoggerMock();
 
-    db.getMissingDays.mockResolvedValue([]);
     db.getDaysMissingCostCenterAggregation.mockResolvedValue([]);
 
     const task = TaskManagementV2.create({
@@ -1501,13 +1482,7 @@ describe('TaskManagementV2', () => {
       'ent-1',
     );
 
-    expect(db.getMissingDays).toHaveBeenCalledWith(
-      'enterprise',
-      'ent-1',
-      reportWindowStart,
-      outsideWindowDay,
-      ['totals', 'users'],
-    );
+    expect(db.getMissingDays).not.toHaveBeenCalled();
     expect(db.getDaysMissingCostCenterAggregation).toHaveBeenCalledWith(
       'enterprise',
       'ent-1',
@@ -1539,9 +1514,6 @@ describe('TaskManagementV2', () => {
       .minus({ days: 1 })
       .toISODate()!;
 
-    db.getMissingDays
-      .mockResolvedValueOnce([])
-      .mockResolvedValueOnce([outsideWindowDay]);
     api.fetchEnterpriseReportLinks.mockResolvedValue({
       download_links: ['https://downloads.github.com/totals.json'],
     });
@@ -1563,22 +1535,7 @@ describe('TaskManagementV2', () => {
       'ent-1',
     );
 
-    expect(db.getMissingDays).toHaveBeenNthCalledWith(
-      1,
-      'enterprise',
-      'ent-1',
-      reportWindowStart,
-      outsideWindowDay,
-      ['totals', 'users', 'teams'],
-    );
-    expect(db.getMissingDays).toHaveBeenNthCalledWith(
-      2,
-      'enterprise',
-      'ent-1',
-      outsideWindowDay,
-      outsideWindowDay,
-      ['totals'],
-    );
+    expect(db.getMissingDays).not.toHaveBeenCalled();
     expect(api.fetchEnterpriseReportLinks).toHaveBeenCalledWith(
       outsideWindowDay,
     );
@@ -1806,7 +1763,6 @@ describe('TaskManagementV2', () => {
     });
     const logger = createLoggerMock();
 
-    db.getMissingDays.mockResolvedValue(['2026-05-12']);
     api.fetchOrganizationReportLinks.mockResolvedValue({
       download_links: ['https://downloads.github.com/org-report.json'],
     });
@@ -1833,13 +1789,7 @@ describe('TaskManagementV2', () => {
       'org-1',
     );
 
-    expect(db.getMissingDays).toHaveBeenCalledWith(
-      'organization',
-      'org-1',
-      '2026-05-12',
-      '2026-05-12',
-      ['totals'],
-    );
+    expect(db.getMissingDays).not.toHaveBeenCalled();
     expect(api.fetchOrganizationReportLinks).toHaveBeenCalledWith('2026-05-12');
     expect(api.fetchOrganizationUserTeamsLinks).not.toHaveBeenCalled();
   });
@@ -1927,22 +1877,7 @@ describe('TaskManagementV2', () => {
       'copilot.ingestCostCenters': false,
     });
 
-    db.getMissingDays.mockResolvedValue([]);
-    api.fetchEnterpriseReportLinks.mockResolvedValue({
-      download_links: ['https://downloads.github.com/totals.json'],
-    });
-    api.fetchEnterpriseUserReportLinks.mockResolvedValue({
-      download_links: ['https://downloads.github.com/users.json'],
-    });
-    api.fetchEnterpriseUserTeamsLinks.mockResolvedValue({
-      download_links: ['https://downloads.github.com/teams.json'],
-    });
-    api.downloadDocument.mockResolvedValue(makeEnterpriseDocument(day));
-    api.downloadNdjsonDocument.mockImplementation(async (url: string) =>
-      url.endsWith('/teams.json')
-        ? makeUserTeamsDocument(day)
-        : makeUserMetricsDocument(day),
-    );
+    mockSuccessfulEnterpriseReports(api, day);
 
     const task = TaskManagementV2.create({
       db: db as unknown as DatabaseHandlerV2,
@@ -1977,10 +1912,7 @@ describe('TaskManagementV2', () => {
       report[0].day_totals[0] as unknown as Record<string, unknown>
     ).totals_by_future_dimension = { total: 3 };
 
-    db.getMissingDays.mockResolvedValue([]);
-    api.fetchEnterpriseReportLinks.mockResolvedValue({
-      download_links: ['https://downloads.github.com/totals.json'],
-    });
+    mockSuccessfulEnterpriseReports(api, day);
     api.downloadDocument.mockResolvedValue(report);
 
     const task = TaskManagementV2.create({
@@ -2031,7 +1963,6 @@ describe('TaskManagementV2', () => {
         'copilot.ingestTeams': true,
         'copilot.ingestCostCenters': true,
       });
-      db.getMissingDays.mockResolvedValue([]);
       db.getDaysMissingCostCenterAggregation.mockResolvedValue([day]);
       db.getIngestionLog.mockResolvedValue([
         {
@@ -2052,21 +1983,12 @@ describe('TaskManagementV2', () => {
       db.replaceRawReportDay.mockImplementation(() => {
         storedCustomizationMetrics.length = 0;
       });
+      mockSuccessfulEnterpriseReports(api, day);
       api.fetchCostCenterMemberships.mockResolvedValue(
         makeCostCenterSnapshot(
           new Map([[1, { costCenterId: 'cc-1', login: 'octocat' }]]),
         ),
       );
-      api.fetchEnterpriseReportLinks.mockResolvedValue({
-        download_links: ['https://downloads.github.com/totals.json'],
-      });
-      api.downloadDocument.mockResolvedValue(makeEnterpriseDocument(day));
-      api.fetchEnterpriseUserReportLinks.mockResolvedValue({
-        download_links: ['https://downloads.github.com/users.json'],
-      });
-      api.fetchEnterpriseUserTeamsLinks.mockResolvedValue({
-        download_links: ['https://downloads.github.com/teams.json'],
-      });
       if (failure === 'missing links') {
         api.fetchEnterpriseUserReportLinks.mockResolvedValueOnce({
           download_links: [],
@@ -2093,11 +2015,6 @@ describe('TaskManagementV2', () => {
           Object.assign(new Error('Not Found'), { status: 404 }),
         );
       }
-      api.downloadNdjsonDocument.mockImplementation(async (url: string) =>
-        url.endsWith('/teams.json')
-          ? makeUserTeamsDocument(day)
-          : makeUserMetricsDocument(day),
-      );
       const task = TaskManagementV2.create({
         db: db as unknown as DatabaseHandlerV2,
         api: api as unknown as GithubClientV2,
@@ -2192,7 +2109,6 @@ describe('TaskManagementV2', () => {
       user_id: 2,
       user_login: 'octocat-user-2',
     });
-    db.getMissingDays.mockResolvedValue([]);
     db.getDaysMissingCostCenterAggregation.mockResolvedValue([day]);
     db.getUserMetricsForDay.mockResolvedValue([
       makeStoredUserMetric(day, {
@@ -2218,19 +2134,7 @@ describe('TaskManagementV2', () => {
         ]),
       ),
     );
-    api.fetchEnterpriseReportLinks.mockResolvedValue({
-      download_links: ['https://downloads.github.com/totals.json'],
-    });
-    api.downloadDocument.mockResolvedValue(makeEnterpriseDocument(day));
-    api.fetchEnterpriseUserReportLinks.mockResolvedValue({
-      download_links: ['https://downloads.github.com/users.json'],
-    });
-    api.fetchEnterpriseUserTeamsLinks.mockResolvedValue({
-      download_links: ['https://downloads.github.com/teams.json'],
-    });
-    api.downloadNdjsonDocument.mockImplementation(async (url: string) =>
-      url.endsWith('/teams.json') ? makeUserTeamsDocument(day) : refreshed,
-    );
+    mockSuccessfulEnterpriseReports(api, day, refreshed);
     const task = TaskManagementV2.create({
       db: db as unknown as DatabaseHandlerV2,
       api: api as unknown as GithubClientV2,
@@ -3303,21 +3207,14 @@ describe('TaskManagementV2', () => {
     });
     const logger = createLoggerMock();
 
-    db.getMissingDays
-      .mockResolvedValueOnce(['2026-05-10'])
-      .mockResolvedValueOnce([]);
-
     api.fetchOrganizationReportLinks.mockResolvedValue({
       download_links: ['https://downloads.github.com/org-report.json'],
     });
     api.fetchOrganizationUserTeamsLinks.mockResolvedValue({
       download_links: ['https://downloads.github.com/org-user-teams.json'],
     });
-    api.downloadDocument.mockResolvedValueOnce(
+    api.downloadDocument.mockResolvedValue(
       makeEnterpriseDocument('2026-05-10'),
-    );
-    api.downloadNdjsonDocument.mockResolvedValueOnce(
-      makeUserTeamsDocument('2026-05-10'),
     );
 
     const task = TaskManagementV2.create({
@@ -3330,7 +3227,7 @@ describe('TaskManagementV2', () => {
     await task.runBackfill('2026-05-10', '2026-05-10', 'organization', 'org-1');
     await task.runBackfill('2026-05-10', '2026-05-10', 'organization', 'org-1');
 
-    expect(db.getMissingDays).toHaveBeenCalledTimes(2);
+    expect(db.getMissingDays).not.toHaveBeenCalled();
     expect(api.fetchOrganizationReportLinks).toHaveBeenCalledTimes(2);
   });
 });
@@ -3514,6 +3411,26 @@ function createApiMock() {
     downloadDocument: jest.fn(),
     downloadNdjsonDocument: jest.fn(),
   };
+}
+
+function mockSuccessfulEnterpriseReports(
+  api: ReturnType<typeof createApiMock>,
+  day: string,
+  userMetrics = makeUserMetricsDocument(day),
+): void {
+  api.fetchEnterpriseReportLinks.mockResolvedValue({
+    download_links: ['https://downloads.github.com/totals.json'],
+  });
+  api.fetchEnterpriseUserReportLinks.mockResolvedValue({
+    download_links: ['https://downloads.github.com/users.json'],
+  });
+  api.fetchEnterpriseUserTeamsLinks.mockResolvedValue({
+    download_links: ['https://downloads.github.com/teams.json'],
+  });
+  api.downloadDocument.mockResolvedValue(makeEnterpriseDocument(day));
+  api.downloadNdjsonDocument.mockImplementation(async (url: string) =>
+    url.endsWith('/teams.json') ? makeUserTeamsDocument(day) : userMetrics,
+  );
 }
 
 function createLoggerMock(): LoggerService {

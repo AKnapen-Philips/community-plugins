@@ -139,7 +139,7 @@ export type V2RawReportDayData = {
   markCostCenterPending?: boolean;
 };
 
-const costCenterAggregateTables = [
+const rawAggregateTables = [
   'copilot_daily_totals',
   'copilot_pr_metrics',
   'copilot_metrics_by_feature',
@@ -149,22 +149,27 @@ const costCenterAggregateTables = [
   'copilot_metrics_by_language_model',
   'copilot_metrics_by_cli',
   'copilot_metrics_by_vscode_agent',
+] as const;
+
+const costCenterAggregateTables = [
+  ...rawAggregateTables,
   'copilot_customization_metrics_by_cost_center',
+] as const;
+
+const rawUserTables = [
+  'copilot_user_metrics',
+  'copilot_user_metrics_by_feature',
+  'copilot_user_metrics_by_ide',
+  'copilot_user_metrics_by_language_feature',
+  'copilot_user_metrics_by_model_feature',
+  'copilot_user_metrics_by_language_model',
 ] as const;
 
 const WEEKLY_ACTIVE_USERS_WINDOW_DAYS = 7;
 const MONTHLY_ACTIVE_USERS_WINDOW_DAYS = 28;
 
 const teamAggregateTables = [
-  'copilot_daily_totals',
-  'copilot_pr_metrics',
-  'copilot_metrics_by_feature',
-  'copilot_metrics_by_ide',
-  'copilot_metrics_by_language_feature',
-  'copilot_metrics_by_model_feature',
-  'copilot_metrics_by_language_model',
-  'copilot_metrics_by_cli',
-  'copilot_metrics_by_vscode_agent',
+  ...rawAggregateTables,
   'copilot_customization_metrics',
 ] as const;
 
@@ -181,18 +186,6 @@ const teamAggregateRowsByTable = (
   ['copilot_metrics_by_vscode_agent', aggregates.byVscodeAgent ?? []],
   ['copilot_customization_metrics', aggregates.customizationMetrics],
 ];
-
-const rawAggregateTables = [
-  'copilot_daily_totals',
-  'copilot_pr_metrics',
-  'copilot_metrics_by_feature',
-  'copilot_metrics_by_ide',
-  'copilot_metrics_by_language_feature',
-  'copilot_metrics_by_model_feature',
-  'copilot_metrics_by_language_model',
-  'copilot_metrics_by_cli',
-  'copilot_metrics_by_vscode_agent',
-] as const;
 
 export class DatabaseHandlerV2 {
   static async create(options: Options): Promise<DatabaseHandlerV2> {
@@ -923,29 +916,6 @@ export class DatabaseHandlerV2 {
     }
   }
 
-  private async insertReplacementRows(
-    transaction: Knex.Transaction,
-    tableName: string,
-    rows: object[],
-    conflictColumns: string[],
-    mergeColumns?: string[],
-  ): Promise<void> {
-    if (!rows.length) {
-      return;
-    }
-
-    await batchInsertInChunks(rows, 100, async chunk => {
-      const query = transaction(tableName)
-        .insert(chunk)
-        .onConflict(conflictColumns);
-      if (mergeColumns) {
-        await query.merge(mergeColumns);
-      } else {
-        await query.ignore();
-      }
-    });
-  }
-
   /**
    * Replaces the raw rows for the report components supplied for one day.
    * Shared aggregate tables are restricted to their unscoped raw slice so
@@ -1043,6 +1013,7 @@ export class DatabaseHandlerV2 {
     }
 
     await this.db.transaction(async transaction => {
+      const transactionHandler = new DatabaseHandlerV2(transaction);
       if (totals) {
         for (const tableName of rawAggregateTables) {
           await transaction(tableName)
@@ -1075,194 +1046,30 @@ export class DatabaseHandlerV2 {
           })
           .del();
 
-        await this.insertReplacementRows(
-          transaction,
-          'copilot_daily_totals',
-          this.withDefaultCostCenter(totals.dailyTotals),
-          [
-            'day',
-            'metrics_type',
-            'entity_id',
-            'team_slug',
-            'cost_center_id',
-            'without_cost_center',
-          ],
-          ['total_ai_credits_used', 'daily_active_vscode_agent_users'],
+        await transactionHandler.insertDailyTotals(totals.dailyTotals);
+        await transactionHandler.insertPrMetrics(totals.prMetrics);
+        await transactionHandler.insertByFeature(totals.byFeature);
+        await transactionHandler.insertByIde(totals.byIde);
+        await transactionHandler.insertByLanguageFeature(
+          totals.byLanguageFeature,
         );
-        await this.insertReplacementRows(
-          transaction,
-          'copilot_pr_metrics',
-          this.withDefaultCostCenter(totals.prMetrics),
-          [
-            'day',
-            'metrics_type',
-            'entity_id',
-            'team_slug',
-            'cost_center_id',
-            'without_cost_center',
-          ],
+        await transactionHandler.insertByModelFeature(totals.byModelFeature);
+        await transactionHandler.insertByLanguageModel(totals.byLanguageModel);
+        await transactionHandler.insertByCli(totals.byCli);
+        await transactionHandler.insertByVscodeAgent(totals.byVscodeAgent);
+        await transactionHandler.insertCustomizationMetrics(
+          totals.customizationMetrics,
         );
-        await this.insertReplacementRows(
-          transaction,
-          'copilot_metrics_by_feature',
-          this.withDefaultCostCenter(totals.byFeature),
-          [
-            'day',
-            'metrics_type',
-            'entity_id',
-            'team_slug',
-            'cost_center_id',
-            'without_cost_center',
-            'feature',
-          ],
-        );
-        await this.insertReplacementRows(
-          transaction,
-          'copilot_metrics_by_ide',
-          this.withDefaultCostCenter(totals.byIde),
-          [
-            'day',
-            'metrics_type',
-            'entity_id',
-            'team_slug',
-            'cost_center_id',
-            'without_cost_center',
-            'ide',
-          ],
-        );
-        await this.insertReplacementRows(
-          transaction,
-          'copilot_metrics_by_language_feature',
-          this.withDefaultCostCenter(totals.byLanguageFeature),
-          [
-            'day',
-            'metrics_type',
-            'entity_id',
-            'team_slug',
-            'cost_center_id',
-            'without_cost_center',
-            'language',
-            'feature',
-          ],
-        );
-        await this.insertReplacementRows(
-          transaction,
-          'copilot_metrics_by_model_feature',
-          this.withDefaultCostCenter(totals.byModelFeature),
-          [
-            'day',
-            'metrics_type',
-            'entity_id',
-            'team_slug',
-            'cost_center_id',
-            'without_cost_center',
-            'model_id',
-            'feature',
-          ],
-        );
-        await this.insertReplacementRows(
-          transaction,
-          'copilot_metrics_by_language_model',
-          this.withDefaultCostCenter(totals.byLanguageModel),
-          [
-            'day',
-            'metrics_type',
-            'entity_id',
-            'team_slug',
-            'cost_center_id',
-            'without_cost_center',
-            'language',
-            'model_id',
-          ],
-        );
-        await this.insertReplacementRows(
-          transaction,
-          'copilot_metrics_by_cli',
-          this.withDefaultCostCenter(totals.byCli),
-          [
-            'day',
-            'metrics_type',
-            'entity_id',
-            'team_slug',
-            'cost_center_id',
-            'without_cost_center',
-          ],
-          [
-            'prompt_count',
-            'request_count',
-            'session_count',
-            'avg_tokens_per_request',
-            'output_tokens_sum',
-            'prompt_tokens_sum',
-          ],
-        );
-        await this.insertReplacementRows(
-          transaction,
-          'copilot_metrics_by_vscode_agent',
-          this.withDefaultCostCenter(totals.byVscodeAgent),
-          [
-            'day',
-            'metrics_type',
-            'entity_id',
-            'team_slug',
-            'cost_center_id',
-            'without_cost_center',
-          ],
-          ['session_count', 'total_user_messages'],
-        );
-        await this.insertReplacementRows(
-          transaction,
-          'copilot_customization_metrics',
-          totals.customizationMetrics.map(row => ({
-            ...row,
-            user_login: row.user_login.toLowerCase(),
-          })),
-          [
-            'day',
-            'metrics_type',
-            'entity_id',
-            'scope',
-            'team_slug',
-            'user_id',
-            'category',
-            'item_name',
-          ],
-          ['interaction_count', 'user_login'],
-        );
-        await this.insertReplacementRows(
-          transaction,
-          'copilot_customization_summaries',
-          totals.customizationSummaries.map(row => ({
-            ...row,
-            user_login: row.user_login.toLowerCase(),
-          })),
-          [
-            'day',
-            'metrics_type',
-            'entity_id',
-            'scope',
-            'team_slug',
-            'user_id',
-            'category',
-          ],
-          ['distinct_item_count', 'user_login'],
+        await transactionHandler.insertCustomizationSummaries(
+          totals.customizationSummaries,
         );
       }
 
       if (users) {
         const scope = { day, metrics_type: metricsType, entity_id: entityId };
-        await transaction('copilot_user_metrics').where(scope).del();
-        await transaction('copilot_user_metrics_by_feature').where(scope).del();
-        await transaction('copilot_user_metrics_by_ide').where(scope).del();
-        await transaction('copilot_user_metrics_by_language_feature')
-          .where(scope)
-          .del();
-        await transaction('copilot_user_metrics_by_model_feature')
-          .where(scope)
-          .del();
-        await transaction('copilot_user_metrics_by_language_model')
-          .where(scope)
-          .del();
+        for (const tableName of rawUserTables) {
+          await transaction(tableName).where(scope).del();
+        }
         await transaction('copilot_customization_metrics')
           .where({ ...scope, scope: 'user', team_slug: '' })
           .del();
@@ -1270,100 +1077,25 @@ export class DatabaseHandlerV2 {
           .where({ ...scope, scope: 'user', team_slug: '' })
           .del();
 
-        await this.insertReplacementRows(
-          transaction,
-          'copilot_user_metrics',
-          users.userMetrics,
-          ['day', 'metrics_type', 'entity_id', 'user_id'],
-          ['ai_credits_used', 'used_vscode_agent'],
-        );
-        await this.insertReplacementRows(
-          transaction,
-          'copilot_user_metrics_by_feature',
+        await transactionHandler.insertUserMetrics(users.userMetrics);
+        await transactionHandler.insertUserMetricsByFeature(
           users.breakdowns.byFeature,
-          ['day', 'metrics_type', 'entity_id', 'user_id', 'feature'],
         );
-        await this.insertReplacementRows(
-          transaction,
-          'copilot_user_metrics_by_ide',
-          users.breakdowns.byIde,
-          ['day', 'metrics_type', 'entity_id', 'user_id', 'ide'],
-        );
-        await this.insertReplacementRows(
-          transaction,
-          'copilot_user_metrics_by_language_feature',
+        await transactionHandler.insertUserMetricsByIde(users.breakdowns.byIde);
+        await transactionHandler.insertUserMetricsByLanguageFeature(
           users.breakdowns.byLanguageFeature,
-          [
-            'day',
-            'metrics_type',
-            'entity_id',
-            'user_id',
-            'language',
-            'feature',
-          ],
         );
-        await this.insertReplacementRows(
-          transaction,
-          'copilot_user_metrics_by_model_feature',
+        await transactionHandler.insertUserMetricsByModelFeature(
           users.breakdowns.byModelFeature,
-          [
-            'day',
-            'metrics_type',
-            'entity_id',
-            'user_id',
-            'model_id',
-            'feature',
-          ],
         );
-        await this.insertReplacementRows(
-          transaction,
-          'copilot_user_metrics_by_language_model',
+        await transactionHandler.insertUserMetricsByLanguageModel(
           users.breakdowns.byLanguageModel,
-          [
-            'day',
-            'metrics_type',
-            'entity_id',
-            'user_id',
-            'language',
-            'model_id',
-          ],
         );
-        await this.insertReplacementRows(
-          transaction,
-          'copilot_customization_metrics',
-          users.customizationMetrics.map(row => ({
-            ...row,
-            user_login: row.user_login.toLowerCase(),
-          })),
-          [
-            'day',
-            'metrics_type',
-            'entity_id',
-            'scope',
-            'team_slug',
-            'user_id',
-            'category',
-            'item_name',
-          ],
-          ['interaction_count', 'user_login'],
+        await transactionHandler.insertCustomizationMetrics(
+          users.customizationMetrics,
         );
-        await this.insertReplacementRows(
-          transaction,
-          'copilot_customization_summaries',
-          users.customizationSummaries.map(row => ({
-            ...row,
-            user_login: row.user_login.toLowerCase(),
-          })),
-          [
-            'day',
-            'metrics_type',
-            'entity_id',
-            'scope',
-            'team_slug',
-            'user_id',
-            'category',
-          ],
-          ['distinct_item_count', 'user_login'],
+        await transactionHandler.insertCustomizationSummaries(
+          users.customizationSummaries,
         );
 
         if (reports.markCostCenterPending) {
