@@ -50,7 +50,11 @@ import {
   bucketCostCenterBreakdown,
   CostCenterBreakdownKind,
 } from './longTailBucketing';
-import { UserBreakdownData } from '../utils/reportParser';
+import type {
+  ParsedEnterpriseDocument,
+  UserBreakdownData,
+} from '../utils/reportParser';
+import type { UserBreakdownRows } from '../utils/userBreakdownRows';
 import type { TeamAggregates } from '../utils/teamAggregator';
 
 type Options = {
@@ -122,7 +126,20 @@ export type CostCenterAggregateRows = {
   customizationMetrics?: CostCenterCustomizationMetricRow[];
 };
 
-const costCenterAggregateTables = [
+export type V2RawUserReportData = {
+  userMetrics: V2UserMetricRow[];
+  breakdowns: UserBreakdownRows;
+  customizationMetrics: V2CustomizationMetricRow[];
+  customizationSummaries: V2CustomizationSummaryRow[];
+};
+
+export type V2RawReportDayData = {
+  totals?: ParsedEnterpriseDocument;
+  users?: V2RawUserReportData;
+  markCostCenterPending?: boolean;
+};
+
+const rawAggregateTables = [
   'copilot_daily_totals',
   'copilot_pr_metrics',
   'copilot_metrics_by_feature',
@@ -132,22 +149,27 @@ const costCenterAggregateTables = [
   'copilot_metrics_by_language_model',
   'copilot_metrics_by_cli',
   'copilot_metrics_by_vscode_agent',
+] as const;
+
+const costCenterAggregateTables = [
+  ...rawAggregateTables,
   'copilot_customization_metrics_by_cost_center',
+] as const;
+
+const rawUserTables = [
+  'copilot_user_metrics',
+  'copilot_user_metrics_by_feature',
+  'copilot_user_metrics_by_ide',
+  'copilot_user_metrics_by_language_feature',
+  'copilot_user_metrics_by_model_feature',
+  'copilot_user_metrics_by_language_model',
 ] as const;
 
 const WEEKLY_ACTIVE_USERS_WINDOW_DAYS = 7;
 const MONTHLY_ACTIVE_USERS_WINDOW_DAYS = 28;
 
 const teamAggregateTables = [
-  'copilot_daily_totals',
-  'copilot_pr_metrics',
-  'copilot_metrics_by_feature',
-  'copilot_metrics_by_ide',
-  'copilot_metrics_by_language_feature',
-  'copilot_metrics_by_model_feature',
-  'copilot_metrics_by_language_model',
-  'copilot_metrics_by_cli',
-  'copilot_metrics_by_vscode_agent',
+  ...rawAggregateTables,
   'copilot_customization_metrics',
 ] as const;
 
@@ -873,7 +895,222 @@ export class DatabaseHandlerV2 {
     });
   }
 
-  async upsertIngestionLog(row: V2IngestionLogRow): Promise<void> {
+  private validateReportRows(
+    rows: Array<{ day: string; metrics_type: MetricsScope; entity_id: string }>,
+    day: string,
+    metricsType: MetricsScope,
+    entityId: string,
+    reportName: string,
+  ): void {
+    if (
+      rows.some(
+        row =>
+          row.day !== day ||
+          row.metrics_type !== metricsType ||
+          row.entity_id !== entityId,
+      )
+    ) {
+      throw new Error(
+        `${reportName} replacement rows must match the requested day and scope.`,
+      );
+    }
+  }
+
+  /**
+   * Replaces the raw rows for the report components supplied for one day.
+   * Shared aggregate tables are restricted to their unscoped raw slice so
+   * team and cost-center aggregates remain intact until their own replacement.
+   */
+  async replaceRawReportDay(
+    day: string,
+    metricsType: MetricsScope,
+    entityId: string,
+    reports: V2RawReportDayData,
+  ): Promise<void> {
+    const { totals, users } = reports;
+    if (!totals && !users) {
+      throw new Error('At least one raw report component must be supplied.');
+    }
+
+    if (totals) {
+      const aggregateRows = [
+        ...totals.dailyTotals,
+        ...totals.prMetrics,
+        ...totals.byFeature,
+        ...totals.byIde,
+        ...totals.byLanguageFeature,
+        ...totals.byModelFeature,
+        ...totals.byLanguageModel,
+        ...totals.byCli,
+        ...totals.byVscodeAgent,
+      ];
+      this.validateReportRows(
+        aggregateRows,
+        day,
+        metricsType,
+        entityId,
+        'Totals',
+      );
+      if (
+        aggregateRows.some(row => {
+          const scopedRow = row as {
+            team_slug?: string;
+            cost_center_id?: string | null;
+            without_cost_center?: boolean;
+          };
+          return (
+            scopedRow.team_slug !== '' ||
+            (scopedRow.cost_center_id !== undefined &&
+              scopedRow.cost_center_id !== null &&
+              scopedRow.cost_center_id !== '') ||
+            scopedRow.without_cost_center === true
+          );
+        })
+      ) {
+        throw new Error(
+          'Totals replacement rows must contain only the unscoped raw slice.',
+        );
+      }
+      this.validateReportRows(
+        [...totals.customizationMetrics, ...totals.customizationSummaries],
+        day,
+        metricsType,
+        entityId,
+        'Totals customization',
+      );
+      if (
+        [...totals.customizationMetrics, ...totals.customizationSummaries].some(
+          row => row.scope !== 'aggregate' || row.team_slug !== '',
+        )
+      ) {
+        throw new Error(
+          'Totals customization rows must contain only the aggregate scope.',
+        );
+      }
+    }
+
+    if (users) {
+      const userRows = [
+        ...users.userMetrics,
+        ...users.breakdowns.byFeature,
+        ...users.breakdowns.byIde,
+        ...users.breakdowns.byLanguageFeature,
+        ...users.breakdowns.byModelFeature,
+        ...users.breakdowns.byLanguageModel,
+        ...users.customizationMetrics,
+        ...users.customizationSummaries,
+      ];
+      this.validateReportRows(userRows, day, metricsType, entityId, 'User');
+      if (
+        [...users.customizationMetrics, ...users.customizationSummaries].some(
+          row => row.scope !== 'user' || row.team_slug !== '',
+        )
+      ) {
+        throw new Error(
+          'User customization rows must contain only the user scope.',
+        );
+      }
+    }
+
+    await this.db.transaction(async transaction => {
+      const transactionHandler = new DatabaseHandlerV2(transaction);
+      if (totals) {
+        for (const tableName of rawAggregateTables) {
+          await transaction(tableName)
+            .where({
+              day,
+              metrics_type: metricsType,
+              entity_id: entityId,
+              team_slug: '',
+              cost_center_id: '',
+              without_cost_center: false,
+            })
+            .del();
+        }
+        await transaction('copilot_customization_metrics')
+          .where({
+            day,
+            metrics_type: metricsType,
+            entity_id: entityId,
+            scope: 'aggregate',
+            team_slug: '',
+          })
+          .del();
+        await transaction('copilot_customization_summaries')
+          .where({
+            day,
+            metrics_type: metricsType,
+            entity_id: entityId,
+            scope: 'aggregate',
+            team_slug: '',
+          })
+          .del();
+
+        await transactionHandler.insertDailyTotals(totals.dailyTotals);
+        await transactionHandler.insertPrMetrics(totals.prMetrics);
+        await transactionHandler.insertByFeature(totals.byFeature);
+        await transactionHandler.insertByIde(totals.byIde);
+        await transactionHandler.insertByLanguageFeature(
+          totals.byLanguageFeature,
+        );
+        await transactionHandler.insertByModelFeature(totals.byModelFeature);
+        await transactionHandler.insertByLanguageModel(totals.byLanguageModel);
+        await transactionHandler.insertByCli(totals.byCli);
+        await transactionHandler.insertByVscodeAgent(totals.byVscodeAgent);
+        await transactionHandler.insertCustomizationMetrics(
+          totals.customizationMetrics,
+        );
+        await transactionHandler.insertCustomizationSummaries(
+          totals.customizationSummaries,
+        );
+      }
+
+      if (users) {
+        const scope = { day, metrics_type: metricsType, entity_id: entityId };
+        for (const tableName of rawUserTables) {
+          await transaction(tableName).where(scope).del();
+        }
+        await transaction('copilot_customization_metrics')
+          .where({ ...scope, scope: 'user', team_slug: '' })
+          .del();
+        await transaction('copilot_customization_summaries')
+          .where({ ...scope, scope: 'user', team_slug: '' })
+          .del();
+
+        await transactionHandler.insertUserMetrics(users.userMetrics);
+        await transactionHandler.insertUserMetricsByFeature(
+          users.breakdowns.byFeature,
+        );
+        await transactionHandler.insertUserMetricsByIde(users.breakdowns.byIde);
+        await transactionHandler.insertUserMetricsByLanguageFeature(
+          users.breakdowns.byLanguageFeature,
+        );
+        await transactionHandler.insertUserMetricsByModelFeature(
+          users.breakdowns.byModelFeature,
+        );
+        await transactionHandler.insertUserMetricsByLanguageModel(
+          users.breakdowns.byLanguageModel,
+        );
+        await transactionHandler.insertCustomizationMetrics(
+          users.customizationMetrics,
+        );
+        await transactionHandler.insertCustomizationSummaries(
+          users.customizationSummaries,
+        );
+
+        if (reports.markCostCenterPending) {
+          await transaction('copilot_cost_center_aggregation_log')
+            .where(scope)
+            .update({ needs_reaggregation: true });
+        }
+      }
+    });
+  }
+
+  async upsertIngestionLog(
+    row: V2IngestionLogRow,
+    options: { replaceComponents?: boolean } = {},
+  ): Promise<void> {
     await this.db.transaction(async transaction => {
       const scope = {
         day: row.day,
@@ -895,14 +1132,18 @@ export class DatabaseHandlerV2 {
         throw new Error('Ingestion log row could not be initialized.');
       }
 
-      const componentsLoaded = [
-        ...new Set([
-          ...parseComponentsLoaded(existing.components_loaded),
-          ...parseComponentsLoaded(row.components_loaded),
-        ]),
-      ];
+      const componentsLoaded = options.replaceComponents
+        ? parseComponentsLoaded(row.components_loaded)
+        : [
+            ...new Set([
+              ...parseComponentsLoaded(existing.components_loaded),
+              ...parseComponentsLoaded(row.components_loaded),
+            ]),
+          ];
       const preserveSuccessfulStatus =
-        existing.status === 'success' && row.status !== 'success';
+        !options.replaceComponents &&
+        existing.status === 'success' &&
+        row.status !== 'success';
       let errorMessage = row.error_message;
       if (errorMessage === undefined) {
         errorMessage = preserveSuccessfulStatus ? existing.error_message : null;

@@ -129,7 +129,7 @@ implementation markers.
 
 GitHub does not provide historical cost-center membership. Each ingested day uses the membership snapshot fetched at that time; backfilling existing per-user data applies the current snapshot to those historical days. GitHub's per-user and team reports cover roughly a rolling year, so newly enabled user, team, and cost-center data is backfilled only within that window. Older totals-only records remain unchanged and are not retried.
 
-Refreshing a user report queues its existing cost-center aggregates for replacement. Scheduled ingestion and manual backfills retry pending days within the report window until replacement succeeds, retaining the previous aggregates, including **No cost center**, meanwhile. Reusing a cached user report does not queue a replacement.
+Refreshing a user report queues its existing cost-center aggregates for replacement. Scheduled ingestion and manual backfills rebuild those aggregates within the report window, retaining the previous aggregates, including **No cost center**, if the membership snapshot is incomplete. Reusing a cached user report does not queue a replacement.
 
 For expired native team-report days, `/v2/backfill/status` omits `teams` from `components_loaded` while preserving the successful totals status.
 
@@ -230,11 +230,13 @@ into an exact team-wide distinct count.
 
 ### Historical Backfill
 
-The V2 task runner performs gap-fill ingestion for missing days from `copilot.backfillFromDate` through yesterday.
+The V2 task runner performs gap-fill ingestion for missing days from `copilot.backfillFromDate` through yesterday. Each scheduled run also re-ingests the three most recent available days (yesterday and the two days before), clamped to the configured start date and GitHub's report window. This refreshes reports that GitHub may update shortly after they first become available.
 
 GitHub's report API currently exposes historical data from `2025-10-10` up to a rolling year. When enabling user, team, or cost-center ingestion after an upgrade, only missing components within that window are backfilled; existing totals-only data outside it is retained.
 
 Use `copilot.backfillDelayMs` to slow down day-by-day requests if you encounter rate pressure during historical ingestion.
+
+Manual backfills re-ingest every day in the requested range, regardless of the ingestion log; the report-window limit still applies to user and team reports. Successfully parsed reports replace that day's stored raw data. Team aggregates are rebuilt when team ingestion is enabled, and cost-center aggregates are rebuilt when cost-center ingestion is enabled and a complete membership snapshot is available. If any requested report is unavailable, empty, or invalid, that day's existing data and ingestion log are left unchanged.
 
 When upgrading to a version with customization metrics, the database migration
 automatically re-ingests successful report days from 2026-10-22 onward so
