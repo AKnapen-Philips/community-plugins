@@ -1,5 +1,6 @@
 ---
 '@backstage-community/plugin-copilot': minor
+'@backstage-community/plugin-copilot-backend': patch
 ---
 
 Enable organization-team filtering in the enterprise dashboard when
