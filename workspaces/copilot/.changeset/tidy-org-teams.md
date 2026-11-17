@@ -3,12 +3,12 @@
 '@backstage-community/plugin-copilot-backend': patch
 ---
 
-Enable organization-team filtering in the enterprise dashboard when
-`copilot.enterprise`, `copilot.organization`, and `copilot.ingestTeams` are
-configured. The enterprise view's Team filter is now labelled Enterprise team
-to distinguish it from organization teams. Known organization teams remain
-selectable when the selected date range has partial report coverage; available
-metrics are shown without filling missing days with zeros, and teams without
-qualifying data display an empty state. Organization-team data that is still
-syncing no longer triggers a warning, and failed options or dashboard requests
-can be retried.
+Enable organization-team filtering for the configured organization with
+`copilot.ingestTeams`, or opt in to organization discovery with
+`copilot.ingestOrganizationTeamReports`. The enterprise view's Team filter is
+now labelled Enterprise team to distinguish it from organization teams.
+Known teams remain selectable regardless of the date range; partial metric
+days remain unfilled, and the organization-scoped dashboard applies the
+existing five-user privacy check. Selecting a team scopes results to its
+owning organization, so same-slug teams remain distinct. Failed options or
+dashboard requests can be retried.
