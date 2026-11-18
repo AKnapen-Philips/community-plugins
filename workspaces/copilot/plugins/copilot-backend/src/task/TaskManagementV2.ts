@@ -373,43 +373,32 @@ export class TaskManagementV2 {
       }
     }
 
-    let configuredOrganizationLease: OrganizationIngestionLease | undefined;
-    if (
-      ingestOrganizationTeamReports &&
-      enterprise &&
-      organization &&
-      configuredOrganizationAvailable
-    ) {
-      const leaseStartedAt = DateTime.utc();
-      configuredOrganizationLease = await db.claimEnterpriseOrganizationLease(
-        enterprise,
-        organization,
-        leaseStartedAt.toJSDate(),
-        leaseStartedAt
-          .plus({ minutes: ORGANIZATION_TEAM_LEASE_MINUTES })
-          .toJSDate(),
-        true,
-      );
-      if (!configuredOrganizationLease) {
-        logger.warn(
-          `[TaskManagementV2] Skipping legacy ingestion for organization:${organization}; another worker owns its organization-team lease.`,
-        );
-      }
-    }
-
     for (const plan of plans) {
-      const isConfiguredOrganization =
-        plan.entity.metricsType === 'organization';
-      const organizationLease = isConfiguredOrganization
-        ? configuredOrganizationLease
-        : undefined;
+      let organizationLease: OrganizationIngestionLease | undefined;
       if (
         ingestOrganizationTeamReports &&
         enterprise &&
-        isConfiguredOrganization &&
-        !organizationLease
+        plan.entity.metricsType === 'organization'
       ) {
-        continue;
+        if (!configuredOrganizationAvailable) {
+          continue;
+        }
+        const leaseStartedAt = DateTime.utc();
+        organizationLease = await db.claimEnterpriseOrganizationLease(
+          enterprise,
+          plan.entity.entityId,
+          leaseStartedAt.toJSDate(),
+          leaseStartedAt
+            .plus({ minutes: ORGANIZATION_TEAM_LEASE_MINUTES })
+            .toJSDate(),
+          true,
+        );
+        if (!organizationLease) {
+          logger.warn(
+            `[TaskManagementV2] Skipping legacy ingestion for organization:${plan.entity.entityId}; another worker owns its organization-team lease.`,
+          );
+          continue;
+        }
       }
 
       try {

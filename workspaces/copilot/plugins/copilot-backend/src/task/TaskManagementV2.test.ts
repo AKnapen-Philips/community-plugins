@@ -33,6 +33,65 @@ import { UserBreakdownData } from '../utils/reportParser';
 import { TaskManagementV2, runBackfill } from './TaskManagementV2';
 
 describe('TaskManagementV2', () => {
+  it('claims the configured organization lease after slow enterprise ingestion', async () => {
+    jest.useFakeTimers();
+    jest.setSystemTime(new Date('2026-11-18T12:00:00Z'));
+    try {
+      const db = createDbMock();
+      const api = createApiMock();
+      const lease = {
+        enterpriseId: 'ent-1',
+        organization: 'org-1',
+        owner: 'worker',
+      };
+      db.getMissingDays.mockResolvedValue(['2026-11-17']);
+      api.fetchEnterpriseOrganizations.mockResolvedValue(['org-1']);
+      api.fetchEnterpriseReportLinks.mockImplementation(async () => {
+        expect(db.claimEnterpriseOrganizationLease).not.toHaveBeenCalled();
+        jest.setSystemTime(new Date('2026-11-18T12:11:00Z'));
+        return { download_links: [] };
+      });
+      api.fetchOrganizationReportLinks.mockResolvedValue({
+        download_links: [],
+      });
+      api.fetchOrganizationUserReportLinks.mockResolvedValue({
+        download_links: [],
+      });
+      api.fetchOrganizationUserTeamsLinks.mockResolvedValue({
+        download_links: [],
+      });
+      db.claimEnterpriseOrganizationLease.mockResolvedValue(lease);
+      const task = TaskManagementV2.create({
+        db: db as unknown as DatabaseHandlerV2,
+        api: api as unknown as GithubClientV2,
+        config: createConfigMock({
+          'copilot.enterprise': 'ent-1',
+          'copilot.organization': 'org-1',
+          'copilot.ingestOrganizationTeamReports': true,
+          'copilot.backfillFromDate': '2026-11-17',
+          'copilot.backfillDelayMs': 0,
+        }),
+        logger: createLoggerMock(),
+      });
+
+      await task.runAsync();
+
+      expect(db.claimEnterpriseOrganizationLease).toHaveBeenCalledWith(
+        'ent-1',
+        'org-1',
+        new Date('2026-11-18T12:11:00Z'),
+        new Date('2026-11-18T12:21:00Z'),
+        true,
+      );
+      expect(api.fetchOrganizationReportLinks).toHaveBeenCalledWith(
+        '2026-11-17',
+      );
+      expect(db.releaseEnterpriseOrganizationLease).toHaveBeenCalledWith(lease);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   it('does not discover enterprise organizations unless multi-org ingestion is enabled', async () => {
     const db = createDbMock();
     const api = createApiMock();
