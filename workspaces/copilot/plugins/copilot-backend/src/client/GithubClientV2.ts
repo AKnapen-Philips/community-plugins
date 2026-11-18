@@ -48,6 +48,7 @@ const STORAGE_DOWNLOAD_HOSTS = [
 
 // Follow at most this many redirects, re-checking the allowlist on every hop.
 const MAX_DOWNLOAD_REDIRECTS = 5;
+const REPORT_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
 
 // GHE.com serves the API from api.SUBDOMAIN.ghe.com and the reports from
 // copilot-reports.SUBDOMAIN.ghe.com.
@@ -303,6 +304,7 @@ export class GithubClientV2 {
     private readonly copilotConfig: CopilotConfig,
     private readonly config: Config,
     private readonly logger: LoggerService,
+    private readonly reportRequestTimeoutMs = REPORT_REQUEST_TIMEOUT_MS,
   ) {}
 
   static async fromConfig(
@@ -1024,7 +1026,11 @@ export class GithubClientV2 {
     octokit: Octokit,
     path: string,
   ): Promise<ReportEnvelope> {
-    const response = await octokit.request(`GET ${path}`);
+    const response = await octokit.request(`GET ${path}`, {
+      request: {
+        signal: AbortSignal.timeout(this.reportRequestTimeoutMs),
+      },
+    });
 
     if (response.status === 204 || !response.data) {
       this.logger.warn(
@@ -1150,6 +1156,7 @@ export class GithubClientV2 {
 
   private async downloadText(url: string): Promise<string> {
     let currentUrl = url;
+    const signal = AbortSignal.timeout(this.reportRequestTimeoutMs);
 
     for (let hop = 0; hop <= MAX_DOWNLOAD_REDIRECTS; hop++) {
       const { origin, pathname } = this.assertAllowedDownloadUrl(currentUrl);
@@ -1157,7 +1164,10 @@ export class GithubClientV2 {
         `[GithubClientV2] Downloading document: ${origin}${pathname}`,
       );
 
-      const response = await fetch(currentUrl, { redirect: 'manual' });
+      const response = await fetch(currentUrl, {
+        redirect: 'manual',
+        signal,
+      });
 
       if (response.status >= 300 && response.status < 400) {
         const location = response.headers.get('location');
