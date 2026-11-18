@@ -267,6 +267,14 @@ GitHub's report API currently exposes historical data from `2025-10-10` up to a 
 
 Use `copilot.backfillDelayMs` to slow down day-by-day requests if you encounter rate pressure during historical ingestion.
 
+Reports are downloaded and prepared before opening a short database transaction
+for each day. The transaction checks which report components are already stored
+and commits new data together with its completion status. Overlapping scheduled
+runs and manual backfills can download the same reports, but do not replace
+components another run has already completed. Unavailable reports are retried
+without clearing previously imported data; failed daily commits are rolled back.
+Cost-center membership remains refreshable independently of completed reports.
+
 When upgrading to a version with customization metrics, the database migration
 automatically re-ingests successful report days from 2026-10-22 onward so
 named values are populated without a manual backfill.
