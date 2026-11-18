@@ -88,7 +88,7 @@ describe('TaskManagementV2', () => {
         expect(tx).toBe(transaction);
       });
     });
-    db.replaceTeamAggregates.mockImplementation(async (...args) => {
+    db.replaceTeamMemberships.mockImplementation(async (...args) => {
       expect(inTransaction).toBe(true);
       expect(args.at(-1)).toBe(transaction);
     });
@@ -98,12 +98,12 @@ describe('TaskManagementV2', () => {
       expect(log).toEqual(
         expect.objectContaining({
           status: 'success',
-          components_loaded: '["totals","users","teams"]',
+          components_loaded: '["totals","users","userBreakdowns","teams"]',
         }),
       );
       expect(db.insertDailyTotals).toHaveBeenCalledTimes(2);
       expect(db.insertUserMetrics).toHaveBeenCalledTimes(1);
-      expect(db.replaceTeamAggregates).toHaveBeenCalledTimes(1);
+      expect(db.replaceTeamMemberships).toHaveBeenCalledTimes(1);
     });
     const task = TaskManagementV2.create({
       db: db as unknown as DatabaseHandlerV2,
@@ -177,7 +177,7 @@ describe('TaskManagementV2', () => {
     expect(db.insertDailyTotals).not.toHaveBeenCalled();
     expect(db.insertUserMetrics).not.toHaveBeenCalled();
     expect(db.insertCustomizationMetrics).not.toHaveBeenCalled();
-    expect(db.replaceTeamAggregates).not.toHaveBeenCalled();
+    expect(db.replaceTeamMemberships).not.toHaveBeenCalled();
     expect(db.upsertIngestionLog).not.toHaveBeenCalled();
     expect(logger.error).not.toHaveBeenCalled();
   });
@@ -318,8 +318,7 @@ describe('TaskManagementV2', () => {
       expect(db.insertUserMetricsByFeature).not.toHaveBeenCalled();
       expect(db.insertCustomizationMetrics).not.toHaveBeenCalled();
       expect(db.insertCustomizationSummaries).not.toHaveBeenCalled();
-      expect(db.replaceTeamAggregates).not.toHaveBeenCalled();
-      expect(db.markCostCenterAggregationPending).not.toHaveBeenCalled();
+      expect(db.replaceTeamMemberships).not.toHaveBeenCalled();
       expect(db.upsertIngestionLog).toHaveBeenCalledTimes(1);
       expect(db.upsertIngestionLog).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -363,7 +362,7 @@ describe('TaskManagementV2', () => {
       .mockImplementationOnce(async (_day, _scope, _entity, operation) =>
         operation(errorTransaction, { components_loaded: '[]' }),
       );
-    db.replaceTeamAggregates.mockRejectedValue(failure);
+    db.replaceTeamMemberships.mockRejectedValue(failure);
     const task = TaskManagementV2.create({
       db: db as unknown as DatabaseHandlerV2,
       api: api as unknown as GithubClientV2,
@@ -401,7 +400,7 @@ describe('TaskManagementV2', () => {
     );
   });
 
-  it('does not apply prepared team aggregates when the locked stored users have changed', async () => {
+  it('commits team memberships independently of concurrent changes to raw users', async () => {
     const db = createDbMock();
     const api = createApiMock();
     const day = '2026-05-10';
@@ -434,26 +433,32 @@ describe('TaskManagementV2', () => {
     await task.runBackfill(day, day, 'enterprise', 'ent-1');
 
     expect(api.downloadNdjsonDocument).toHaveBeenCalledWith('teams');
-    expect(db.replaceTeamAggregates).not.toHaveBeenCalled();
+    expect(db.replaceTeamMemberships).toHaveBeenCalledWith(
+      day,
+      'enterprise',
+      'ent-1',
+      [expect.objectContaining({ user_id: 1, team_slug: 'platform' })],
+      expect.any(Object),
+    );
     expect(db.insertUserMetrics).not.toHaveBeenCalled();
     expect(db.upsertIngestionLog).toHaveBeenCalledWith(
       expect.objectContaining({
-        status: 'partial',
-        components_loaded: '["totals","users"]',
+        status: 'success',
+        components_loaded: '["totals","users","teams"]',
       }),
       expect.any(Object),
     );
   });
 
   it.each([false, true])(
-    'does not replace cost-center aggregates from changed stored users (legacy repair=%s)',
+    'commits cost-center memberships independently of changed raw users (legacy repair=%s)',
     async legacyRepair => {
       const db = createDbMock();
       const api = createApiMock();
       const day = '2026-05-10';
       const stored = makeStoredUserMetric(day);
       db.getMissingDays.mockResolvedValue([]);
-      db.getDaysMissingCostCenterAggregation.mockResolvedValue([day]);
+      db.getDaysMissingCostCenterMemberships.mockResolvedValue([day]);
       db.getUserMetricsForDay
         .mockResolvedValueOnce([stored])
         .mockResolvedValue([{ ...stored, loc_added_sum: 999 }]);
@@ -462,7 +467,10 @@ describe('TaskManagementV2', () => {
       );
       api.fetchCostCenterMemberships.mockResolvedValue(
         makeCostCenterSnapshot(
-          new Map([[1, { costCenterId: 'cc-1', login: 'octocat' }]]),
+          new Map([
+            [1, { costCenterId: 'cc-1', login: 'octocat' }],
+            [2, { costCenterId: 'cc-2', login: 'not-yet-active' }],
+          ]),
         ),
       );
       api.fetchEnterpriseUserReportLinks.mockResolvedValue({
@@ -493,11 +501,181 @@ describe('TaskManagementV2', () => {
       expect(api.downloadNdjsonDocument).toHaveBeenCalledTimes(
         legacyRepair ? 1 : 0,
       );
-      expect(db.insertUserMetrics).not.toHaveBeenCalled();
-      expect(db.replaceCostCenterAggregates).not.toHaveBeenCalled();
-      expect(db.markCostCenterAggregationPending).not.toHaveBeenCalled();
+      expect(db.insertUserMetrics).toHaveBeenCalledTimes(legacyRepair ? 1 : 0);
+      expect(db.replaceCostCenterMemberships).toHaveBeenCalledWith(
+        day,
+        'enterprise',
+        'ent-1',
+        [
+          expect.objectContaining({ user_id: 1, cost_center_id: 'cc-1' }),
+          expect.objectContaining({
+            user_id: 2,
+            user_login: 'not-yet-active',
+            cost_center_id: 'cc-2',
+          }),
+        ],
+        true,
+        expect.any(Object),
+      );
     },
   );
+
+  it.each([false, true])(
+    'does not overwrite a concurrently completed cost-center snapshot (unassigned complete=%s)',
+    async unassignedComplete => {
+      const db = createDbMock();
+      const api = createApiMock();
+      const day = '2026-05-10';
+      const transaction = {};
+      db.getMissingDays.mockResolvedValue([]);
+      db.getDaysMissingCostCenterMemberships
+        .mockResolvedValueOnce([day])
+        .mockResolvedValue([]);
+      db.getUserMetricsForDay.mockResolvedValue([makeStoredUserMetric(day)]);
+      api.fetchCostCenterMemberships.mockResolvedValue(
+        makeCostCenterSnapshot(
+          new Map([[1, { costCenterId: 'cc-stale', login: 'octocat' }]]),
+          [],
+          true,
+          unassignedComplete,
+        ),
+      );
+      api.fetchEnterpriseUserReportLinks.mockResolvedValue({
+        download_links: ['users'],
+      });
+      api.downloadNdjsonDocument.mockResolvedValue(
+        makeUserMetricsDocument(day),
+      );
+      db.withIngestionDay.mockImplementation(
+        async (_day, _scope, _entity, operation) =>
+          operation(transaction, {
+            components_loaded: '["totals","users","userBreakdowns"]',
+          }),
+      );
+      const task = TaskManagementV2.create({
+        db: db as unknown as DatabaseHandlerV2,
+        api: api as unknown as GithubClientV2,
+        config: createConfigMock({
+          'copilot.enterprise': 'ent-1',
+          'copilot.ingestCostCenters': true,
+          'copilot.backfillDelayMs': 0,
+        }),
+        logger: createLoggerMock(),
+      });
+
+      await task.runBackfill(day, day, 'enterprise', 'ent-1');
+
+      expect(api.downloadNdjsonDocument).toHaveBeenCalledWith('users');
+      expect(db.getDaysMissingCostCenterMemberships).toHaveBeenLastCalledWith(
+        'enterprise',
+        'ent-1',
+        day,
+        day,
+        transaction,
+      );
+      expect(
+        db.getDaysWithIncompleteCostCenterMemberships,
+      ).toHaveBeenLastCalledWith('enterprise', 'ent-1', day, day, transaction);
+      expect(db.insertUserMetrics).not.toHaveBeenCalled();
+      expect(db.replaceCostCenterMemberships).not.toHaveBeenCalled();
+      expect(db.upsertIngestionLog).not.toHaveBeenCalled();
+    },
+  );
+
+  it('skips a prepared legacy raw repair already completed by another worker without losing memberships', async () => {
+    const db = createDbMock();
+    const api = createApiMock();
+    const day = '2026-05-10';
+    const transaction = {};
+    db.getMissingDays.mockResolvedValue([]);
+    db.getDaysMissingCostCenterMemberships.mockResolvedValue([day]);
+    db.getUserMetricsForDay.mockResolvedValue([makeStoredUserMetric(day)]);
+    api.fetchCostCenterMemberships.mockResolvedValue(
+      makeCostCenterSnapshot(
+        new Map([[1, { costCenterId: 'cc-1', login: 'octocat' }]]),
+      ),
+    );
+    api.fetchEnterpriseUserReportLinks.mockResolvedValue({
+      download_links: ['users'],
+    });
+    api.downloadNdjsonDocument.mockResolvedValue(makeUserMetricsDocument(day));
+    db.withIngestionDay.mockImplementation(
+      async (_day, _scope, _entity, operation) =>
+        operation(transaction, {
+          components_loaded: '["totals","users","userBreakdowns"]',
+        }),
+    );
+    const task = TaskManagementV2.create({
+      db: db as unknown as DatabaseHandlerV2,
+      api: api as unknown as GithubClientV2,
+      config: createConfigMock({
+        'copilot.enterprise': 'ent-1',
+        'copilot.ingestCostCenters': true,
+        'copilot.backfillDelayMs': 0,
+      }),
+      logger: createLoggerMock(),
+    });
+
+    await task.runBackfill(day, day, 'enterprise', 'ent-1');
+
+    expect(api.downloadNdjsonDocument).toHaveBeenCalledWith('users');
+    expect(db.insertUserMetrics).not.toHaveBeenCalled();
+    expect(db.upsertIngestionLog).not.toHaveBeenCalled();
+    expect(db.replaceCostCenterMemberships).toHaveBeenCalledWith(
+      day,
+      'enterprise',
+      'ent-1',
+      [expect.objectContaining({ user_id: 1, cost_center_id: 'cc-1' })],
+      true,
+      transaction,
+    );
+  });
+
+  it('reuses legitimately empty raw breakdowns when completing team and cost-center memberships', async () => {
+    const db = createDbMock();
+    const api = createApiMock();
+    const day = '2026-05-10';
+    db.getMissingDays.mockResolvedValue([day]);
+    db.getIngestionLog.mockResolvedValue([
+      { components_loaded: '["totals","users","userBreakdowns"]' },
+    ]);
+    db.getUserMetricsForDay.mockResolvedValue([makeStoredUserMetric(day)]);
+    api.fetchEnterpriseUserTeamsLinks.mockResolvedValue({
+      download_links: ['teams'],
+    });
+    api.downloadNdjsonDocument.mockResolvedValue(makeUserTeamsDocument(day));
+    api.fetchCostCenterMemberships.mockResolvedValue(
+      makeCostCenterSnapshot(
+        new Map([[1, { costCenterId: 'cc-1', login: 'octocat' }]]),
+      ),
+    );
+    db.getDaysMissingCostCenterMemberships.mockResolvedValue([day]);
+    const task = TaskManagementV2.create({
+      db: db as unknown as DatabaseHandlerV2,
+      api: api as unknown as GithubClientV2,
+      config: createConfigMock({
+        'copilot.enterprise': 'ent-1',
+        'copilot.ingestTeams': true,
+        'copilot.ingestCostCenters': true,
+        'copilot.backfillDelayMs': 0,
+      }),
+      logger: createLoggerMock(),
+    });
+
+    await task.runBackfill(day, day, 'enterprise', 'ent-1');
+
+    expect(api.fetchEnterpriseUserReportLinks).not.toHaveBeenCalled();
+    expect(db.insertUserMetrics).not.toHaveBeenCalled();
+    expect(db.replaceTeamMemberships).toHaveBeenCalledTimes(1);
+    expect(db.replaceCostCenterMemberships).toHaveBeenCalledTimes(1);
+    expect(db.upsertIngestionLog).toHaveBeenCalledWith(
+      expect.objectContaining({
+        status: 'success',
+        components_loaded: '["totals","users","userBreakdowns","teams"]',
+      }),
+      expect.any(Object),
+    );
+  });
 
   it.each([false, true])(
     'uses the start of organization access verification for state updates (inaccessible=%s)',
@@ -794,7 +972,7 @@ describe('TaskManagementV2', () => {
       'insertDailyTotals',
       'insertUserMetrics',
       'insertUserMetricsByFeature',
-      'replaceTeamAggregates',
+      'replaceTeamMemberships',
       'upsertIngestionLog',
     ] as const) {
       expect(
@@ -807,7 +985,7 @@ describe('TaskManagementV2', () => {
         metrics_type: 'organization',
         entity_id: 'org-1',
         status: 'success',
-        components_loaded: '["totals","users","teams"]',
+        components_loaded: '["totals","users","userBreakdowns","teams"]',
       }),
       transaction,
     );
@@ -850,7 +1028,7 @@ describe('TaskManagementV2', () => {
       day,
       ['totals'],
     );
-    expect(db.getDaysMissingCostCenterAggregation).toHaveBeenCalledWith(
+    expect(db.getDaysMissingCostCenterMemberships).toHaveBeenCalledWith(
       'organization',
       'Org-1',
       expect.any(String),
@@ -936,7 +1114,7 @@ describe('TaskManagementV2', () => {
       );
       expect(setTimeoutSpy).toHaveBeenCalledWith(expect.any(Function), 5);
       expect(api.fetchCostCenterMemberships).not.toHaveBeenCalled();
-      expect(db.getDaysMissingCostCenterAggregation).not.toHaveBeenCalled();
+      expect(db.getDaysMissingCostCenterMemberships).not.toHaveBeenCalled();
       expect(api.verifyEnterpriseOrganizationAccess).toHaveBeenCalledWith(
         'Org-1',
         expect.any(String),
@@ -1070,7 +1248,7 @@ describe('TaskManagementV2', () => {
           }),
         ]),
       );
-      expect(db.replaceTeamAggregates).toHaveBeenCalledTimes(1);
+      expect(db.replaceTeamMemberships).toHaveBeenCalledTimes(1);
       expect(db.upsertIngestionLog).toHaveBeenCalledWith(
         expect.objectContaining({
           day: outsideWindowDay,
@@ -1149,7 +1327,7 @@ describe('TaskManagementV2', () => {
       ]),
       expect.any(Object),
     );
-    expect(db.replaceTeamAggregates).not.toHaveBeenCalled();
+    expect(db.replaceTeamMemberships).not.toHaveBeenCalled();
     expect(db.upsertIngestionLog).toHaveBeenCalledWith(
       expect.objectContaining({
         day,
@@ -1382,7 +1560,7 @@ describe('TaskManagementV2', () => {
     expect(db.withIngestionDay).toHaveBeenCalledTimes(6);
   });
 
-  it('refreshes recent team aggregates without refetching daily totals or user reports', async () => {
+  it('refreshes recent team memberships without refetching daily totals or user reports', async () => {
     const db = createDbMock();
     const api = createApiMock();
     const logger = createLoggerMock();
@@ -1443,8 +1621,8 @@ describe('TaskManagementV2', () => {
       3,
     );
     expect(db.withIngestionDay.mock.calls.map(([day]) => day)).toEqual(days);
-    expect(db.replaceTeamAggregates).toHaveBeenCalledTimes(3);
-    expect(db.replaceTeamAggregates.mock.calls.map(([day]) => day)).toEqual(
+    expect(db.replaceTeamMemberships).toHaveBeenCalledTimes(3);
+    expect(db.replaceTeamMemberships.mock.calls.map(([day]) => day)).toEqual(
       days,
     );
     expect(db.upsertIngestionLog).toHaveBeenCalledTimes(3);
@@ -1702,14 +1880,14 @@ describe('TaskManagementV2', () => {
     );
     expect(api.fetchEnterpriseReportLinks).not.toHaveBeenCalled();
     expect(api.fetchCostCenterMemberships).not.toHaveBeenCalled();
-    expect(db.getDaysMissingCostCenterAggregation).not.toHaveBeenCalled();
+    expect(db.getDaysMissingCostCenterMemberships).not.toHaveBeenCalled();
     expect(db.upsertCostCenters).not.toHaveBeenCalled();
     expect(db.upsertUserCostCenters).not.toHaveBeenCalled();
     expect(db.getUserMetricsForDay).not.toHaveBeenCalled();
     expect(db.getUserBreakdownsForDay).not.toHaveBeenCalled();
     expect(db.getUserTeamsForDay).not.toHaveBeenCalled();
-    expect(db.markCostCenterAggregationDone).not.toHaveBeenCalled();
-    expect(db.replaceCostCenterAggregates).not.toHaveBeenCalled();
+    expect(db.markCostCenterMembershipsDone).not.toHaveBeenCalled();
+    expect(db.replaceCostCenterMemberships).not.toHaveBeenCalled();
   });
 
   it('does not fetch a cost-center snapshot when no days need processing', async () => {
@@ -1725,7 +1903,7 @@ describe('TaskManagementV2', () => {
     const logger = createLoggerMock();
 
     db.getMissingDays.mockResolvedValue([]);
-    db.getDaysMissingCostCenterAggregation.mockResolvedValue([]);
+    db.getDaysMissingCostCenterMemberships.mockResolvedValue([]);
 
     const task = TaskManagementV2.create({
       db: db as unknown as DatabaseHandlerV2,
@@ -1779,7 +1957,7 @@ describe('TaskManagementV2', () => {
     );
     expect(api.fetchOrganizationReportLinks).toHaveBeenCalledWith('2026-05-10');
     expect(api.fetchCostCenterMemberships).not.toHaveBeenCalled();
-    expect(db.getDaysMissingCostCenterAggregation).not.toHaveBeenCalled();
+    expect(db.getDaysMissingCostCenterMemberships).not.toHaveBeenCalled();
   });
 
   it('warns and skips organization cost centers when no organization is configured', async () => {
@@ -1830,8 +2008,8 @@ describe('TaskManagementV2', () => {
     );
     expect(api.fetchOrganizationReportLinks).toHaveBeenCalledWith(day);
     expect(api.fetchCostCenterMemberships).not.toHaveBeenCalled();
-    expect(db.getDaysMissingCostCenterAggregation).not.toHaveBeenCalled();
-    expect(db.replaceCostCenterAggregates).not.toHaveBeenCalled();
+    expect(db.getDaysMissingCostCenterMemberships).not.toHaveBeenCalled();
+    expect(db.replaceCostCenterMemberships).not.toHaveBeenCalled();
   });
 
   it('ingests organization cost centers independently of team ingestion', async () => {
@@ -1918,7 +2096,7 @@ describe('TaskManagementV2', () => {
       expect.any(String),
       ['totals', 'users'],
     );
-    expect(db.getDaysMissingCostCenterAggregation).toHaveBeenCalledWith(
+    expect(db.getDaysMissingCostCenterMemberships).toHaveBeenCalledWith(
       'organization',
       'org-1',
       '2026-05-10',
@@ -1938,7 +2116,7 @@ describe('TaskManagementV2', () => {
         name: 'Engineering',
       },
     ]);
-    expect(db.replaceCostCenterAggregates).toHaveBeenCalledWith(
+    expect(db.replaceCostCenterMemberships).toHaveBeenCalledWith(
       day,
       'organization',
       'org-1',
@@ -1950,28 +2128,9 @@ describe('TaskManagementV2', () => {
           cost_center_id: 'cc-1',
         }),
       ],
-      expect.objectContaining({
-        dailyTotals: expect.arrayContaining([
-          expect.objectContaining({
-            team_slug: '',
-            cost_center_id: 'cc-1',
-            daily_active_users: 1,
-            loc_added_sum: 10,
-          }),
-          expect.objectContaining({
-            team_slug: '',
-            cost_center_id: '',
-            without_cost_center: true,
-            daily_active_users: 1,
-            loc_added_sum: 20,
-          }),
-        ]),
-      }),
       true,
       expect.any(Object),
     );
-    const [, , , , aggregates] = db.replaceCostCenterAggregates.mock.calls[0];
-    expect(aggregates.dailyTotals).toHaveLength(2);
     expect(logger.warn).not.toHaveBeenCalled();
   });
 
@@ -1981,7 +2140,7 @@ describe('TaskManagementV2', () => {
     const logger = createLoggerMock();
     const days = ['2026-05-10', '2026-05-11'];
     db.getMissingDays.mockResolvedValue([]);
-    db.getDaysMissingCostCenterAggregation.mockImplementation(
+    db.getDaysMissingCostCenterMemberships.mockImplementation(
       async metricsType => (metricsType === 'organization' ? days : []),
     );
     const task = TaskManagementV2.create({
@@ -2001,22 +2160,22 @@ describe('TaskManagementV2', () => {
     jest
       .spyOn(task as any, 'loadCostCenterSnapshot')
       .mockResolvedValue(makeCostCenterSnapshot(new Map()));
-    const ingestCostCenterAggregates = jest
-      .spyOn(task as any, 'ingestCostCenterAggregates')
+    const ingestCostCenterMemberships = jest
+      .spyOn(task as any, 'ingestCostCenterMemberships')
       .mockRejectedValueOnce(new Error('transaction failed'))
       .mockResolvedValue(undefined);
 
     await task.runAsync();
 
-    expect(ingestCostCenterAggregates).toHaveBeenCalledTimes(2);
-    expect(ingestCostCenterAggregates).toHaveBeenCalledWith(
+    expect(ingestCostCenterMemberships).toHaveBeenCalledTimes(2);
+    expect(ingestCostCenterMemberships).toHaveBeenCalledWith(
       days[0],
       'organization',
       'org-1',
       expect.any(Object),
       true,
     );
-    expect(ingestCostCenterAggregates).toHaveBeenLastCalledWith(
+    expect(ingestCostCenterMemberships).toHaveBeenLastCalledWith(
       days[1],
       'organization',
       'org-1',
@@ -2041,7 +2200,7 @@ describe('TaskManagementV2', () => {
     const day = '2026-05-10';
 
     db.getMissingDays.mockResolvedValue([]);
-    db.getDaysMissingCostCenterAggregation.mockResolvedValue([day]);
+    db.getDaysMissingCostCenterMemberships.mockResolvedValue([day]);
     db.getUserMetricsForDay.mockImplementation(
       async (metricsType, entityId) => [
         makeStoredUserMetric(day, {
@@ -2084,7 +2243,7 @@ describe('TaskManagementV2', () => {
         cost_center_id: 'cc-1',
       }),
     ]);
-    expect(db.replaceCostCenterAggregates).toHaveBeenCalledTimes(2);
+    expect(db.replaceCostCenterMemberships).toHaveBeenCalledTimes(2);
   });
 
   it('ingests enterprise users for cost centers without fetching teams', async () => {
@@ -2101,7 +2260,7 @@ describe('TaskManagementV2', () => {
     const day = '2026-05-10';
 
     db.getMissingDays.mockResolvedValue([day]);
-    db.getDaysMissingCostCenterAggregation.mockResolvedValue([]);
+    db.getDaysMissingCostCenterMemberships.mockResolvedValue([day]);
     db.getUserMetricsForDay.mockResolvedValue([
       makeStoredUserMetric(day, { loc_added_sum: 10 }),
     ]);
@@ -2152,7 +2311,7 @@ describe('TaskManagementV2', () => {
         name: 'Engineering',
       },
     ]);
-    expect(db.replaceCostCenterAggregates).toHaveBeenCalledWith(
+    expect(db.replaceCostCenterMemberships).toHaveBeenCalledWith(
       day,
       'enterprise',
       'ent-1',
@@ -2166,34 +2325,14 @@ describe('TaskManagementV2', () => {
           cost_center_id: 'cc-1',
         }),
       ],
-      expect.objectContaining({
-        dailyTotals: [
-          expect.objectContaining({
-            team_slug: '',
-            cost_center_id: 'cc-1',
-            daily_active_users: 1,
-            loc_added_sum: 10,
-          }),
-        ],
-        byFeature: [
-          expect.objectContaining({
-            team_slug: '',
-            cost_center_id: 'cc-1',
-            feature: 'chat_panel',
-            loc_added_sum: 10,
-          }),
-        ],
-        byCli: [],
-        byVscodeAgent: [],
-      }),
       true,
       expect.any(Object),
     );
     expect(db.upsertUserCostCenters).not.toHaveBeenCalled();
-    expect(db.markCostCenterAggregationDone).not.toHaveBeenCalled();
+    expect(db.markCostCenterMembershipsDone).not.toHaveBeenCalled();
   });
 
-  it('re-aggregates cost centers for re-ingested customization-metric days', async () => {
+  it('persists raw customization metrics alongside cost-center memberships', async () => {
     const db = createDbMock();
     const api = createApiMock();
     const day = '2026-10-28';
@@ -2262,24 +2401,13 @@ describe('TaskManagementV2', () => {
       ],
       expect.any(Object),
     );
-    expect(db.replaceCostCenterAggregates).toHaveBeenCalledWith(
+    expect(db.replaceCostCenterMemberships).toHaveBeenCalledWith(
       day,
       'enterprise',
       'ent-1',
       expect.arrayContaining([
         expect.objectContaining({ user_id: 1, cost_center_id: 'cc-1' }),
       ]),
-      expect.objectContaining({
-        customizationMetrics: [
-          expect.objectContaining({
-            cost_center_id: 'cc-1',
-            without_cost_center: false,
-            category: 'skill',
-            item_name: 'release-checks',
-            interaction_count: 4,
-          }),
-        ],
-      }),
       true,
       expect.any(Object),
     );
@@ -2335,10 +2463,10 @@ describe('TaskManagementV2', () => {
           source,
         },
       ]);
-      db.getDaysMissingCostCenterAggregation.mockResolvedValue(
+      db.getDaysMissingCostCenterMemberships.mockResolvedValue(
         costCenters === 'missing' ? [day] : [],
       );
-      db.getDaysWithIncompleteCostCenterAggregation.mockResolvedValue(
+      db.getDaysWithIncompleteCostCenterMemberships.mockResolvedValue(
         costCenters === 'incomplete' ? [day] : [],
       );
       db.getUserMetricsForDay.mockResolvedValue([makeStoredUserMetric(day)]);
@@ -2375,7 +2503,7 @@ describe('TaskManagementV2', () => {
       }
 
       expect(api.fetchEnterpriseUserReportLinks).not.toHaveBeenCalled();
-      expect(db.replaceTeamAggregates).toHaveBeenCalledTimes(
+      expect(db.replaceTeamMemberships).toHaveBeenCalledTimes(
         component === 'teams' ? 1 : 0,
       );
       expect(db.upsertIngestionLog).toHaveBeenCalledWith(
@@ -2387,19 +2515,16 @@ describe('TaskManagementV2', () => {
         'enterprise',
         'ent-1',
         [expect.objectContaining({ user_id: 1, cost_center_id: 'cc-new' })],
-        expect.objectContaining({
-          dailyTotals: [expect.objectContaining({ cost_center_id: 'cc-new' })],
-        }),
         true,
         expect.any(Object),
       ];
-      expect(db.replaceCostCenterAggregates.mock.calls).toEqual(
+      expect(db.replaceCostCenterMemberships.mock.calls).toEqual(
         costCenters === 'complete' ? [] : [expectedReplacement],
       );
     },
   );
 
-  it('keeps team and cost-center aggregates in separate scopes', async () => {
+  it('keeps team and cost-center memberships in separate scopes', async () => {
     const db = createDbMock();
     const api = createApiMock();
     const config = createConfigMock({
@@ -2431,7 +2556,7 @@ describe('TaskManagementV2', () => {
     ];
 
     db.getMissingDays.mockResolvedValue([day]);
-    db.getDaysMissingCostCenterAggregation.mockResolvedValue([]);
+    db.getDaysMissingCostCenterMemberships.mockResolvedValue([day]);
     db.getUserMetricsForDay.mockResolvedValue([
       makeStoredUserMetric(day, { loc_added_sum: 10 }),
       makeStoredUserMetric(day, {
@@ -2476,36 +2601,22 @@ describe('TaskManagementV2', () => {
 
     await task.runAsync();
 
-    expect(db.replaceCostCenterAggregates).toHaveBeenCalledTimes(1);
-    const [, , , userCostCenters, costCenterAggregates] =
-      db.replaceCostCenterAggregates.mock.calls[0];
+    expect(db.replaceCostCenterMemberships).toHaveBeenCalledTimes(1);
+    const [, , , userCostCenters] =
+      db.replaceCostCenterMemberships.mock.calls[0];
     expect(userCostCenters).toEqual([
       expect.objectContaining({ user_id: 1, cost_center_id: 'cc-1' }),
     ]);
-    const costCenterTotals = costCenterAggregates.dailyTotals;
-    expect(costCenterTotals).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          team_slug: '',
-          cost_center_id: 'cc-1',
-          daily_active_users: 1,
-          loc_added_sum: 10,
-        }),
-        expect.objectContaining({
-          team_slug: '',
-          cost_center_id: '',
-          without_cost_center: true,
-          daily_active_users: 1,
-          loc_added_sum: 20,
-        }),
-      ]),
+    expect(db.replaceTeamMemberships).toHaveBeenCalledWith(
+      day,
+      'enterprise',
+      'ent-1',
+      [
+        expect.objectContaining({ user_id: 1, team_slug: 'platform' }),
+        expect.objectContaining({ user_id: 2, team_slug: 'platform' }),
+      ],
+      expect.any(Object),
     );
-    expect(costCenterTotals).toHaveLength(2);
-    expect(
-      (costCenterTotals as Array<{ team_slug: string }>).every(
-        row => row.team_slug === '',
-      ),
-    ).toBe(true);
     expect(api.fetchEnterpriseUserTeamsLinks).toHaveBeenCalledWith(day);
     expect(db.getUserTeamsForDay).not.toHaveBeenCalled();
   });
@@ -2524,7 +2635,7 @@ describe('TaskManagementV2', () => {
     const day = '2026-05-10';
 
     db.getMissingDays.mockResolvedValue([day]);
-    db.getDaysMissingCostCenterAggregation.mockResolvedValue([]);
+    db.getDaysMissingCostCenterMemberships.mockResolvedValue([day]);
     api.fetchCostCenterMemberships.mockResolvedValue(
       makeCostCenterSnapshot(new Map()),
     );
@@ -2546,22 +2657,16 @@ describe('TaskManagementV2', () => {
 
     await task.runAsync();
 
-    expect(db.replaceCostCenterAggregates).toHaveBeenCalledWith(
+    expect(db.replaceCostCenterMemberships).toHaveBeenCalledWith(
       day,
       'enterprise',
       'ent-1',
       [],
-      expect.objectContaining({
-        dailyTotals: [],
-        byFeature: [],
-        byCli: [],
-        byVscodeAgent: [],
-      }),
       true,
       expect.any(Object),
     );
     expect(db.insertDailyTotals).toHaveBeenCalledTimes(1);
-    expect(db.markCostCenterAggregationDone).not.toHaveBeenCalled();
+    expect(db.markCostCenterMembershipsDone).not.toHaveBeenCalled();
   });
 
   it('runAsync with one missing day ingests once', async () => {
@@ -2756,7 +2861,12 @@ describe('TaskManagementV2', () => {
       expect.objectContaining({
         day: reportWindowStart,
         status: 'success',
-        components_loaded: JSON.stringify(['totals', 'users', 'teams']),
+        components_loaded: JSON.stringify([
+          'totals',
+          'users',
+          'userBreakdowns',
+          'teams',
+        ]),
       }),
       expect.any(Object),
     );
@@ -2785,7 +2895,7 @@ describe('TaskManagementV2', () => {
       .toISODate()!;
 
     db.getMissingDays.mockResolvedValue([]);
-    db.getDaysMissingCostCenterAggregation.mockResolvedValue([]);
+    db.getDaysMissingCostCenterMemberships.mockResolvedValue([]);
 
     const task = TaskManagementV2.create({
       db: db as unknown as DatabaseHandlerV2,
@@ -2808,7 +2918,7 @@ describe('TaskManagementV2', () => {
       outsideWindowDay,
       ['totals', 'users'],
     );
-    expect(db.getDaysMissingCostCenterAggregation).toHaveBeenCalledWith(
+    expect(db.getDaysMissingCostCenterMemberships).toHaveBeenCalledWith(
       'enterprise',
       'ent-1',
       reportWindowStart,
@@ -2984,11 +3094,11 @@ describe('TaskManagementV2', () => {
     expect(api.fetchOrganizationUserTeamsLinks).toHaveBeenCalledWith(day);
     expect(db.insertDailyTotals).toHaveBeenCalledTimes(1);
     expect(db.insertUserMetrics).toHaveBeenCalledTimes(1);
-    expect(db.replaceTeamAggregates).not.toHaveBeenCalled();
+    expect(db.replaceTeamMemberships).not.toHaveBeenCalled();
     expect(db.upsertIngestionLog).toHaveBeenCalledWith(
       expect.objectContaining({
         status: 'partial',
-        components_loaded: '["totals","users"]',
+        components_loaded: '["totals","users","userBreakdowns"]',
       }),
       expect.any(Object),
     );
@@ -3027,7 +3137,7 @@ describe('TaskManagementV2', () => {
     });
 
     db.getMissingDays.mockResolvedValue([day]);
-    db.getDaysMissingCostCenterAggregation.mockResolvedValue([day]);
+    db.getDaysMissingCostCenterMemberships.mockResolvedValue([day]);
     api.fetchCostCenterMemberships.mockResolvedValue(
       makeCostCenterSnapshot(new Map()),
     );
@@ -3054,8 +3164,8 @@ describe('TaskManagementV2', () => {
     await task.runBackfill(day, day, 'organization', 'org-1');
 
     expect(db.insertDailyTotals).toHaveBeenCalledTimes(1);
-    expect(db.replaceCostCenterAggregates).not.toHaveBeenCalled();
-    expect(db.markCostCenterAggregationDone).not.toHaveBeenCalled();
+    expect(db.replaceCostCenterMemberships).not.toHaveBeenCalled();
+    expect(db.markCostCenterMembershipsDone).not.toHaveBeenCalled();
     expect(db.upsertIngestionLog).toHaveBeenCalledWith(
       expect.objectContaining({
         status: 'partial',
@@ -3130,7 +3240,7 @@ describe('TaskManagementV2', () => {
     expect(api.fetchOrganizationUserTeamsLinks).not.toHaveBeenCalled();
   });
 
-  it('backfills cost-center aggregates from stored user data without downloading reports', async () => {
+  it('backfills cost-center memberships alongside stored users without downloading reports', async () => {
     const db = createDbMock();
     const api = createApiMock();
     const config = createConfigMock({
@@ -3143,7 +3253,7 @@ describe('TaskManagementV2', () => {
     const day = '2026-05-12';
 
     db.getMissingDays.mockResolvedValue([]);
-    db.getDaysMissingCostCenterAggregation.mockResolvedValue([day]);
+    db.getDaysMissingCostCenterMemberships.mockResolvedValue([day]);
     db.getUserMetricsForDay.mockResolvedValue([
       makeStoredUserMetric(day, { loc_added_sum: 15 }),
     ]);
@@ -3165,7 +3275,7 @@ describe('TaskManagementV2', () => {
 
     await task.runBackfill(day, day, 'enterprise', 'ent-1');
 
-    expect(db.getDaysMissingCostCenterAggregation).toHaveBeenCalledWith(
+    expect(db.getDaysMissingCostCenterMemberships).toHaveBeenCalledWith(
       'enterprise',
       'ent-1',
       day,
@@ -3185,20 +3295,15 @@ describe('TaskManagementV2', () => {
     expect(api.fetchEnterpriseUserReportLinks).not.toHaveBeenCalled();
     expect(api.fetchEnterpriseUserTeamsLinks).not.toHaveBeenCalled();
     expect(api.downloadNdjsonDocument).not.toHaveBeenCalled();
-    expect(db.replaceCostCenterAggregates).toHaveBeenCalledWith(
+    expect(db.replaceCostCenterMemberships).toHaveBeenCalledWith(
       day,
       'enterprise',
       'ent-1',
       [expect.objectContaining({ user_id: 1, cost_center_id: 'cc-1' })],
-      expect.objectContaining({
-        dailyTotals: expect.arrayContaining([
-          expect.objectContaining({ loc_added_sum: 15 }),
-        ]),
-      }),
       true,
       expect.any(Object),
     );
-    expect(db.markCostCenterAggregationDone).not.toHaveBeenCalled();
+    expect(db.markCostCenterMembershipsDone).not.toHaveBeenCalled();
   });
 
   it.each(['missing links', 'download failure', 'empty report'])(
@@ -3214,7 +3319,7 @@ describe('TaskManagementV2', () => {
         'copilot.ingestCostCenters': true,
       });
       db.getMissingDays.mockResolvedValue([]);
-      db.getDaysMissingCostCenterAggregation.mockResolvedValue([day]);
+      db.getDaysMissingCostCenterMemberships.mockResolvedValue([day]);
       db.getIngestionLog.mockResolvedValue([
         {
           day,
@@ -3256,8 +3361,8 @@ describe('TaskManagementV2', () => {
 
       await task.runBackfill(day, day, 'enterprise', 'ent-1');
 
-      expect(db.replaceCostCenterAggregates).not.toHaveBeenCalled();
-      expect(db.markCostCenterAggregationDone).not.toHaveBeenCalled();
+      expect(db.replaceCostCenterMemberships).not.toHaveBeenCalled();
+      expect(db.markCostCenterMembershipsDone).not.toHaveBeenCalled();
 
       await task.runBackfill(day, day, 'enterprise', 'ent-1');
 
@@ -3267,35 +3372,29 @@ describe('TaskManagementV2', () => {
         [expect.objectContaining({ day, feature: 'chat_panel' })],
         expect.any(Object),
       );
-      expect(db.replaceCostCenterAggregates).toHaveBeenCalledTimes(1);
-      expect(db.replaceCostCenterAggregates).toHaveBeenCalledWith(
+      expect(db.replaceCostCenterMemberships).toHaveBeenCalledTimes(1);
+      expect(db.replaceCostCenterMemberships).toHaveBeenCalledWith(
         day,
         'enterprise',
         'ent-1',
         [expect.objectContaining({ user_id: 1, cost_center_id: 'cc-1' })],
-        expect.objectContaining({
-          dailyTotals: expect.arrayContaining([
-            expect.objectContaining({ loc_added_sum: 15 }),
-          ]),
-          byFeature: [
-            expect.objectContaining({
-              feature: 'chat_panel',
-              loc_added_sum: 10,
-            }),
-          ],
-        }),
         true,
         expect.any(Object),
       );
       expect(api.fetchEnterpriseReportLinks).not.toHaveBeenCalled();
       expect(api.fetchEnterpriseUserTeamsLinks).not.toHaveBeenCalled();
       expect(db.insertDailyTotals).not.toHaveBeenCalled();
-      expect(db.replaceTeamAggregates).not.toHaveBeenCalled();
-      expect(db.upsertIngestionLog).not.toHaveBeenCalled();
+      expect(db.replaceTeamMemberships).not.toHaveBeenCalled();
+      expect(db.upsertIngestionLog).toHaveBeenCalledWith(
+        expect.objectContaining({
+          components_loaded: '["totals","users","teams","userBreakdowns"]',
+        }),
+        expect.any(Object),
+      );
     },
   );
 
-  it('aggregates persisted merged metrics and added users after a legacy refresh', async () => {
+  it('repairs legacy raw metrics and persists the full assigned snapshot atomically', async () => {
     const db = createDbMock();
     const api = createApiMock();
     const day = '2026-05-12';
@@ -3318,7 +3417,7 @@ describe('TaskManagementV2', () => {
       user_login: 'octocat-user-2',
     });
     db.getMissingDays.mockResolvedValue([]);
-    db.getDaysMissingCostCenterAggregation.mockResolvedValue([day]);
+    db.getDaysMissingCostCenterMemberships.mockResolvedValue([day]);
     db.getUserMetricsForDay.mockResolvedValue([original]);
     db.withIngestionDay.mockImplementation(
       async (_day, _scope, _entity, operation) => {
@@ -3353,7 +3452,7 @@ describe('TaskManagementV2', () => {
       expect(inTransaction).toBe(true);
       expect(tx).toBe(transaction);
     });
-    db.replaceCostCenterAggregates.mockImplementation(async (...args) => {
+    db.replaceCostCenterMemberships.mockImplementation(async (...args) => {
       expect(inTransaction).toBe(true);
       expect(args.at(-1)).toBe(transaction);
     });
@@ -3381,7 +3480,7 @@ describe('TaskManagementV2', () => {
     );
     expect(db.withIngestionDay).toHaveBeenCalledTimes(1);
     expect(db.insertUserMetrics).toHaveBeenCalledTimes(1);
-    expect(db.replaceCostCenterAggregates).toHaveBeenCalledWith(
+    expect(db.replaceCostCenterMemberships).toHaveBeenCalledWith(
       day,
       'enterprise',
       'ent-1',
@@ -3389,29 +3488,20 @@ describe('TaskManagementV2', () => {
         expect.objectContaining({ user_id: 1, cost_center_id: 'cc-1' }),
         expect.objectContaining({ user_id: 2, cost_center_id: 'cc-1' }),
       ],
-      expect.objectContaining({
-        dailyTotals: expect.arrayContaining([
-          expect.objectContaining({
-            cost_center_id: 'cc-1',
-            daily_active_users: 2,
-            daily_active_vscode_agent_users: 2,
-            total_ai_credits_used: 11,
-            loc_added_sum: 25,
-          }),
-        ]),
-        byFeature: [
-          expect.objectContaining({ feature: 'chat_panel', loc_added_sum: 20 }),
-        ],
-      }),
       true,
       expect.any(Object),
     );
     expect(db.insertDailyTotals).not.toHaveBeenCalled();
-    expect(db.replaceTeamAggregates).not.toHaveBeenCalled();
-    expect(db.upsertIngestionLog).not.toHaveBeenCalled();
+    expect(db.replaceTeamMemberships).not.toHaveBeenCalled();
+    expect(db.upsertIngestionLog).toHaveBeenCalledWith(
+      expect.objectContaining({
+        components_loaded: '["totals","users","teams","userBreakdowns"]',
+      }),
+      transaction,
+    );
   });
 
-  it('re-aggregates incomplete unassigned days after the snapshot becomes complete', async () => {
+  it('replaces incomplete memberships after the snapshot becomes complete', async () => {
     const db = createDbMock();
     const api = createApiMock();
     const config = createConfigMock({
@@ -3424,8 +3514,8 @@ describe('TaskManagementV2', () => {
     const day = '2026-05-12';
 
     db.getMissingDays.mockResolvedValue([]);
-    db.getDaysMissingCostCenterAggregation.mockResolvedValue([]);
-    db.getDaysWithIncompleteCostCenterAggregation.mockResolvedValue([day]);
+    db.getDaysMissingCostCenterMemberships.mockResolvedValue([]);
+    db.getDaysWithIncompleteCostCenterMemberships.mockResolvedValue([day]);
     db.getUserMetricsForDay.mockResolvedValue([
       makeStoredUserMetric(day, { loc_added_sum: 15 }),
     ]);
@@ -3447,22 +3537,17 @@ describe('TaskManagementV2', () => {
 
     await task.runBackfill(day, day, 'enterprise', 'ent-1');
 
-    expect(db.getDaysWithIncompleteCostCenterAggregation).toHaveBeenCalledWith(
+    expect(db.getDaysWithIncompleteCostCenterMemberships).toHaveBeenCalledWith(
       'enterprise',
       'ent-1',
       day,
       day,
     );
-    expect(db.replaceCostCenterAggregates).toHaveBeenCalledWith(
+    expect(db.replaceCostCenterMemberships).toHaveBeenCalledWith(
       day,
       'enterprise',
       'ent-1',
       [expect.objectContaining({ user_id: 1, cost_center_id: 'cc-1' })],
-      expect.objectContaining({
-        dailyTotals: expect.arrayContaining([
-          expect.objectContaining({ loc_added_sum: 15 }),
-        ]),
-      }),
       true,
       expect.any(Object),
     );
@@ -3481,8 +3566,8 @@ describe('TaskManagementV2', () => {
     const day = '2026-05-12';
 
     db.getMissingDays.mockResolvedValue([]);
-    db.getDaysMissingCostCenterAggregation.mockResolvedValue([]);
-    db.getDaysWithIncompleteCostCenterAggregation.mockResolvedValue([day]);
+    db.getDaysMissingCostCenterMemberships.mockResolvedValue([]);
+    db.getDaysWithIncompleteCostCenterMemberships.mockResolvedValue([day]);
     api.fetchCostCenterMemberships.mockResolvedValue(
       makeCostCenterSnapshot(new Map(), [], true, false),
     );
@@ -3497,8 +3582,8 @@ describe('TaskManagementV2', () => {
     await task.runBackfill(day, day, 'enterprise', 'ent-1');
 
     expect(api.fetchCostCenterMemberships).toHaveBeenCalledTimes(1);
-    expect(db.replaceCostCenterAggregates).not.toHaveBeenCalled();
-    expect(db.markCostCenterAggregationDone).not.toHaveBeenCalled();
+    expect(db.replaceCostCenterMemberships).not.toHaveBeenCalled();
+    expect(db.markCostCenterMembershipsDone).not.toHaveBeenCalled();
   });
 
   it('ingests named centers but omits no-cost-center data when an org installation is missing', async () => {
@@ -3514,7 +3599,7 @@ describe('TaskManagementV2', () => {
     const day = '2026-05-12';
 
     db.getMissingDays.mockResolvedValue([]);
-    db.getDaysMissingCostCenterAggregation.mockResolvedValue([day]);
+    db.getDaysMissingCostCenterMemberships.mockResolvedValue([day]);
     db.getUserMetricsForDay.mockResolvedValue([
       makeStoredUserMetric(day, { user_id: 1, loc_added_sum: 15 }),
       makeStoredUserMetric(day, {
@@ -3547,23 +3632,11 @@ describe('TaskManagementV2', () => {
 
     await task.runBackfill(day, day, 'enterprise', 'ent-1');
 
-    const [, , , userCostCenters, aggregates, unassignedComplete] =
-      db.replaceCostCenterAggregates.mock.calls[0];
+    const [, , , userCostCenters, unassignedComplete] =
+      db.replaceCostCenterMemberships.mock.calls[0];
     expect(userCostCenters).toEqual([
       expect.objectContaining({ user_id: 1, cost_center_id: 'cc-1' }),
     ]);
-    expect(aggregates.dailyTotals).toEqual([
-      expect.objectContaining({
-        cost_center_id: 'cc-1',
-        daily_active_users: 1,
-        loc_added_sum: 15,
-      }),
-    ]);
-    expect(aggregates.dailyTotals).not.toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ without_cost_center: true }),
-      ]),
-    );
     expect(unassignedComplete).toBe(false);
   });
 
@@ -3581,7 +3654,7 @@ describe('TaskManagementV2', () => {
     const day = '2026-05-12';
 
     db.getMissingDays.mockResolvedValue([]);
-    db.getDaysMissingCostCenterAggregation.mockResolvedValue([day]);
+    db.getDaysMissingCostCenterMemberships.mockResolvedValue([day]);
     db.getUserMetricsForDay.mockResolvedValue([
       makeStoredUserMetric(day, {
         metrics_type: 'organization',
@@ -3607,7 +3680,7 @@ describe('TaskManagementV2', () => {
 
     await task.runBackfill(day, day, 'organization', 'org-1');
 
-    expect(db.getDaysMissingCostCenterAggregation).toHaveBeenCalledWith(
+    expect(db.getDaysMissingCostCenterMemberships).toHaveBeenCalledWith(
       'organization',
       'org-1',
       day,
@@ -3621,16 +3694,11 @@ describe('TaskManagementV2', () => {
     expect(db.getUserTeamsForDay).not.toHaveBeenCalled();
     expect(api.fetchCostCenterMemberships).toHaveBeenCalledTimes(1);
     expect(api.fetchOrganizationUserReportLinks).not.toHaveBeenCalled();
-    expect(db.replaceCostCenterAggregates).toHaveBeenCalledWith(
+    expect(db.replaceCostCenterMemberships).toHaveBeenCalledWith(
       day,
       'organization',
       'org-1',
       [expect.objectContaining({ user_id: 1, cost_center_id: 'cc-1' })],
-      expect.objectContaining({
-        dailyTotals: expect.arrayContaining([
-          expect.objectContaining({ loc_added_sum: 15 }),
-        ]),
-      }),
       true,
       expect.any(Object),
     );
@@ -3654,7 +3722,7 @@ describe('TaskManagementV2', () => {
     const originalState = structuredClone(persistedState);
 
     db.getMissingDays.mockResolvedValue([]);
-    db.getDaysMissingCostCenterAggregation.mockResolvedValue([day]);
+    db.getDaysMissingCostCenterMemberships.mockResolvedValue([day]);
     api.fetchCostCenterMemberships.mockResolvedValue(
       makeCostCenterSnapshot(
         new Map([[1, { costCenterId: 'cc-partial', login: 'octocat-user-1' }]]),
@@ -3662,10 +3730,9 @@ describe('TaskManagementV2', () => {
         false,
       ),
     );
-    db.replaceCostCenterAggregates.mockImplementation(
-      async (_day, _metricsType, _entityId, memberships, aggregates) => {
+    db.replaceCostCenterMemberships.mockImplementation(
+      async (_day, _metricsType, _entityId, memberships) => {
         persistedState.memberships = memberships;
-        persistedState.aggregates = aggregates.dailyTotals;
       },
     );
 
@@ -3680,8 +3747,8 @@ describe('TaskManagementV2', () => {
 
     expect(persistedState).toEqual(originalState);
     expect(db.upsertCostCenters).not.toHaveBeenCalled();
-    expect(db.replaceCostCenterAggregates).not.toHaveBeenCalled();
-    expect(db.markCostCenterAggregationDone).not.toHaveBeenCalled();
+    expect(db.replaceCostCenterMemberships).not.toHaveBeenCalled();
+    expect(db.markCostCenterMembershipsDone).not.toHaveBeenCalled();
     expect(logger.warn).toHaveBeenCalledWith(
       expect.stringContaining(
         'preserving existing membership and aggregate data',
@@ -3702,7 +3769,7 @@ describe('TaskManagementV2', () => {
     const day = '2026-05-12';
 
     db.getMissingDays.mockResolvedValue([]);
-    db.getDaysMissingCostCenterAggregation.mockResolvedValue([day]);
+    db.getDaysMissingCostCenterMemberships.mockResolvedValue([day]);
     api.fetchCostCenterMemberships.mockResolvedValue(
       makeCostCenterSnapshot(new Map()),
     );
@@ -3719,15 +3786,11 @@ describe('TaskManagementV2', () => {
 
     expect(api.fetchEnterpriseUserReportLinks).not.toHaveBeenCalled();
     expect(api.downloadNdjsonDocument).not.toHaveBeenCalled();
-    expect(db.replaceCostCenterAggregates).toHaveBeenCalledWith(
+    expect(db.replaceCostCenterMemberships).toHaveBeenCalledWith(
       day,
       'enterprise',
       'ent-1',
       [],
-      expect.objectContaining({
-        dailyTotals: [],
-        byFeature: [],
-      }),
       true,
       expect.any(Object),
     );
@@ -3746,9 +3809,10 @@ describe('TaskManagementV2', () => {
     const day = '2026-05-12';
 
     db.getMissingDays.mockResolvedValue([]);
-    db.getDaysMissingCostCenterAggregation
+    db.getDaysMissingCostCenterMemberships
       .mockResolvedValueOnce([day])
-      .mockResolvedValueOnce([]);
+      .mockResolvedValueOnce([day])
+      .mockResolvedValue([]);
     db.getUserMetricsForDay.mockResolvedValue([
       makeStoredUserMetric(day, { loc_added_sum: 15 }),
     ]);
@@ -3773,12 +3837,12 @@ describe('TaskManagementV2', () => {
 
     expect(api.fetchCostCenterMemberships).toHaveBeenCalledTimes(1);
     expect(db.getUserMetricsForDay).toHaveBeenCalledTimes(2);
-    expect(db.replaceCostCenterAggregates).toHaveBeenCalledTimes(1);
-    expect(db.markCostCenterAggregationDone).not.toHaveBeenCalled();
+    expect(db.replaceCostCenterMemberships).toHaveBeenCalledTimes(1);
+    expect(db.markCostCenterMembershipsDone).not.toHaveBeenCalled();
   });
 
   it.each(['scheduled', 'backfill'] as const)(
-    'retries refreshed cost-center data after snapshot and replacement failures (%s)',
+    'retries missing memberships after snapshot and replacement failures (%s)',
     async source => {
       const db = createDbMock();
       const api = createApiMock();
@@ -3790,20 +3854,17 @@ describe('TaskManagementV2', () => {
         'copilot.ingestTeams': false,
         'copilot.ingestCostCenters': true,
       });
-      let pending = false;
+      let pending = true;
       db.getMissingDays.mockResolvedValue([day]);
-      db.getDaysMissingCostCenterAggregation.mockImplementation(async () =>
+      db.getDaysMissingCostCenterMemberships.mockImplementation(async () =>
         pending ? [day] : [],
       );
-      db.markCostCenterAggregationPending.mockImplementation(async () => {
-        pending = true;
-      });
       const snapshot = makeCostCenterSnapshot(
         new Map([[1, { costCenterId: 'cc-1', login: 'octocat-user-1' }]]),
       );
       if (source === 'backfill') {
         snapshot.unassignedComplete = false;
-        db.getDaysWithIncompleteCostCenterAggregation.mockResolvedValue([day]);
+        db.getDaysWithIncompleteCostCenterMemberships.mockResolvedValue([day]);
       }
       if (source === 'scheduled') {
         api.fetchCostCenterMemberships.mockRejectedValueOnce(
@@ -3825,7 +3886,7 @@ describe('TaskManagementV2', () => {
       api.downloadNdjsonDocument.mockResolvedValue(
         makeUserMetricsDocument(day),
       );
-      db.replaceCostCenterAggregates
+      db.replaceCostCenterMemberships
         .mockRejectedValueOnce(new Error('replacement failed'))
         .mockImplementation(async () => {
           pending = false;
@@ -3842,14 +3903,8 @@ describe('TaskManagementV2', () => {
           : task.runBackfill(day, day, 'enterprise', 'ent-1');
 
       await run();
-      expect(db.markCostCenterAggregationPending).toHaveBeenCalledWith(
-        day,
-        'enterprise',
-        'ent-1',
-        expect.any(Object),
-      );
       expect(pending).toBe(true);
-      expect(db.replaceCostCenterAggregates).not.toHaveBeenCalled();
+      expect(db.replaceCostCenterMemberships).not.toHaveBeenCalled();
 
       db.getMissingDays.mockResolvedValue([]);
       db.getUserMetricsForDay.mockResolvedValue([makeStoredUserMetric(day)]);
@@ -3857,21 +3912,20 @@ describe('TaskManagementV2', () => {
         makeStoredUserBreakdown(1, 'octocat-user-1'),
       ]);
       await run();
-      expect(db.replaceCostCenterAggregates).toHaveBeenCalledTimes(1);
+      expect(db.replaceCostCenterMemberships).toHaveBeenCalledTimes(1);
       expect(pending).toBe(true);
       await run();
-      expect(db.replaceCostCenterAggregates).toHaveBeenCalledTimes(2);
+      expect(db.replaceCostCenterMemberships).toHaveBeenCalledTimes(2);
       expect(pending).toBe(false);
 
-      // A retry of core ingestion must reuse cached users without requeueing cost centers.
+      // Retrying raw ingestion must not requeue a completed membership snapshot.
       db.getMissingDays.mockResolvedValue([day]);
       db.getIngestionLog.mockResolvedValue([
         { components_loaded: '["totals","users"]' },
       ]);
       await run();
-      expect(db.markCostCenterAggregationPending).toHaveBeenCalledTimes(1);
       expect(api.fetchEnterpriseUserReportLinks).toHaveBeenCalledTimes(1);
-      expect(db.replaceCostCenterAggregates).toHaveBeenCalledTimes(2);
+      expect(db.replaceCostCenterMemberships).toHaveBeenCalledTimes(2);
       expect(pending).toBe(false);
     },
   );
@@ -3890,7 +3944,7 @@ describe('TaskManagementV2', () => {
     const day = '2026-05-10';
 
     db.getMissingDays.mockResolvedValue([day]);
-    db.getDaysMissingCostCenterAggregation.mockResolvedValue([]);
+    db.getDaysMissingCostCenterMemberships.mockResolvedValue([]);
     api.fetchCostCenterMemberships.mockRejectedValue(
       new Error('cost-center list failed'),
     );
@@ -3922,8 +3976,8 @@ describe('TaskManagementV2', () => {
       expect.any(Object),
     );
     expect(db.upsertCostCenters).not.toHaveBeenCalled();
-    expect(db.replaceCostCenterAggregates).not.toHaveBeenCalled();
-    expect(db.markCostCenterAggregationDone).not.toHaveBeenCalled();
+    expect(db.replaceCostCenterMemberships).not.toHaveBeenCalled();
+    expect(db.markCostCenterMembershipsDone).not.toHaveBeenCalled();
     expect(logger.error).toHaveBeenCalledWith(
       expect.stringContaining(
         'Failed to load cost-center membership for enterprise:ent-1',
@@ -3951,7 +4005,7 @@ describe('TaskManagementV2', () => {
     const originalState = structuredClone(persistedState);
 
     db.getMissingDays.mockResolvedValue([day]);
-    db.getDaysMissingCostCenterAggregation.mockResolvedValue([]);
+    db.getDaysMissingCostCenterMemberships.mockResolvedValue([]);
     api.fetchCostCenterMemberships.mockResolvedValue(
       makeCostCenterSnapshot(
         new Map([[1, { costCenterId: 'cc-partial', login: 'octocat-user-1' }]]),
@@ -3969,10 +4023,9 @@ describe('TaskManagementV2', () => {
     api.downloadNdjsonDocument.mockResolvedValueOnce(
       makeUserMetricsDocument(day),
     );
-    db.replaceCostCenterAggregates.mockImplementation(
-      async (_day, _metricsType, _entityId, memberships, aggregates) => {
+    db.replaceCostCenterMemberships.mockImplementation(
+      async (_day, _metricsType, _entityId, memberships) => {
         persistedState.memberships = memberships;
-        persistedState.aggregates = aggregates.dailyTotals;
       },
     );
 
@@ -3992,8 +4045,8 @@ describe('TaskManagementV2', () => {
     );
     expect(persistedState).toEqual(originalState);
     expect(db.upsertCostCenters).not.toHaveBeenCalled();
-    expect(db.replaceCostCenterAggregates).not.toHaveBeenCalled();
-    expect(db.markCostCenterAggregationDone).not.toHaveBeenCalled();
+    expect(db.replaceCostCenterMemberships).not.toHaveBeenCalled();
+    expect(db.markCostCenterMembershipsDone).not.toHaveBeenCalled();
     expect(logger.warn).toHaveBeenCalledWith(
       expect.stringContaining(
         'preserving existing membership and aggregate data',
@@ -4207,21 +4260,20 @@ describe('TaskManagementV2', () => {
     );
     expect(db.insertUserMetricsByFeature).toHaveBeenCalledTimes(cached ? 0 : 1);
     expect(api.fetchEnterpriseUserTeamsLinks).toHaveBeenCalledWith(day);
-    expect(db.replaceTeamAggregates).toHaveBeenCalledWith(
+    expect(db.replaceTeamMemberships).toHaveBeenCalledWith(
       day,
       'enterprise',
       'ent-1',
       [expect.objectContaining({ day, team_slug: 'platform' })],
-      expect.objectContaining({
-        dailyTotals: [expect.objectContaining({ day, team_slug: 'platform' })],
-      }),
       expect.any(Object),
     );
     expect(db.upsertIngestionLog).toHaveBeenCalledWith(
       expect.objectContaining({
         day,
         status: 'success',
-        components_loaded: '["totals","users","teams"]',
+        components_loaded: cached
+          ? '["totals","users","teams"]'
+          : '["totals","users","userBreakdowns","teams"]',
       }),
       expect.any(Object),
     );
@@ -4291,7 +4343,7 @@ describe('TaskManagementV2', () => {
           expect.objectContaining({
             day,
             status: 'partial',
-            components_loaded: '["totals","users"]',
+            components_loaded: '["totals","users","userBreakdowns"]',
             error_message: 'Missing components: teams',
           }),
           expect.any(Object),
@@ -4312,28 +4364,18 @@ describe('TaskManagementV2', () => {
         [expect.objectContaining({ day, user_id: 1 })],
         expect.any(Object),
       );
-      expect(db.replaceTeamAggregates).toHaveBeenLastCalledWith(
+      expect(db.replaceTeamMemberships).toHaveBeenLastCalledWith(
         day,
         'enterprise',
         'ent-1',
         [expect.objectContaining({ day, team_slug: 'platform' })],
-        expect.objectContaining({
-          dailyTotals: [
-            expect.objectContaining({
-              day,
-              team_slug: 'platform',
-              daily_active_users: 1,
-              code_generation_activity_count: 4,
-            }),
-          ],
-        }),
         expect.any(Object),
       );
       expect(db.upsertIngestionLog).toHaveBeenLastCalledWith(
         expect.objectContaining({
           day,
           status: 'success',
-          components_loaded: '["totals","users","teams"]',
+          components_loaded: '["totals","users","userBreakdowns","teams"]',
         }),
         expect.any(Object),
       );
@@ -4341,7 +4383,7 @@ describe('TaskManagementV2', () => {
     },
   );
 
-  it('persists per-user breakdown rows in addition to team aggregates when ingesting teams', async () => {
+  it('persists per-user breakdown rows alongside team memberships', async () => {
     const db = createDbMock();
     const api = createApiMock();
     const config = createConfigMock({
@@ -4405,18 +4447,13 @@ describe('TaskManagementV2', () => {
       ],
       expect.any(Object),
     );
-    expect(db.replaceTeamAggregates).toHaveBeenCalledWith(
+    expect(db.replaceTeamMemberships).toHaveBeenCalledWith(
       '2026-05-10',
       'enterprise',
       'ent-1',
       expect.arrayContaining([
         expect.objectContaining({ team_slug: 'platform' }),
       ]),
-      expect.objectContaining({
-        dailyTotals: expect.arrayContaining([
-          expect.objectContaining({ team_slug: 'platform' }),
-        ]),
-      }),
       expect.any(Object),
     );
     expect(db.upsertIngestionLog).toHaveBeenCalledWith(
@@ -4600,8 +4637,11 @@ function createDbMock() {
   const getIngestionLog = jest.fn().mockResolvedValue([]);
   const db = {
     getMissingDays: jest.fn(),
-    getDaysMissingCostCenterAggregation: jest.fn().mockResolvedValue([]),
-    getDaysWithIncompleteCostCenterAggregation: jest.fn().mockResolvedValue([]),
+    getDaysMissingCostCenterMemberships: jest.fn(
+      async (_scope, _entity, from, _to, transaction?) =>
+        transaction ? [from] : [],
+    ),
+    getDaysWithIncompleteCostCenterMemberships: jest.fn().mockResolvedValue([]),
     getIngestionLog,
     insertDailyTotals: jest.fn().mockResolvedValue(undefined),
     insertPrMetrics: jest.fn().mockResolvedValue(undefined),
@@ -4624,7 +4664,7 @@ function createDbMock() {
     getUserMetricsForDay: jest.fn().mockResolvedValue([]),
     getUserBreakdownsForDay: jest.fn().mockResolvedValue([]),
     getUserTeamsForDay: jest.fn().mockResolvedValue([]),
-    replaceTeamAggregates: jest.fn().mockResolvedValue(undefined),
+    replaceTeamMemberships: jest.fn().mockResolvedValue(undefined),
     syncEnterpriseOrganizations: jest.fn().mockResolvedValue(undefined),
     markEnterpriseOrganizationDirectoryFailed: jest
       .fn()
@@ -4651,9 +4691,8 @@ function createDbMock() {
     updateEnterpriseOrganizationState: jest.fn().mockResolvedValue(undefined),
     upsertCostCenters: jest.fn().mockResolvedValue(undefined),
     upsertUserCostCenters: jest.fn().mockResolvedValue(undefined),
-    markCostCenterAggregationDone: jest.fn().mockResolvedValue(undefined),
-    markCostCenterAggregationPending: jest.fn().mockResolvedValue(undefined),
-    replaceCostCenterAggregates: jest.fn().mockResolvedValue(undefined),
+    markCostCenterMembershipsDone: jest.fn().mockResolvedValue(undefined),
+    replaceCostCenterMemberships: jest.fn().mockResolvedValue(undefined),
     upsertIngestionLog: jest.fn().mockResolvedValue(undefined),
   };
   return db;
