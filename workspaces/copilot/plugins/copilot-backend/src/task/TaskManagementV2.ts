@@ -16,7 +16,6 @@
 import { Config } from '@backstage/config';
 import { LoggerService } from '@backstage/backend-plugin-api';
 import { DateTime } from 'luxon';
-import type { Knex } from 'knex';
 import {
   MetricsScope,
   V2UserTeamRow,
@@ -183,13 +182,11 @@ export class TaskManagementV2 {
 
   private withOrganizationIngestionLease<T>(
     lease: OrganizationIngestionLease | undefined,
-    operation: (transaction?: Knex.Transaction) => Promise<T>,
+    operation: (database: DatabaseHandlerV2) => Promise<T>,
   ): Promise<T> {
     return lease
-      ? this.options.db.withOrganizationIngestionLease(lease, transaction =>
-          operation(transaction),
-        )
-      : operation();
+      ? this.options.db.withOrganizationIngestionLease(lease, operation)
+      : operation(this.options.db);
   }
 
   private async renewOrganizationIngestionLease(
@@ -892,7 +889,7 @@ export class TaskManagementV2 {
     organizationLease?: OrganizationIngestionLease,
     organizationReportTarget?: string,
   ): Promise<boolean> {
-    const { api, db, logger } = this.options;
+    const { api, logger } = this.options;
     let reportEnvelope: Awaited<
       ReturnType<GithubClientV2['fetchEnterpriseReportLinks']>
     >;
@@ -924,31 +921,19 @@ export class TaskManagementV2 {
           ? parseOrganizationDocument(document, metricsType, entityId)
           : parseEnterpriseDocument(document, metricsType, entityId);
 
-      await this.withOrganizationIngestionLease(
-        organizationLease,
-        async transaction => {
-          await db.insertDailyTotals(parsed.dailyTotals, transaction);
-          await db.insertPrMetrics(parsed.prMetrics, transaction);
-          await db.insertByFeature(parsed.byFeature, transaction);
-          await db.insertByIde(parsed.byIde, transaction);
-          await db.insertByLanguageFeature(
-            parsed.byLanguageFeature,
-            transaction,
-          );
-          await db.insertByModelFeature(parsed.byModelFeature, transaction);
-          await db.insertByLanguageModel(parsed.byLanguageModel, transaction);
-          await db.insertByCli(parsed.byCli, transaction);
-          await db.insertByVscodeAgent(parsed.byVscodeAgent, transaction);
-          await db.insertCustomizationMetrics(
-            parsed.customizationMetrics,
-            transaction,
-          );
-          await db.insertCustomizationSummaries(
-            parsed.customizationSummaries,
-            transaction,
-          );
-        },
-      );
+      await this.withOrganizationIngestionLease(organizationLease, async db => {
+        await db.insertDailyTotals(parsed.dailyTotals);
+        await db.insertPrMetrics(parsed.prMetrics);
+        await db.insertByFeature(parsed.byFeature);
+        await db.insertByIde(parsed.byIde);
+        await db.insertByLanguageFeature(parsed.byLanguageFeature);
+        await db.insertByModelFeature(parsed.byModelFeature);
+        await db.insertByLanguageModel(parsed.byLanguageModel);
+        await db.insertByCli(parsed.byCli);
+        await db.insertByVscodeAgent(parsed.byVscodeAgent);
+        await db.insertCustomizationMetrics(parsed.customizationMetrics);
+        await db.insertCustomizationSummaries(parsed.customizationSummaries);
+      });
 
       totalRowsParsed += parsed.dailyTotals.length;
     }
@@ -974,7 +959,7 @@ export class TaskManagementV2 {
     userMetrics: V2UserMetricRow[];
     userBreakdowns: UserBreakdownData[];
   }> {
-    const { api, db, logger } = this.options;
+    const { api, logger } = this.options;
     let userReportEnvelope: Awaited<
       ReturnType<GithubClientV2['fetchEnterpriseUserReportLinks']>
     >;
@@ -1016,19 +1001,10 @@ export class TaskManagementV2 {
       const parsed = parseUserDocument(rows, metricsType, entityId);
       userMetrics.push(...parsed.userMetrics);
       userBreakdowns.push(...parsed.userBreakdowns);
-      await this.withOrganizationIngestionLease(
-        organizationLease,
-        async transaction => {
-          await db.insertCustomizationMetrics(
-            parsed.customizationMetrics,
-            transaction,
-          );
-          await db.insertCustomizationSummaries(
-            parsed.customizationSummaries,
-            transaction,
-          );
-        },
-      );
+      await this.withOrganizationIngestionLease(organizationLease, async db => {
+        await db.insertCustomizationMetrics(parsed.customizationMetrics);
+        await db.insertCustomizationSummaries(parsed.customizationSummaries);
+      });
     }
 
     const breakdownRows = buildUserBreakdownRows(
@@ -1037,29 +1013,16 @@ export class TaskManagementV2 {
       metricsType,
       entityId,
     );
-    await this.withOrganizationIngestionLease(
-      organizationLease,
-      async transaction => {
-        await db.insertUserMetrics(userMetrics, transaction);
-        await db.insertUserMetricsByFeature(
-          breakdownRows.byFeature,
-          transaction,
-        );
-        await db.insertUserMetricsByIde(breakdownRows.byIde, transaction);
-        await db.insertUserMetricsByLanguageFeature(
-          breakdownRows.byLanguageFeature,
-          transaction,
-        );
-        await db.insertUserMetricsByModelFeature(
-          breakdownRows.byModelFeature,
-          transaction,
-        );
-        await db.insertUserMetricsByLanguageModel(
-          breakdownRows.byLanguageModel,
-          transaction,
-        );
-      },
-    );
+    await this.withOrganizationIngestionLease(organizationLease, async db => {
+      await db.insertUserMetrics(userMetrics);
+      await db.insertUserMetricsByFeature(breakdownRows.byFeature);
+      await db.insertUserMetricsByIde(breakdownRows.byIde);
+      await db.insertUserMetricsByLanguageFeature(
+        breakdownRows.byLanguageFeature,
+      );
+      await db.insertUserMetricsByModelFeature(breakdownRows.byModelFeature);
+      await db.insertUserMetricsByLanguageModel(breakdownRows.byLanguageModel);
+    });
 
     return { loaded: true, userMetrics, userBreakdowns };
   }
@@ -1074,7 +1037,7 @@ export class TaskManagementV2 {
     organizationLease?: OrganizationIngestionLease,
     organizationReportTarget?: string,
   ): Promise<boolean> {
-    const { api, db, logger } = this.options;
+    const { api, logger } = this.options;
     let userTeamsEnvelope: Awaited<
       ReturnType<GithubClientV2['fetchEnterpriseUserTeamsLinks']>
     >;
@@ -1128,14 +1091,13 @@ export class TaskManagementV2 {
       entityId,
     );
 
-    await this.withOrganizationIngestionLease(organizationLease, transaction =>
+    await this.withOrganizationIngestionLease(organizationLease, db =>
       db.replaceTeamAggregates(
         day,
         metricsType,
         entityId,
         userTeams,
         teamAggregates,
-        transaction,
       ),
     );
 
@@ -1205,8 +1167,8 @@ export class TaskManagementV2 {
       snapshot.unassignedComplete,
     );
 
-    await this.withOrganizationIngestionLease(organizationLease, transaction =>
-      db.replaceCostCenterAggregates(
+    await this.withOrganizationIngestionLease(organizationLease, database =>
+      database.replaceCostCenterAggregates(
         day,
         metricsType,
         entityId,
@@ -1224,7 +1186,6 @@ export class TaskManagementV2 {
           customizationMetrics: aggregates.costCenterCustomizationMetrics,
         },
         snapshot.unassignedComplete,
-        transaction,
       ),
     );
     return true;
@@ -1238,7 +1199,7 @@ export class TaskManagementV2 {
     componentsLoaded: string[],
     requiredComponents: string[],
   ): Promise<void> {
-    const { db, logger } = this.options;
+    const { logger } = this.options;
     const missingComponents = requiredComponents.filter(
       component => !componentsLoaded.includes(component),
     );
@@ -1249,21 +1210,16 @@ export class TaskManagementV2 {
         ? `Missing components: ${missingComponents.join(', ')}`
         : undefined;
 
-    await this.withOrganizationIngestionLease(
-      context.organizationLease,
-      transaction =>
-        db.upsertIngestionLog(
-          {
-            day,
-            metrics_type: metricsType,
-            entity_id: entityId,
-            status,
-            components_loaded: JSON.stringify(componentsLoaded),
-            error_message: errorMessage,
-            source: context.source,
-          },
-          transaction,
-        ),
+    await this.withOrganizationIngestionLease(context.organizationLease, db =>
+      db.upsertIngestionLog({
+        day,
+        metrics_type: metricsType,
+        entity_id: entityId,
+        status,
+        components_loaded: JSON.stringify(componentsLoaded),
+        error_message: errorMessage,
+        source: context.source,
+      }),
     );
 
     if (status === 'success') {
@@ -1357,12 +1313,11 @@ export class TaskManagementV2 {
         if (userReportsRefreshed && context.ingestCostCenters) {
           await this.withOrganizationIngestionLease(
             context.organizationLease,
-            transaction =>
-              db.markCostCenterAggregationPending(
+            database =>
+              database.markCostCenterAggregationPending(
                 day,
                 metricsType,
                 entityId,
-                transaction,
               ),
           );
         }
@@ -1412,19 +1367,16 @@ export class TaskManagementV2 {
 
       await this.withOrganizationIngestionLease(
         context.organizationLease,
-        transaction =>
-          db.upsertIngestionLog(
-            {
-              day,
-              metrics_type: metricsType,
-              entity_id: entityId,
-              status: 'error',
-              components_loaded: JSON.stringify([...componentsLoaded]),
-              error_message: message,
-              source: context.source,
-            },
-            transaction,
-          ),
+        database =>
+          database.upsertIngestionLog({
+            day,
+            metrics_type: metricsType,
+            entity_id: entityId,
+            status: 'error',
+            components_loaded: JSON.stringify([...componentsLoaded]),
+            error_message: message,
+            source: context.source,
+          }),
       );
       if (
         context.organizationReportTarget &&

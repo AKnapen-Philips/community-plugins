@@ -208,6 +208,11 @@ describe('TaskManagementV2', () => {
 
   it('ingests configured-organization teams through the existing path when multi-org is enabled', async () => {
     const db = createDbMock();
+    const transactionDb = createDbMock();
+    db.withOrganizationIngestionLease.mockImplementation(
+      async (_lease, operation) =>
+        operation(transactionDb as unknown as DatabaseHandlerV2),
+    );
     const api = createApiMock();
     const logger = createLoggerMock();
     const lease = {
@@ -258,7 +263,17 @@ describe('TaskManagementV2', () => {
 
     expect(api.fetchOrganizationUserReportLinks).toHaveBeenCalledWith(day);
     expect(api.fetchOrganizationUserTeamsLinks).toHaveBeenCalledWith(day);
-    expect(db.upsertIngestionLog).toHaveBeenCalledWith(
+    for (const method of [
+      'insertDailyTotals',
+      'insertUserMetrics',
+      'insertUserMetricsByFeature',
+      'replaceTeamAggregates',
+      'upsertIngestionLog',
+    ] as const) {
+      expect(transactionDb[method]).toHaveBeenCalled();
+      expect(db[method]).not.toHaveBeenCalled();
+    }
+    expect(transactionDb.upsertIngestionLog).toHaveBeenCalledWith(
       expect.objectContaining({
         day,
         metrics_type: 'organization',
@@ -266,7 +281,6 @@ describe('TaskManagementV2', () => {
         status: 'success',
         components_loaded: '["totals","users","teams"]',
       }),
-      expect.any(Object),
     );
   });
 
@@ -570,7 +584,6 @@ describe('TaskManagementV2', () => {
           components_loaded: '["totals"]',
           source: 'backfill',
         }),
-        {},
       );
       expect(
         db.updateEnterpriseOrganizationState.mock.calls.some(
@@ -640,7 +653,6 @@ describe('TaskManagementV2', () => {
           entity_id: 'Org-A',
         }),
       ]),
-      {},
     );
     expect(db.replaceTeamAggregates).not.toHaveBeenCalled();
     expect(db.upsertIngestionLog).toHaveBeenCalledWith(
@@ -653,7 +665,6 @@ describe('TaskManagementV2', () => {
         error_message: 'Missing components: users, teams',
         source: 'backfill',
       }),
-      {},
     );
     expect(db.updateEnterpriseOrganizationState).toHaveBeenCalledWith(
       lease,
@@ -1068,7 +1079,6 @@ describe('TaskManagementV2', () => {
         status: 'success',
         components_loaded: '["totals"]',
       }),
-      undefined,
     );
   });
 
@@ -1371,7 +1381,6 @@ describe('TaskManagementV2', () => {
         ]),
       }),
       true,
-      undefined,
     );
     const [, , , , aggregates] = db.replaceCostCenterAggregates.mock.calls[0];
     expect(aggregates.dailyTotals).toHaveLength(2);
@@ -1592,7 +1601,6 @@ describe('TaskManagementV2', () => {
         byVscodeAgent: [],
       }),
       true,
-      undefined,
     );
     expect(db.upsertUserCostCenters).not.toHaveBeenCalled();
     expect(db.markCostCenterAggregationDone).not.toHaveBeenCalled();
@@ -1653,20 +1661,17 @@ describe('TaskManagementV2', () => {
     await task.runAsync();
 
     expect(api.fetchEnterpriseUserReportLinks).toHaveBeenCalledWith(day);
-    expect(db.insertCustomizationMetrics).toHaveBeenCalledWith(
-      [
-        expect.objectContaining({
-          day,
-          metrics_type: 'enterprise',
-          entity_id: 'ent-1',
-          scope: 'user',
-          category: 'skill',
-          item_name: 'release-checks',
-          interaction_count: 4,
-        }),
-      ],
-      undefined,
-    );
+    expect(db.insertCustomizationMetrics).toHaveBeenCalledWith([
+      expect.objectContaining({
+        day,
+        metrics_type: 'enterprise',
+        entity_id: 'ent-1',
+        scope: 'user',
+        category: 'skill',
+        item_name: 'release-checks',
+        interaction_count: 4,
+      }),
+    ]);
     expect(db.replaceCostCenterAggregates).toHaveBeenCalledWith(
       day,
       'enterprise',
@@ -1686,7 +1691,6 @@ describe('TaskManagementV2', () => {
         ],
       }),
       true,
-      undefined,
     );
   });
 
@@ -1783,7 +1787,6 @@ describe('TaskManagementV2', () => {
       expect(db.replaceTeamAggregates).toHaveBeenCalled();
       expect(db.upsertIngestionLog).toHaveBeenCalledWith(
         expect.objectContaining({ day, status: 'success' }),
-        undefined,
       );
       const expectedReplacement = [
         day,
@@ -1961,7 +1964,6 @@ describe('TaskManagementV2', () => {
         byVscodeAgent: [],
       }),
       true,
-      undefined,
     );
     expect(db.insertDailyTotals).toHaveBeenCalledTimes(1);
     expect(db.markCostCenterAggregationDone).not.toHaveBeenCalled();
@@ -2002,18 +2004,15 @@ describe('TaskManagementV2', () => {
     await task.runAsync();
 
     expect(api.fetchEnterpriseReportLinks).toHaveBeenCalledWith('2026-05-10');
-    expect(db.insertByVscodeAgent).toHaveBeenCalledWith(
-      [
-        expect.objectContaining({
-          day: '2026-05-10',
-          metrics_type: 'enterprise',
-          entity_id: 'ent-1',
-          session_count: 2,
-          total_user_messages: 8,
-        }),
-      ],
-      undefined,
-    );
+    expect(db.insertByVscodeAgent).toHaveBeenCalledWith([
+      expect.objectContaining({
+        day: '2026-05-10',
+        metrics_type: 'enterprise',
+        entity_id: 'ent-1',
+        session_count: 2,
+        total_user_messages: 8,
+      }),
+    ]);
     expect(db.upsertIngestionLog).toHaveBeenCalledWith(
       expect.objectContaining({
         day: '2026-05-10',
@@ -2021,7 +2020,6 @@ describe('TaskManagementV2', () => {
         entity_id: 'ent-1',
         status: 'success',
       }),
-      undefined,
     );
   });
 
@@ -2070,11 +2068,9 @@ describe('TaskManagementV2', () => {
     expect(api.fetchEnterpriseReportLinks).toHaveBeenCalledTimes(2);
     expect(db.upsertIngestionLog).toHaveBeenCalledWith(
       expect.objectContaining({ day: '2026-05-10', status: 'error' }),
-      undefined,
     );
     expect(db.upsertIngestionLog).toHaveBeenCalledWith(
       expect.objectContaining({ day: '2026-05-11', status: 'success' }),
-      undefined,
     );
     expect(logger.error).toHaveBeenCalled();
   });
@@ -2161,7 +2157,6 @@ describe('TaskManagementV2', () => {
         status: 'success',
         components_loaded: JSON.stringify(['totals', 'users', 'teams']),
       }),
-      undefined,
     );
   });
 
@@ -2393,7 +2388,6 @@ describe('TaskManagementV2', () => {
         status: 'partial',
         components_loaded: '["totals","users"]',
       }),
-      undefined,
     );
     expect(logger.error).toHaveBeenCalledWith(
       expect.stringContaining('GitHub returned HTTP 404'),
@@ -2464,7 +2458,6 @@ describe('TaskManagementV2', () => {
         status: 'partial',
         components_loaded: '["totals"]',
       }),
-      undefined,
     );
     expect(logger.error).toHaveBeenCalledWith(
       expect.stringContaining('GitHub returned HTTP 403'),
@@ -2599,7 +2592,6 @@ describe('TaskManagementV2', () => {
         ]),
       }),
       true,
-      undefined,
     );
     expect(db.markCostCenterAggregationDone).not.toHaveBeenCalled();
   });
@@ -2666,10 +2658,9 @@ describe('TaskManagementV2', () => {
 
       expect(api.fetchEnterpriseUserReportLinks).toHaveBeenCalledTimes(2);
       expect(api.fetchEnterpriseUserReportLinks).toHaveBeenLastCalledWith(day);
-      expect(db.insertUserMetricsByFeature).toHaveBeenLastCalledWith(
-        [expect.objectContaining({ day, feature: 'chat_panel' })],
-        undefined,
-      );
+      expect(db.insertUserMetricsByFeature).toHaveBeenLastCalledWith([
+        expect.objectContaining({ day, feature: 'chat_panel' }),
+      ]);
       expect(db.replaceCostCenterAggregates).toHaveBeenCalledTimes(1);
       expect(db.replaceCostCenterAggregates).toHaveBeenCalledWith(
         day,
@@ -2688,7 +2679,6 @@ describe('TaskManagementV2', () => {
           ],
         }),
         true,
-        undefined,
       );
       expect(api.fetchEnterpriseReportLinks).not.toHaveBeenCalled();
       expect(api.fetchEnterpriseUserTeamsLinks).not.toHaveBeenCalled();
@@ -2780,7 +2770,6 @@ describe('TaskManagementV2', () => {
         ],
       }),
       true,
-      undefined,
     );
     expect(db.insertDailyTotals).not.toHaveBeenCalled();
     expect(db.replaceTeamAggregates).not.toHaveBeenCalled();
@@ -2840,7 +2829,6 @@ describe('TaskManagementV2', () => {
         ]),
       }),
       true,
-      undefined,
     );
   });
 
@@ -3008,7 +2996,6 @@ describe('TaskManagementV2', () => {
         ]),
       }),
       true,
-      undefined,
     );
   });
 
@@ -3105,7 +3092,6 @@ describe('TaskManagementV2', () => {
         byFeature: [],
       }),
       true,
-      undefined,
     );
   });
 
@@ -3222,7 +3208,6 @@ describe('TaskManagementV2', () => {
         day,
         'enterprise',
         'ent-1',
-        undefined,
       );
       expect(pending).toBe(true);
       expect(db.replaceCostCenterAggregates).not.toHaveBeenCalled();
@@ -3295,7 +3280,6 @@ describe('TaskManagementV2', () => {
     expect(db.insertUserMetrics).toHaveBeenCalled();
     expect(db.upsertIngestionLog).toHaveBeenCalledWith(
       expect.objectContaining({ day, status: 'success' }),
-      undefined,
     );
     expect(db.upsertCostCenters).not.toHaveBeenCalled();
     expect(db.replaceCostCenterAggregates).not.toHaveBeenCalled();
@@ -3364,7 +3348,6 @@ describe('TaskManagementV2', () => {
     expect(db.insertUserMetrics).toHaveBeenCalled();
     expect(db.upsertIngestionLog).toHaveBeenCalledWith(
       expect.objectContaining({ day, status: 'success' }),
-      undefined,
     );
     expect(persistedState).toEqual(originalState);
     expect(db.upsertCostCenters).not.toHaveBeenCalled();
@@ -3466,7 +3449,6 @@ describe('TaskManagementV2', () => {
         components_loaded: JSON.stringify(['totals']),
         error_message: 'Missing components: users, teams',
       }),
-      undefined,
     );
   });
 
@@ -3563,7 +3545,6 @@ describe('TaskManagementV2', () => {
           ? '["totals","users","teams"]'
           : '["totals","users"]',
       }),
-      undefined,
     );
     await task.runAsync();
 
@@ -3591,7 +3572,6 @@ describe('TaskManagementV2', () => {
       expect.objectContaining({
         dailyTotals: [expect.objectContaining({ day, team_slug: 'platform' })],
       }),
-      undefined,
     );
     expect(db.upsertIngestionLog).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -3599,7 +3579,6 @@ describe('TaskManagementV2', () => {
         status: 'success',
         components_loaded: '["totals","users","teams"]',
       }),
-      undefined,
     );
   });
 
@@ -3670,9 +3649,8 @@ describe('TaskManagementV2', () => {
             components_loaded: '["totals","users"]',
             error_message: 'Missing components: teams',
           }),
-          undefined,
         );
-        expect(db.insertUserMetrics).toHaveBeenLastCalledWith([], undefined);
+        expect(db.insertUserMetrics).toHaveBeenLastCalledWith([]);
         expect(db.insertDailyTotals).toHaveBeenCalledTimes(1);
       }
 
@@ -3681,10 +3659,9 @@ describe('TaskManagementV2', () => {
       expect(api.fetchEnterpriseReportLinks).toHaveBeenCalledTimes(1);
       expect(api.fetchEnterpriseUserReportLinks).toHaveBeenCalledTimes(3);
       expect(db.getUserMetricsForDay).toHaveBeenCalledTimes(2);
-      expect(db.insertUserMetrics).toHaveBeenLastCalledWith(
-        [expect.objectContaining({ day, user_id: 1 })],
-        undefined,
-      );
+      expect(db.insertUserMetrics).toHaveBeenLastCalledWith([
+        expect.objectContaining({ day, user_id: 1 }),
+      ]);
       expect(db.replaceTeamAggregates).toHaveBeenLastCalledWith(
         day,
         'enterprise',
@@ -3700,7 +3677,6 @@ describe('TaskManagementV2', () => {
             }),
           ],
         }),
-        undefined,
       );
       expect(db.upsertIngestionLog).toHaveBeenLastCalledWith(
         expect.objectContaining({
@@ -3708,7 +3684,6 @@ describe('TaskManagementV2', () => {
           status: 'success',
           components_loaded: '["totals","users","teams"]',
         }),
-        undefined,
       );
       expect(logger.error).not.toHaveBeenCalled();
     },
@@ -3755,29 +3730,23 @@ describe('TaskManagementV2', () => {
     await task.runAsync();
 
     // Per-user breakdown rows are persisted, keyed by the resolved user.
-    expect(db.insertUserMetricsByFeature).toHaveBeenCalledWith(
-      [
-        expect.objectContaining({
-          day: '2026-05-10',
-          metrics_type: 'enterprise',
-          entity_id: 'ent-1',
-          user_id: 1,
-          user_login: 'octocat',
-          feature: 'chat_panel',
-        }),
-      ],
-      undefined,
-    );
-    expect(db.insertUserMetricsByIde).toHaveBeenCalledWith(
-      [
-        expect.objectContaining({
-          user_id: 1,
-          user_login: 'octocat',
-          ide: 'vscode',
-        }),
-      ],
-      undefined,
-    );
+    expect(db.insertUserMetricsByFeature).toHaveBeenCalledWith([
+      expect.objectContaining({
+        day: '2026-05-10',
+        metrics_type: 'enterprise',
+        entity_id: 'ent-1',
+        user_id: 1,
+        user_login: 'octocat',
+        feature: 'chat_panel',
+      }),
+    ]);
+    expect(db.insertUserMetricsByIde).toHaveBeenCalledWith([
+      expect.objectContaining({
+        user_id: 1,
+        user_login: 'octocat',
+        ide: 'vscode',
+      }),
+    ]);
     expect(db.replaceTeamAggregates).toHaveBeenCalledWith(
       '2026-05-10',
       'enterprise',
@@ -3790,11 +3759,9 @@ describe('TaskManagementV2', () => {
           expect.objectContaining({ team_slug: 'platform' }),
         ]),
       }),
-      undefined,
     );
     expect(db.upsertIngestionLog).toHaveBeenCalledWith(
       expect.objectContaining({ day: '2026-05-10', status: 'success' }),
-      undefined,
     );
   });
 
@@ -3879,7 +3846,6 @@ it('ingestTotals returns partial status when downloaded document yields 0 parsed
       entity_id: 'ent-1',
       status: 'partial',
     }),
-    undefined,
   );
   expect(db.upsertIngestionLog).not.toHaveBeenCalledWith(
     expect.objectContaining({ status: 'success' }),
@@ -3970,7 +3936,7 @@ function makeStoredUserBreakdown(
 }
 
 function createDbMock() {
-  return {
+  const db = {
     getMissingDays: jest.fn(),
     getDaysMissingCostCenterAggregation: jest.fn().mockResolvedValue([]),
     getDaysWithIncompleteCostCenterAggregation: jest.fn().mockResolvedValue([]),
@@ -4013,8 +3979,10 @@ function createDbMock() {
     renewEnterpriseOrganizationLease: jest.fn().mockResolvedValue(true),
     releaseEnterpriseOrganizationLease: jest.fn().mockResolvedValue(undefined),
     withOrganizationIngestionLease: jest.fn(
-      async (_lease: unknown, operation: (transaction: any) => Promise<any>) =>
-        operation({}),
+      async (
+        _lease: unknown,
+        operation: (database: DatabaseHandlerV2) => Promise<void>,
+      ): Promise<void> => operation(db as unknown as DatabaseHandlerV2),
     ),
     updateEnterpriseOrganizationState: jest.fn().mockResolvedValue(undefined),
     upsertCostCenters: jest.fn().mockResolvedValue(undefined),
@@ -4024,6 +3992,7 @@ function createDbMock() {
     replaceCostCenterAggregates: jest.fn().mockResolvedValue(undefined),
     upsertIngestionLog: jest.fn().mockResolvedValue(undefined),
   };
+  return db;
 }
 
 function createApiMock() {
