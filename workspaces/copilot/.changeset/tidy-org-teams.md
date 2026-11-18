@@ -11,3 +11,4 @@ Organization-team options use the selected date range and existing five-user
 eligibility threshold; partial metric days remain unfilled. Selecting a team
 scopes results to its owning organization, so same-slug teams remain
 distinct. Failed options or dashboard requests can be retried.
+Enterprise totals continue to fill missing days when all organizations are selected.
