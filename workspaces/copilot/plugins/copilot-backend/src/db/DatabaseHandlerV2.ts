@@ -162,18 +162,18 @@ export type OrganizationIngestionLease = {
   directoryGeneration?: EnterpriseOrganizationDirectoryGeneration;
 };
 
-export type EnterpriseOrganizationDirectory = {
-  complete: boolean;
-  hasPendingOrganizations: boolean;
-  organizations: string[];
-};
-
 export class OrganizationIngestionLeaseLostError extends Error {
   constructor() {
     super('Organization-team ingestion no longer owns its work lease.');
     this.name = 'OrganizationIngestionLeaseLostError';
   }
 }
+
+export type EnterpriseOrganizationDirectory = {
+  complete: boolean;
+  hasPendingOrganizations: boolean;
+  organizations: string[];
+};
 
 export type CostCenterAggregateRows = {
   dailyTotals: V2DailyTotal[];
@@ -308,6 +308,10 @@ export class DatabaseHandlerV2 {
       row !== undefined &&
       formatDirectoryGeneration(row.sync_generation) === generation
     );
+  }
+
+  private connection(transaction?: Knex.Transaction): Knex | Knex.Transaction {
+    return transaction ?? this.db;
   }
 
   async syncEnterpriseOrganizations(
@@ -687,13 +691,6 @@ export class DatabaseHandlerV2 {
         query = query.whereNot('organization_key', excludedKey);
       }
       return query
-        .andWhere(function leaseIsAvailable() {
-          this.whereNull('lease_expires_at').orWhere(
-            'lease_expires_at',
-            '<=',
-            now,
-          );
-        })
         .where(function dueForAttempt() {
           this.whereNull('next_attempt_at').orWhere(
             'next_attempt_at',
@@ -865,6 +862,44 @@ export class DatabaseHandlerV2 {
     });
   }
 
+  async withIngestionDay<T>(
+    day: string,
+    metricsType: MetricsScope,
+    entityId: string,
+    operation: (
+      transaction: Knex.Transaction,
+      existingLog: V2IngestionLogRow,
+    ) => Promise<T>,
+  ): Promise<T> {
+    return this.db.transaction(async transaction => {
+      const scope = {
+        day,
+        metrics_type: metricsType,
+        entity_id: entityId,
+      };
+      // Initialize before locking so first-time imports serialize as well.
+      await transaction<V2IngestionLogRow>('copilot_ingestion_log')
+        .insert({
+          ...scope,
+          status: 'partial',
+          components_loaded: '[]',
+          source: 'scheduled',
+        })
+        .onConflict(['day', 'metrics_type', 'entity_id'])
+        .ignore();
+      const existing = await transaction<V2IngestionLogRow>(
+        'copilot_ingestion_log',
+      )
+        .where(scope)
+        .forUpdate()
+        .first();
+      if (!existing) {
+        throw new Error('Ingestion log row could not be initialized.');
+      }
+      return operation(transaction, existing);
+    });
+  }
+
   async updateEnterpriseOrganizationState(
     lease: OrganizationIngestionLease,
     state: {
@@ -914,7 +949,6 @@ export class DatabaseHandlerV2 {
       await query.update(update);
     });
   }
-
   private addCostCenterFilter(
     query: Knex.QueryBuilder,
     costCenter?: CostCenterFilter,
@@ -1019,10 +1053,11 @@ export class DatabaseHandlerV2 {
     entityId: string,
     userTeams: V2UserTeamRow[],
     aggregates: TeamAggregates,
+    outerTransaction?: Knex.Transaction,
   ): Promise<void> {
     this.validateTeamReplacementRows(day, userTeams);
 
-    await this.db.transaction(async transaction => {
+    const replace = async (transaction: Knex.Transaction) => {
       await transaction('copilot_user_teams')
         .where({ day, metrics_type: metricsType, entity_id: entityId })
         .del();
@@ -1046,7 +1081,13 @@ export class DatabaseHandlerV2 {
         entityId,
       );
       await this.insertTeamAggregateRows(transaction, aggregates);
-    });
+    };
+
+    if (outerTransaction) {
+      await replace(outerTransaction);
+    } else {
+      await this.db.transaction(replace);
+    }
   }
 
   async getBackfillStatus(
@@ -1068,7 +1109,10 @@ export class DatabaseHandlerV2 {
     }));
   }
 
-  async insertDailyTotals(rows: V2DailyTotal[]): Promise<void> {
+  async insertDailyTotals(
+    rows: V2DailyTotal[],
+    transaction?: Knex.Transaction,
+  ): Promise<void> {
     if (!rows.length) {
       return;
     }
@@ -1077,7 +1121,7 @@ export class DatabaseHandlerV2 {
       this.withDefaultCostCenter(rows),
       100,
       async chunk => {
-        await this.db<V2DailyTotal>('copilot_daily_totals')
+        await this.connection(transaction)<V2DailyTotal>('copilot_daily_totals')
           .insert(chunk)
           // Merge `total_ai_credits_used`/`daily_active_vscode_agent_users` on
           // conflict (rather than ignoring) so that re-ingesting a day that
@@ -1096,7 +1140,10 @@ export class DatabaseHandlerV2 {
     );
   }
 
-  async insertPrMetrics(rows: V2PrMetricsRow[]): Promise<void> {
+  async insertPrMetrics(
+    rows: V2PrMetricsRow[],
+    transaction?: Knex.Transaction,
+  ): Promise<void> {
     if (!rows.length) {
       return;
     }
@@ -1105,7 +1152,7 @@ export class DatabaseHandlerV2 {
       this.withDefaultCostCenter(rows),
       100,
       async chunk => {
-        await this.db<V2PrMetricsRow>('copilot_pr_metrics')
+        await this.connection(transaction)<V2PrMetricsRow>('copilot_pr_metrics')
           .insert(chunk)
           .onConflict([
             'day',
@@ -1120,7 +1167,10 @@ export class DatabaseHandlerV2 {
     );
   }
 
-  async insertByFeature(rows: V2MetricsByFeatureRow[]): Promise<void> {
+  async insertByFeature(
+    rows: V2MetricsByFeatureRow[],
+    transaction?: Knex.Transaction,
+  ): Promise<void> {
     if (!rows.length) {
       return;
     }
@@ -1129,7 +1179,9 @@ export class DatabaseHandlerV2 {
       this.withDefaultCostCenter(rows),
       100,
       async chunk => {
-        await this.db<V2MetricsByFeatureRow>('copilot_metrics_by_feature')
+        await this.connection(transaction)<V2MetricsByFeatureRow>(
+          'copilot_metrics_by_feature',
+        )
           .insert(chunk)
           .onConflict([
             'day',
@@ -1145,7 +1197,10 @@ export class DatabaseHandlerV2 {
     );
   }
 
-  async insertByIde(rows: V2MetricsByIdeRow[]): Promise<void> {
+  async insertByIde(
+    rows: V2MetricsByIdeRow[],
+    transaction?: Knex.Transaction,
+  ): Promise<void> {
     if (!rows.length) {
       return;
     }
@@ -1154,7 +1209,9 @@ export class DatabaseHandlerV2 {
       this.withDefaultCostCenter(rows),
       100,
       async chunk => {
-        await this.db<V2MetricsByIdeRow>('copilot_metrics_by_ide')
+        await this.connection(transaction)<V2MetricsByIdeRow>(
+          'copilot_metrics_by_ide',
+        )
           .insert(chunk)
           .onConflict([
             'day',
@@ -1172,6 +1229,7 @@ export class DatabaseHandlerV2 {
 
   async insertByLanguageFeature(
     rows: V2MetricsByLanguageFeatureRow[],
+    transaction?: Knex.Transaction,
   ): Promise<void> {
     if (!rows.length) {
       return;
@@ -1181,7 +1239,7 @@ export class DatabaseHandlerV2 {
       this.withDefaultCostCenter(rows),
       100,
       async chunk => {
-        await this.db<V2MetricsByLanguageFeatureRow>(
+        await this.connection(transaction)<V2MetricsByLanguageFeatureRow>(
           'copilot_metrics_by_language_feature',
         )
           .insert(chunk)
@@ -1202,13 +1260,14 @@ export class DatabaseHandlerV2 {
 
   async insertByModelFeature(
     rows: V2MetricsByModelFeatureRow[],
+    transaction?: Knex.Transaction,
   ): Promise<void> {
     if (!rows.length) return;
     await batchInsertInChunks(
       this.withDefaultCostCenter(rows),
       100,
       async chunk => {
-        await this.db<V2MetricsByModelFeatureRow>(
+        await this.connection(transaction)<V2MetricsByModelFeatureRow>(
           'copilot_metrics_by_model_feature',
         )
           .insert(chunk)
@@ -1229,13 +1288,14 @@ export class DatabaseHandlerV2 {
 
   async insertByLanguageModel(
     rows: V2MetricsByLanguageModelRow[],
+    transaction?: Knex.Transaction,
   ): Promise<void> {
     if (!rows.length) return;
     await batchInsertInChunks(
       this.withDefaultCostCenter(rows),
       100,
       async chunk => {
-        await this.db<V2MetricsByLanguageModelRow>(
+        await this.connection(transaction)<V2MetricsByLanguageModelRow>(
           'copilot_metrics_by_language_model',
         )
           .insert(chunk)
@@ -1254,13 +1314,18 @@ export class DatabaseHandlerV2 {
     );
   }
 
-  async insertByCli(rows: V2MetricsByCliRow[]): Promise<void> {
+  async insertByCli(
+    rows: V2MetricsByCliRow[],
+    transaction?: Knex.Transaction,
+  ): Promise<void> {
     if (!rows.length) return;
     await batchInsertInChunks(
       this.withDefaultCostCenter(rows),
       100,
       async chunk => {
-        await this.db<V2MetricsByCliRow>('copilot_metrics_by_cli')
+        await this.connection(transaction)<V2MetricsByCliRow>(
+          'copilot_metrics_by_cli',
+        )
           .insert(chunk)
           .onConflict([
             'day',
@@ -1288,13 +1353,16 @@ export class DatabaseHandlerV2 {
     );
   }
 
-  async insertByVscodeAgent(rows: V2MetricsByVscodeAgentRow[]): Promise<void> {
+  async insertByVscodeAgent(
+    rows: V2MetricsByVscodeAgentRow[],
+    transaction?: Knex.Transaction,
+  ): Promise<void> {
     if (!rows.length) return;
     await batchInsertInChunks(
       this.withDefaultCostCenter(rows),
       100,
       async chunk => {
-        await this.db<V2MetricsByVscodeAgentRow>(
+        await this.connection(transaction)<V2MetricsByVscodeAgentRow>(
           'copilot_metrics_by_vscode_agent',
         )
           .insert(chunk)
@@ -1316,6 +1384,7 @@ export class DatabaseHandlerV2 {
 
   async insertCustomizationMetrics(
     rows: V2CustomizationMetricRow[],
+    transaction?: Knex.Transaction,
   ): Promise<void> {
     if (!rows.length) return;
 
@@ -1325,7 +1394,9 @@ export class DatabaseHandlerV2 {
     }));
 
     await batchInsertInChunks(normalizedRows, 100, async chunk => {
-      await this.db<V2CustomizationMetricRow>('copilot_customization_metrics')
+      await this.connection(transaction)<V2CustomizationMetricRow>(
+        'copilot_customization_metrics',
+      )
         .insert(chunk)
         .onConflict([
           'day',
@@ -1343,6 +1414,7 @@ export class DatabaseHandlerV2 {
 
   async insertCustomizationSummaries(
     rows: V2CustomizationSummaryRow[],
+    transaction?: Knex.Transaction,
   ): Promise<void> {
     if (!rows.length) return;
 
@@ -1352,7 +1424,7 @@ export class DatabaseHandlerV2 {
     }));
 
     await batchInsertInChunks(normalizedRows, 100, async chunk => {
-      await this.db<V2CustomizationSummaryRow>(
+      await this.connection(transaction)<V2CustomizationSummaryRow>(
         'copilot_customization_summaries',
       )
         .insert(chunk)
@@ -1369,13 +1441,18 @@ export class DatabaseHandlerV2 {
     });
   }
 
-  async insertUserMetrics(rows: V2UserMetricRow[]): Promise<void> {
+  async insertUserMetrics(
+    rows: V2UserMetricRow[],
+    transaction?: Knex.Transaction,
+  ): Promise<void> {
     if (!rows.length) {
       return;
     }
 
     await batchInsertInChunks(rows, 100, async chunk => {
-      await this.db<V2UserMetricRow>('copilot_user_metrics')
+      await this.connection(transaction)<V2UserMetricRow>(
+        'copilot_user_metrics',
+      )
         .insert(chunk)
         // Merge `ai_credits_used`/`used_vscode_agent` on conflict (rather
         // than ignoring) so that re-ingesting a day that was already stored
@@ -1440,6 +1517,7 @@ export class DatabaseHandlerV2 {
     userCostCenters: V2UserCostCenterRow[],
     aggregates: CostCenterAggregateRows,
     unassignedComplete: boolean = true,
+    outerTransaction?: Knex.Transaction,
   ): Promise<void> {
     const rowsByTable = {
       copilot_daily_totals: this.withDefaultCostCenter(aggregates.dailyTotals),
@@ -1479,7 +1557,7 @@ export class DatabaseHandlerV2 {
       );
     }
 
-    await this.db.transaction(async transaction => {
+    const replace = async (transaction: Knex.Transaction) => {
       await transaction('copilot_user_cost_centers')
         .where({ day, metrics_type: metricsType, entity_id: entityId })
         .del();
@@ -1519,15 +1597,22 @@ export class DatabaseHandlerV2 {
         })
         .onConflict(['day', 'metrics_type', 'entity_id'])
         .merge(['unassigned_complete', 'needs_reaggregation', 'aggregated_at']);
-    });
+    };
+
+    if (outerTransaction) {
+      await replace(outerTransaction);
+    } else {
+      await this.db.transaction(replace);
+    }
   }
 
   async insertUserMetricsByFeature(
     rows: V2UserMetricsByFeatureRow[],
+    transaction?: Knex.Transaction,
   ): Promise<void> {
     if (!rows.length) return;
     await batchInsertInChunks(rows, 100, async chunk => {
-      await this.db<V2UserMetricsByFeatureRow>(
+      await this.connection(transaction)<V2UserMetricsByFeatureRow>(
         'copilot_user_metrics_by_feature',
       )
         .insert(chunk)
@@ -1536,10 +1621,15 @@ export class DatabaseHandlerV2 {
     });
   }
 
-  async insertUserMetricsByIde(rows: V2UserMetricsByIdeRow[]): Promise<void> {
+  async insertUserMetricsByIde(
+    rows: V2UserMetricsByIdeRow[],
+    transaction?: Knex.Transaction,
+  ): Promise<void> {
     if (!rows.length) return;
     await batchInsertInChunks(rows, 100, async chunk => {
-      await this.db<V2UserMetricsByIdeRow>('copilot_user_metrics_by_ide')
+      await this.connection(transaction)<V2UserMetricsByIdeRow>(
+        'copilot_user_metrics_by_ide',
+      )
         .insert(chunk)
         .onConflict(['day', 'metrics_type', 'entity_id', 'user_id', 'ide'])
         .ignore();
@@ -1548,10 +1638,11 @@ export class DatabaseHandlerV2 {
 
   async insertUserMetricsByLanguageFeature(
     rows: V2UserMetricsByLanguageFeatureRow[],
+    transaction?: Knex.Transaction,
   ): Promise<void> {
     if (!rows.length) return;
     await batchInsertInChunks(rows, 100, async chunk => {
-      await this.db<V2UserMetricsByLanguageFeatureRow>(
+      await this.connection(transaction)<V2UserMetricsByLanguageFeatureRow>(
         'copilot_user_metrics_by_language_feature',
       )
         .insert(chunk)
@@ -1569,10 +1660,11 @@ export class DatabaseHandlerV2 {
 
   async insertUserMetricsByModelFeature(
     rows: V2UserMetricsByModelFeatureRow[],
+    transaction?: Knex.Transaction,
   ): Promise<void> {
     if (!rows.length) return;
     await batchInsertInChunks(rows, 100, async chunk => {
-      await this.db<V2UserMetricsByModelFeatureRow>(
+      await this.connection(transaction)<V2UserMetricsByModelFeatureRow>(
         'copilot_user_metrics_by_model_feature',
       )
         .insert(chunk)
@@ -1590,10 +1682,11 @@ export class DatabaseHandlerV2 {
 
   async insertUserMetricsByLanguageModel(
     rows: V2UserMetricsByLanguageModelRow[],
+    transaction?: Knex.Transaction,
   ): Promise<void> {
     if (!rows.length) return;
     await batchInsertInChunks(rows, 100, async chunk => {
-      await this.db<V2UserMetricsByLanguageModelRow>(
+      await this.connection(transaction)<V2UserMetricsByLanguageModelRow>(
         'copilot_user_metrics_by_language_model',
       )
         .insert(chunk)
@@ -1609,8 +1702,11 @@ export class DatabaseHandlerV2 {
     });
   }
 
-  async upsertIngestionLog(row: V2IngestionLogRow): Promise<void> {
-    await this.db.transaction(async transaction => {
+  async upsertIngestionLog(
+    row: V2IngestionLogRow,
+    outerTransaction?: Knex.Transaction,
+  ): Promise<void> {
+    const upsert = async (transaction: Knex.Transaction) => {
       const scope = {
         day: row.day,
         metrics_type: row.metrics_type,
@@ -1652,7 +1748,13 @@ export class DatabaseHandlerV2 {
           error_message: errorMessage,
           source: row.source,
         });
-    });
+    };
+
+    if (outerTransaction) {
+      await upsert(outerTransaction);
+    } else {
+      await this.db.transaction(upsert);
+    }
   }
 
   async getMissingDays(
@@ -1828,8 +1930,9 @@ export class DatabaseHandlerV2 {
     day: string,
     metricsType: MetricsScope,
     entityId: string,
+    transaction?: Knex.Transaction,
   ): Promise<void> {
-    await this.db('copilot_cost_center_aggregation_log')
+    await this.connection(transaction)('copilot_cost_center_aggregation_log')
       .where({ day, metrics_type: metricsType, entity_id: entityId })
       .update({ needs_reaggregation: true });
   }
@@ -2874,8 +2977,11 @@ export class DatabaseHandlerV2 {
     metricsType: MetricsScope,
     entityId: string,
     day: string,
+    transaction?: Knex.Transaction,
   ): Promise<V2UserMetricRow[]> {
-    const rows = await this.db<V2UserMetricRow>('copilot_user_metrics')
+    const rows = await this.connection(transaction)<V2UserMetricRow>(
+      'copilot_user_metrics',
+    )
       .where('metrics_type', metricsType)
       .where('entity_id', entityId)
       .where('day', day)
@@ -2893,9 +2999,10 @@ export class DatabaseHandlerV2 {
     metricsType: MetricsScope,
     entityId: string,
     day: string,
+    transaction?: Knex.Transaction,
   ): Promise<UserBreakdownData[]> {
     const getRows = (tableName: string) =>
-      this.db(tableName)
+      this.connection(transaction)(tableName)
         .where('metrics_type', metricsType)
         .where('entity_id', entityId)
         .where('day', day)
@@ -2915,7 +3022,9 @@ export class DatabaseHandlerV2 {
       getRows('copilot_user_metrics_by_language_feature'),
       getRows('copilot_user_metrics_by_model_feature'),
       getRows('copilot_user_metrics_by_language_model'),
-      this.db<V2CustomizationMetricRow>('copilot_customization_metrics')
+      this.connection(transaction)<V2CustomizationMetricRow>(
+        'copilot_customization_metrics',
+      )
         .where({
           metrics_type: metricsType,
           entity_id: entityId,

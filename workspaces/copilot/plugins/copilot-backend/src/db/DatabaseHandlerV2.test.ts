@@ -39,6 +39,7 @@ import type { CostCenterAggregateRows } from './DatabaseHandlerV2';
 import {
   DatabaseHandlerV2,
   OrganizationIngestionLeaseLostError,
+  parseComponentsLoaded,
 } from './DatabaseHandlerV2';
 
 const costCenterMigration = jest.requireActual<{
@@ -244,6 +245,226 @@ describe('DatabaseHandlerV2', () => {
       ).resolves.toBe('synced');
       return generation;
     }
+
+    it.each(['commit', 'rollback', 'invalid replacement'])(
+      'keeps bound inserts and nested replacements in the day transaction: %s',
+      async outcome => {
+        const day = '2026-05-01';
+        const teamTotal = buildDailyTotal({ team_slug: 'platform' });
+        const operation = handler.withIngestionDay(
+          day,
+          'organization',
+          'org-1',
+          async transaction => {
+            await handler.insertDailyTotals([buildDailyTotal()], transaction);
+            await handler.replaceTeamAggregates(
+              day,
+              'organization',
+              'org-1',
+              [buildUserTeam({ team_slug: 'platform' })],
+              {
+                dailyTotals:
+                  outcome === 'invalid replacement'
+                    ? [teamTotal, teamTotal]
+                    : [teamTotal],
+                byFeature: [],
+                byIde: [],
+                byLanguageFeature: [],
+                byModelFeature: [],
+                byLanguageModel: [],
+                customizationMetrics: [],
+                costCenterCustomizationMetrics: [],
+              },
+              transaction,
+            );
+            await handler.replaceCostCenterAggregates(
+              day,
+              'organization',
+              'org-1',
+              [
+                {
+                  day,
+                  metrics_type: 'organization',
+                  entity_id: 'org-1',
+                  user_id: 1,
+                  user_login: 'user-1',
+                  cost_center_id: 'cc-a',
+                },
+              ],
+              makeCostCenterAggregateRows(
+                day,
+                [
+                  {
+                    costCenterId: 'cc-a',
+                    teamSlug: '',
+                    activeUsers: 1,
+                    locAdded: 10,
+                  },
+                ],
+                'organization',
+                'org-1',
+              ),
+              true,
+              transaction,
+            );
+            await handler.upsertIngestionLog(buildIngestionLog(), transaction);
+            if (outcome === 'rollback') {
+              throw new Error('Abort organization writes');
+            }
+          },
+        );
+
+        const error = await operation.then(
+          () => undefined,
+          (cause: Error) => cause,
+        );
+        const expectedMessage = {
+          commit: /^$/,
+          rollback: /Abort organization writes/,
+          'invalid replacement': /unique|duplicate/i,
+        }[outcome];
+        expect(error?.message ?? '').toMatch(expectedMessage!);
+        for (const table of [
+          ...costCenterAggregateTables,
+          'copilot_user_teams',
+          'copilot_user_cost_centers',
+          'copilot_cost_center_aggregation_log',
+          'copilot_ingestion_log',
+        ]) {
+          const committedCount = table === 'copilot_daily_totals' ? 3 : 1;
+          const expectedCount = outcome === 'commit' ? committedCount : 0;
+          expect(await knex(table).select('day')).toHaveLength(expectedCount);
+        }
+      },
+    );
+
+    it('rolls back daily rows and completion together and allows a retry', async () => {
+      const day = '2026-05-01';
+      await expect(
+        handler.withIngestionDay(
+          day,
+          'organization',
+          'org-1',
+          async transaction => {
+            await handler.insertDailyTotals([buildDailyTotal()], transaction);
+            throw new Error('injected first-import failure');
+          },
+        ),
+      ).rejects.toThrow('injected first-import failure');
+      await expect(
+        handler.getIngestionLog('organization', 'org-1', day, day),
+      ).resolves.toEqual([]);
+      await expect(knex('copilot_daily_totals').select('day')).resolves.toEqual(
+        [],
+      );
+      await handler.upsertIngestionLog(
+        buildIngestionLog({
+          status: 'partial',
+          components_loaded: '["totals"]',
+        }),
+      );
+      await handler.insertDailyTotals([buildDailyTotal()]);
+      await expect(
+        handler.withIngestionDay(
+          day,
+          'organization',
+          'org-1',
+          async (transaction, existing) => {
+            expect(parseComponentsLoaded(existing.components_loaded)).toEqual([
+              'totals',
+            ]);
+            await handler.insertUserMetrics([buildUserMetric()], transaction);
+            await handler.upsertIngestionLog(
+              buildIngestionLog({
+                status: 'success',
+                components_loaded: '["totals","users"]',
+              }),
+              transaction,
+            );
+            throw new Error('injected persistence failure');
+          },
+        ),
+      ).rejects.toThrow('injected persistence failure');
+      await expect(
+        handler.getUserMetricsForDay('organization', 'org-1', day),
+      ).resolves.toEqual([]);
+      await expect(
+        handler.getIngestionLog('organization', 'org-1', day, day),
+      ).resolves.toEqual([
+        expect.objectContaining({
+          status: 'partial',
+          components_loaded: '["totals"]',
+        }),
+      ]);
+      await handler.withIngestionDay(
+        day,
+        'organization',
+        'org-1',
+        async (transaction, existing) => {
+          expect(parseComponentsLoaded(existing.components_loaded)).toEqual([
+            'totals',
+          ]);
+          await handler.insertUserMetrics([buildUserMetric()], transaction);
+          await handler.upsertIngestionLog(
+            buildIngestionLog({ components_loaded: '["totals","users"]' }),
+            transaction,
+          );
+        },
+      );
+      await expect(
+        handler.getUserMetricsForDay('organization', 'org-1', day),
+      ).resolves.toHaveLength(1);
+    });
+
+    it('serializes competing first commits and rechecks completion before writing', async () => {
+      const day = '2026-05-01';
+      const committed: number[] = [];
+      const commit = (credits: number) =>
+        handler.withIngestionDay(
+          day,
+          'organization',
+          'org-1',
+          async (transaction, existing) => {
+            if (
+              parseComponentsLoaded(existing.components_loaded).includes(
+                'totals',
+              )
+            ) {
+              return;
+            }
+            await handler.insertDailyTotals(
+              [buildDailyTotal({ total_ai_credits_used: credits })],
+              transaction,
+            );
+            await handler.upsertIngestionLog(buildIngestionLog(), transaction);
+            committed.push(credits);
+          },
+        );
+      await Promise.all([commit(10), commit(20)]);
+      expect(committed).toHaveLength(1);
+      const rows = await knex('copilot_daily_totals').where({
+        day,
+        metrics_type: 'organization',
+        entity_id: 'org-1',
+      });
+      expect(rows).toHaveLength(1);
+      expect(Number(rows[0].total_ai_credits_used)).toBe(committed[0]);
+      await handler.upsertIngestionLog(
+        buildIngestionLog({
+          status: 'error',
+          components_loaded: '[]',
+          error_message: 'delayed failed duplicate',
+        }),
+      );
+      await expect(
+        handler.getIngestionLog('organization', 'org-1', day, day),
+      ).resolves.toEqual([
+        expect.objectContaining({
+          status: 'success',
+          components_loaded: '["totals"]',
+        }),
+      ]);
+    });
 
     it.each(['commit', 'rollback', 'invalid replacement'])(
       'keeps bound inserts and nested replacements in the lease transaction: %s',
