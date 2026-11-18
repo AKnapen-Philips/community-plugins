@@ -35,7 +35,6 @@ import {
   V2UserTeamRow,
 } from '@backstage-community/plugin-copilot-common';
 import { migrationsDir } from './DatabaseHandler';
-import type { CostCenterAggregateRows } from './DatabaseHandlerV2';
 import {
   DatabaseHandlerV2,
   OrganizationIngestionLeaseLostError,
@@ -247,37 +246,28 @@ describe('DatabaseHandlerV2', () => {
     }
 
     it.each(['commit', 'rollback', 'invalid replacement'])(
-      'keeps bound inserts and nested replacements in the day transaction: %s',
+      'keeps daily inserts and membership replacements in the day transaction: %s',
       async outcome => {
         const day = '2026-05-01';
-        const teamTotal = buildDailyTotal({ team_slug: 'platform' });
         const operation = handler.withIngestionDay(
           day,
           'organization',
           'org-1',
           async transaction => {
             await handler.insertDailyTotals([buildDailyTotal()], transaction);
-            await handler.replaceTeamAggregates(
+            await handler.replaceTeamMemberships(
               day,
               'organization',
               'org-1',
-              [buildUserTeam({ team_slug: 'platform' })],
-              {
-                dailyTotals:
-                  outcome === 'invalid replacement'
-                    ? [teamTotal, teamTotal]
-                    : [teamTotal],
-                byFeature: [],
-                byIde: [],
-                byLanguageFeature: [],
-                byModelFeature: [],
-                byLanguageModel: [],
-                customizationMetrics: [],
-                costCenterCustomizationMetrics: [],
-              },
+              [
+                buildUserTeam({
+                  day: outcome === 'invalid replacement' ? '2026-04-30' : day,
+                  team_slug: 'platform',
+                }),
+              ],
               transaction,
             );
-            await handler.replaceCostCenterAggregates(
+            await handler.replaceCostCenterMemberships(
               day,
               'organization',
               'org-1',
@@ -291,19 +281,6 @@ describe('DatabaseHandlerV2', () => {
                   cost_center_id: 'cc-a',
                 },
               ],
-              makeCostCenterAggregateRows(
-                day,
-                [
-                  {
-                    costCenterId: 'cc-a',
-                    teamSlug: '',
-                    activeUsers: 1,
-                    locAdded: 10,
-                  },
-                ],
-                'organization',
-                'org-1',
-              ),
               true,
               transaction,
             );
@@ -321,18 +298,26 @@ describe('DatabaseHandlerV2', () => {
         const expectedMessage = {
           commit: /^$/,
           rollback: /Abort organization writes/,
-          'invalid replacement': /unique|duplicate/i,
+          'invalid replacement':
+            /Team replacement memberships must match the requested day and scope/,
         }[outcome];
         expect(error?.message ?? '').toMatch(expectedMessage!);
-        for (const table of [
+        const committedCounts: Record<string, number> = {
+          copilot_daily_totals: 1,
+          copilot_user_teams: 1,
+          copilot_user_cost_centers: 1,
+          copilot_cost_center_aggregation_log: 1,
+          copilot_ingestion_log: 1,
+        };
+        for (const table of new Set([
           ...costCenterAggregateTables,
           'copilot_user_teams',
           'copilot_user_cost_centers',
           'copilot_cost_center_aggregation_log',
           'copilot_ingestion_log',
-        ]) {
-          const committedCount = table === 'copilot_daily_totals' ? 3 : 1;
-          const expectedCount = outcome === 'commit' ? committedCount : 0;
+        ])) {
+          const expectedCount =
+            outcome === 'commit' ? committedCounts[table] ?? 0 : 0;
           expect(await knex(table).select('day')).toHaveLength(expectedCount);
         }
       },
@@ -467,7 +452,7 @@ describe('DatabaseHandlerV2', () => {
     });
 
     it.each(['commit', 'rollback', 'invalid replacement'])(
-      'keeps bound inserts and nested replacements in the lease transaction: %s',
+      'keeps membership replacements in the organization lease transaction: %s',
       async outcome => {
         const now = new Date();
         await syncOrganizations('ent-1', ['org-1'], now);
@@ -478,62 +463,57 @@ describe('DatabaseHandlerV2', () => {
           new Date(now.getTime() + 60_000),
         );
         const day = '2026-05-01';
-        const teamTotal = buildDailyTotal({ team_slug: 'platform' });
         const operation = handler.withOrganizationIngestionLease(
           lease!,
           async database => {
-            await database.insertDailyTotals([buildDailyTotal()]);
-            await database.replaceTeamAggregates(
+            await database.withIngestionDay(
               day,
               'organization',
               'org-1',
-              [buildUserTeam({ team_slug: 'platform' })],
-              {
-                dailyTotals:
-                  outcome === 'invalid replacement'
-                    ? [teamTotal, teamTotal]
-                    : [teamTotal],
-                byFeature: [],
-                byIde: [],
-                byLanguageFeature: [],
-                byModelFeature: [],
-                byLanguageModel: [],
-                customizationMetrics: [],
-                costCenterCustomizationMetrics: [],
+              async transaction => {
+                await database.insertDailyTotals(
+                  [buildDailyTotal()],
+                  transaction,
+                );
+                await database.replaceTeamMemberships(
+                  day,
+                  'organization',
+                  'org-1',
+                  [
+                    buildUserTeam({
+                      day:
+                        outcome === 'invalid replacement' ? '2026-04-30' : day,
+                      team_slug: 'platform',
+                    }),
+                  ],
+                  transaction,
+                );
+                await database.replaceCostCenterMemberships(
+                  day,
+                  'organization',
+                  'org-1',
+                  [
+                    {
+                      day,
+                      metrics_type: 'organization',
+                      entity_id: 'org-1',
+                      user_id: 1,
+                      user_login: 'user-1',
+                      cost_center_id: 'cc-a',
+                    },
+                  ],
+                  true,
+                  transaction,
+                );
+                await database.upsertIngestionLog(
+                  buildIngestionLog(),
+                  transaction,
+                );
+                if (outcome === 'rollback') {
+                  throw new Error('Abort organization writes');
+                }
               },
             );
-            await database.replaceCostCenterAggregates(
-              day,
-              'organization',
-              'org-1',
-              [
-                {
-                  day,
-                  metrics_type: 'organization',
-                  entity_id: 'org-1',
-                  user_id: 1,
-                  user_login: 'user-1',
-                  cost_center_id: 'cc-a',
-                },
-              ],
-              makeCostCenterAggregateRows(
-                day,
-                [
-                  {
-                    costCenterId: 'cc-a',
-                    teamSlug: '',
-                    activeUsers: 1,
-                    locAdded: 10,
-                  },
-                ],
-                'organization',
-                'org-1',
-              ),
-            );
-            await database.upsertIngestionLog(buildIngestionLog());
-            if (outcome === 'rollback') {
-              throw new Error('Abort organization writes');
-            }
           },
         );
 
@@ -544,18 +524,17 @@ describe('DatabaseHandlerV2', () => {
         const expectedMessage = {
           commit: /^$/,
           rollback: /Abort organization writes/,
-          'invalid replacement': /unique|duplicate/i,
+          'invalid replacement': /match the requested day and scope/i,
         }[outcome];
         expect(error?.message ?? '').toMatch(expectedMessage!);
         for (const table of [
-          ...costCenterAggregateTables,
+          'copilot_daily_totals',
           'copilot_user_teams',
           'copilot_user_cost_centers',
           'copilot_cost_center_aggregation_log',
           'copilot_ingestion_log',
         ]) {
-          const committedCount = table === 'copilot_daily_totals' ? 3 : 1;
-          const expectedCount = outcome === 'commit' ? committedCount : 0;
+          const expectedCount = outcome === 'commit' ? 1 : 0;
           expect(await knex(table).select('day')).toHaveLength(expectedCount);
         }
       },
@@ -2087,6 +2066,15 @@ describe('DatabaseHandlerV2', () => {
       const historyDay = DateTime.utc()
         .minus({ days: 2 })
         .toFormat('yyyy-MM-dd');
+      await handler.insertUserMetrics(
+        [
+          { day, entity_id: 'Org-A', user_id: 1 },
+          { day, entity_id: 'Org-A', user_id: 2 },
+          { day, entity_id: 'Org-B', user_id: 1 },
+          { day, entity_id: 'Org-B', user_id: 3 },
+          { day: historyDay, entity_id: 'Org-A', user_id: 1 },
+        ].map(scope => buildUserMetric(scope)),
+      );
       await knex('copilot_user_teams').insert(
         buildUserTeam({
           day: historyDay,
@@ -2554,19 +2542,19 @@ describe('DatabaseHandlerV2', () => {
       ]);
 
       await expect(
-        handler.getDaysMissingCostCenterAggregation(
+        handler.getDaysMissingCostCenterMemberships(
           'organization',
           'org-1',
           '2026-05-01',
           '2026-05-03',
         ),
       ).resolves.toEqual(['2026-05-01', '2026-05-02']);
-      await handler.markCostCenterAggregationDone(
+      await handler.markCostCenterMembershipsDone(
         '2026-05-01',
         'organization',
         'org-1',
       );
-      await handler.markCostCenterAggregationDone(
+      await handler.markCostCenterMembershipsDone(
         '2026-05-01',
         'organization',
         'org-1',
@@ -2634,7 +2622,7 @@ describe('DatabaseHandlerV2', () => {
         }),
       ).toHaveLength(1);
       await expect(
-        handler.getDaysMissingCostCenterAggregation(
+        handler.getDaysMissingCostCenterMemberships(
           'organization',
           'org-1',
           '2026-05-01',
@@ -2642,13 +2630,13 @@ describe('DatabaseHandlerV2', () => {
         ),
       ).resolves.toEqual(['2026-05-02']);
 
-      await handler.markCostCenterAggregationDone(
+      await handler.markCostCenterMembershipsDone(
         '2026-05-02',
         'organization',
         'org-1',
       );
       await expect(
-        handler.getDaysMissingCostCenterAggregation(
+        handler.getDaysMissingCostCenterMemberships(
           'organization',
           'org-1',
           '2026-05-01',
@@ -2672,7 +2660,7 @@ describe('DatabaseHandlerV2', () => {
       );
 
       await expect(
-        handler.getDaysMissingCostCenterAggregation(
+        handler.getDaysMissingCostCenterMemberships(
           'organization',
           'org-1',
           '2026-05-03',
@@ -2681,31 +2669,24 @@ describe('DatabaseHandlerV2', () => {
       ).resolves.toEqual(['2026-05-03']);
     });
 
-    it('requeues refreshed days without hiding their previous unassigned aggregates', async () => {
+    it('refreshes legacy dirty memberships once without hiding complete unassigned snapshots', async () => {
       const day = '2026-05-05';
       await handler.insertUserMetrics([buildUserMetric({ day })]);
       await knex('copilot_daily_totals').insert({
         ...buildDailyTotal({ day, cost_center_id: '' }),
         without_cost_center: true,
       });
-      await handler.markCostCenterAggregationDone(day, 'organization', 'org-1');
-      await handler.markCostCenterAggregationDone(day, 'organization', 'org-2');
-      await handler.markCostCenterAggregationDone(day, 'enterprise', 'org-1');
-      await handler.markCostCenterAggregationDone(
+      await handler.markCostCenterMembershipsDone(day, 'organization', 'org-1');
+      await handler.markCostCenterMembershipsDone(day, 'organization', 'org-2');
+      await handler.markCostCenterMembershipsDone(day, 'enterprise', 'org-1');
+      await handler.markCostCenterMembershipsDone(
         '2026-05-06',
         'organization',
         'org-1',
       );
-      await handler.markCostCenterAggregationPending(
-        day,
-        'organization',
-        'org-1',
-      );
-      await handler.markCostCenterAggregationPending(
-        '2026-05-07',
-        'organization',
-        'org-1',
-      );
+      await knex('copilot_cost_center_aggregation_log')
+        .where({ day, metrics_type: 'organization', entity_id: 'org-1' })
+        .update({ needs_reaggregation: true });
 
       const pendingRows = await knex(
         'copilot_cost_center_aggregation_log',
@@ -2725,7 +2706,7 @@ describe('DatabaseHandlerV2', () => {
         }),
       ).resolves.toEqual([]);
       await expect(
-        handler.getDaysMissingCostCenterAggregation(
+        handler.getDaysMissingCostCenterMemberships(
           'organization',
           'org-1',
           day,
@@ -2733,7 +2714,7 @@ describe('DatabaseHandlerV2', () => {
         ),
       ).resolves.toEqual([day]);
       await expect(
-        handler.getDaysMissingCostCenterAggregation(
+        handler.getDaysMissingCostCenterMemberships(
           'organization',
           'org-1',
           '2026-05-06',
@@ -2749,9 +2730,9 @@ describe('DatabaseHandlerV2', () => {
         handler.getCostCenters('organization', 'org-1', day, day, 1),
       ).resolves.toEqual({ costCenters: [], hasUsersWithoutCostCenter: true });
 
-      await handler.markCostCenterAggregationDone(day, 'organization', 'org-1');
+      await handler.markCostCenterMembershipsDone(day, 'organization', 'org-1');
       await expect(
-        handler.getDaysMissingCostCenterAggregation(
+        handler.getDaysMissingCostCenterMemberships(
           'organization',
           'org-1',
           day,
@@ -2771,7 +2752,7 @@ describe('DatabaseHandlerV2', () => {
       await handler.insertUserMetrics([
         buildUserMetric({ day, user_id: 1, user_login: 'octocat' }),
       ]);
-      await handler.markCostCenterAggregationDone(
+      await handler.markCostCenterMembershipsDone(
         day,
         'organization',
         'org-1',
@@ -2779,7 +2760,7 @@ describe('DatabaseHandlerV2', () => {
       );
 
       await expect(
-        handler.getDaysMissingCostCenterAggregation(
+        handler.getDaysMissingCostCenterMemberships(
           'organization',
           'org-1',
           day,
@@ -2787,7 +2768,7 @@ describe('DatabaseHandlerV2', () => {
         ),
       ).resolves.toEqual([]);
       await expect(
-        handler.getDaysWithIncompleteCostCenterAggregation(
+        handler.getDaysWithIncompleteCostCenterMemberships(
           'organization',
           'org-1',
           day,
@@ -2795,9 +2776,9 @@ describe('DatabaseHandlerV2', () => {
         ),
       ).resolves.toEqual([day]);
 
-      await handler.markCostCenterAggregationDone(day, 'organization', 'org-1');
+      await handler.markCostCenterMembershipsDone(day, 'organization', 'org-1');
       await expect(
-        handler.getDaysWithIncompleteCostCenterAggregation(
+        handler.getDaysWithIncompleteCostCenterMemberships(
           'organization',
           'org-1',
           day,
@@ -2806,7 +2787,7 @@ describe('DatabaseHandlerV2', () => {
       ).resolves.toEqual([]);
     });
 
-    it('atomically replaces memberships and all scoped aggregates when a snapshot changes', async () => {
+    it('replaces memberships without writing or deleting stored aggregates', async () => {
       const day = '2026-05-10';
       const scope = {
         day,
@@ -2836,32 +2817,23 @@ describe('DatabaseHandlerV2', () => {
         }),
       ]);
 
-      const firstGroups = makeCostCenterAggregateRows(day, [
-        { costCenterId: 'cc-a', teamSlug: '', activeUsers: 6, locAdded: 60 },
-      ]);
-      await handler.replaceCostCenterAggregates(
+      await handler.insertUserMetrics(
+        memberships('cc-a').map(({ cost_center_id: _, ...row }) =>
+          buildUserMetric({ ...row, loc_added_sum: 10 }),
+        ),
+      );
+      await handler.replaceCostCenterMemberships(
         day,
         'enterprise',
         'ent-1',
         memberships('cc-a'),
-        firstGroups,
       );
 
-      const updatedGroups = makeCostCenterAggregateRows(day, [
-        { costCenterId: 'cc-a', teamSlug: '', activeUsers: 5, locAdded: 50 },
-        { costCenterId: 'cc-b', teamSlug: '', activeUsers: 1, locAdded: 10 },
-      ]);
-      await handler.markCostCenterAggregationPending(
-        day,
-        'enterprise',
-        'ent-1',
-      );
-      await handler.replaceCostCenterAggregates(
+      await handler.replaceCostCenterMemberships(
         day,
         'enterprise',
         'ent-1',
         memberships('cc-b'),
-        updatedGroups,
       );
       await expect(
         knex('copilot_cost_center_aggregation_log')
@@ -2880,18 +2852,24 @@ describe('DatabaseHandlerV2', () => {
         membershipRows.find(row => Number(row.user_id) === 6)?.cost_center_id,
       ).toBe('cc-b');
 
-      const costCenterA = await knex('copilot_daily_totals')
-        .where({ ...scope, team_slug: '', cost_center_id: 'cc-a' })
-        .first();
+      const [costCenterA] = await handler.getDailyTotals(
+        'enterprise',
+        'ent-1',
+        day,
+        day,
+        undefined,
+        'cc-a',
+      );
       expect(costCenterA.daily_active_users).toBe(5);
       expect(costCenterA.loc_added_sum).toBe(50);
 
-      for (const tableName of costCenterAggregateTables) {
+      for (const tableName of [
+        ...costCenterAggregateTables,
+        'copilot_customization_metrics_by_cost_center',
+      ]) {
         await expect(
           knex(tableName).where({ ...scope, cost_center_id: 'cc-a' }),
-        ).resolves.toEqual(
-          expect.arrayContaining([expect.objectContaining({ team_slug: '' })]),
-        );
+        ).resolves.toEqual([]);
       }
 
       const unscopedRows = await knex('copilot_daily_totals')
@@ -2912,7 +2890,6 @@ describe('DatabaseHandlerV2', () => {
         metrics_type: 'enterprise' as const,
         entity_id: 'ent-1',
       };
-      const aggregateScope = { ...metricScope, team_slug: '' };
       await handler.insertUserMetrics(
         Array.from({ length: 10 }, (_, index) =>
           buildUserMetric({
@@ -2929,73 +2906,28 @@ describe('DatabaseHandlerV2', () => {
         user_login: `user-${index + 6}`,
         cost_center_id: 'cc-a',
       }));
-      const assignedTotals = buildDailyTotal({
-        ...aggregateScope,
-        cost_center_id: 'cc-a',
-        daily_active_users: 5,
-        loc_added_sum: 50,
-      });
-      const unassignedTotals = {
-        ...buildDailyTotal({
-          ...aggregateScope,
-          cost_center_id: '',
-          daily_active_users: 5,
-          loc_added_sum: 50,
-        }),
-        without_cost_center: true,
-      };
-      const assignedFeature = {
-        ...aggregateScope,
-        cost_center_id: 'cc-a',
-        feature: 'chat_panel',
-        code_acceptance_activity_count: 5,
-        code_generation_activity_count: 5,
-        loc_added_sum: 50,
-        loc_deleted_sum: 0,
-        loc_suggested_to_add_sum: 0,
-        loc_suggested_to_delete_sum: 0,
-        user_initiated_interaction_count: 5,
-      };
-      const unassignedFeature = {
-        ...assignedFeature,
-        cost_center_id: '',
-        without_cost_center: true,
-      };
-      const assignedCustomization = {
-        ...metricScope,
-        cost_center_id: 'cc-a',
-        category: 'skill',
-        item_name: 'assigned-skill',
-        interaction_count: 7,
-      };
-      const unassignedCustomization = {
-        ...assignedCustomization,
-        cost_center_id: '',
-        without_cost_center: true,
-        item_name: 'unassigned-skill',
-        interaction_count: 3,
-      };
-
-      await handler.replaceCostCenterAggregates(
+      await handler.insertUserMetricsByFeature(
+        [1, 6].map(user_id =>
+          buildUserMetricsByFeature({ ...metricScope, user_id }),
+        ),
+      );
+      await handler.insertCustomizationMetrics(
+        [1, 6].map(user_id => ({
+          ...metricScope,
+          scope: 'user' as const,
+          team_slug: '',
+          user_id,
+          user_login: `user-${user_id}`,
+          category: 'skill',
+          item_name: user_id === 1 ? 'unassigned-skill' : 'assigned-skill',
+          interaction_count: user_id === 1 ? 3 : 7,
+        })),
+      );
+      await handler.replaceCostCenterMemberships(
         day,
         'enterprise',
         'ent-1',
         assignedMemberships,
-        {
-          dailyTotals: [assignedTotals, unassignedTotals],
-          prMetrics: [],
-          byFeature: [assignedFeature, unassignedFeature],
-          byIde: [],
-          byLanguageFeature: [],
-          byModelFeature: [],
-          byLanguageModel: [],
-          byCli: [],
-          byVscodeAgent: [],
-          customizationMetrics: [
-            assignedCustomization,
-            unassignedCustomization,
-          ],
-        },
       );
 
       const noCostCenterDashboard = await handler.getDashboardData(
@@ -3054,7 +2986,6 @@ describe('DatabaseHandlerV2', () => {
         metrics_type: 'organization' as const,
         entity_id: 'org-1',
       };
-      const aggregateScope = { ...metricScope, team_slug: '' };
       const userIds = [1, 2, 3, 4, 5];
       await handler.upsertCostCenters([
         {
@@ -3079,39 +3010,14 @@ describe('DatabaseHandlerV2', () => {
         user_login: `user-${userId}`,
         cost_center_id: '__none__',
       }));
-      const totals = buildDailyTotal({
-        ...aggregateScope,
-        cost_center_id: '__none__',
-        daily_active_users: 5,
-      });
-      const feature = {
-        ...aggregateScope,
-        cost_center_id: '__none__',
-        feature: 'chat_panel',
-        code_acceptance_activity_count: 5,
-        code_generation_activity_count: 5,
-        loc_added_sum: 0,
-        loc_deleted_sum: 0,
-        loc_suggested_to_add_sum: 0,
-        loc_suggested_to_delete_sum: 0,
-        user_initiated_interaction_count: 5,
-      };
-      await handler.replaceCostCenterAggregates(
+      await handler.insertUserMetricsByFeature([
+        buildUserMetricsByFeature({ ...metricScope, feature: 'chat_panel' }),
+      ]);
+      await handler.replaceCostCenterMemberships(
         day,
         'organization',
         'org-1',
         memberships,
-        {
-          dailyTotals: [totals],
-          prMetrics: [],
-          byFeature: [feature],
-          byIde: [],
-          byLanguageFeature: [],
-          byModelFeature: [],
-          byLanguageModel: [],
-          byCli: [],
-          byVscodeAgent: [],
-        },
       );
 
       const listing = await handler.getCostCenters(
@@ -3159,22 +3065,18 @@ describe('DatabaseHandlerV2', () => {
       const day = '2026-05-10';
 
       await expect(
-        handler.replaceCostCenterAggregates(
-          day,
-          'enterprise',
-          'ent-1',
-          [],
-          makeCostCenterAggregateRows(day, [
-            {
-              costCenterId: '',
-              teamSlug: '',
-              activeUsers: 1,
-              locAdded: 10,
-            },
-          ]),
-        ),
+        handler.replaceCostCenterMemberships(day, 'enterprise', 'ent-1', [
+          {
+            day,
+            metrics_type: 'enterprise',
+            entity_id: 'ent-1',
+            user_id: 1,
+            user_login: 'user-1',
+            cost_center_id: '',
+          },
+        ]),
       ).rejects.toThrow(
-        'Cost-center replacement rows must match the requested day and scope and must not include a team scope.',
+        'Cost-center replacement memberships must match the requested day and scope and have a cost center.',
       );
 
       await expect(
@@ -3280,12 +3182,18 @@ describe('DatabaseHandlerV2', () => {
     });
 
     it('getDailyTotals filters by date range and team', async () => {
-      await handler.insertDailyTotals([
-        buildDailyTotal({ day: '2026-05-01', team_slug: 'team-a' }),
-        buildDailyTotal({ day: '2026-05-02', team_slug: 'team-a' }),
-        buildDailyTotal({ day: '2026-05-02', team_slug: 'team-b' }),
-        buildDailyTotal({ day: '2026-05-04', team_slug: 'team-a' }),
-      ]);
+      const membershipRows = [
+        buildUserTeam({ day: '2026-05-01', team_slug: 'team-a' }),
+        buildUserTeam({ day: '2026-05-02', team_slug: 'team-a' }),
+        buildUserTeam({ day: '2026-05-02', team_slug: 'team-b', user_id: 2 }),
+        buildUserTeam({ day: '2026-05-04', team_slug: 'team-a' }),
+      ];
+      await handler.insertUserTeams(membershipRows);
+      await handler.insertUserMetrics(
+        membershipRows.map(({ day, user_id }) =>
+          buildUserMetric({ day, user_id }),
+        ),
+      );
 
       const rows = await handler.getDailyTotals(
         'organization',
@@ -3301,7 +3209,7 @@ describe('DatabaseHandlerV2', () => {
       expect(rows.every(r => r.team_slug === 'team-a')).toBe(true);
     });
 
-    it('scopes aggregate inserts and reads by team or cost center', async () => {
+    it('scopes raw reads by team or cost center without changing canonical aggregates', async () => {
       const scopes = [
         { team_slug: '', cost_center_id: '' },
         { team_slug: 'team-a', cost_center_id: '' },
@@ -3420,6 +3328,34 @@ describe('DatabaseHandlerV2', () => {
           total_user_messages: 1,
         })),
       );
+      await handler.insertUserMetrics([buildUserMetric()]);
+      await handler.insertUserTeams([buildUserTeam({ team_slug: 'team-a' })]);
+      await handler.replaceCostCenterMemberships(
+        '2026-05-01',
+        'organization',
+        'org-1',
+        [
+          {
+            day: '2026-05-01',
+            metrics_type: 'organization',
+            entity_id: 'org-1',
+            user_id: 1,
+            user_login: 'octocat',
+            cost_center_id: 'cc-a',
+          },
+        ],
+      );
+      await handler.insertUserMetricsByFeature([buildUserMetricsByFeature()]);
+      await handler.insertUserMetricsByIde([buildUserMetricsByIde()]);
+      await handler.insertUserMetricsByLanguageFeature([
+        buildUserMetricsByLanguageFeature(),
+      ]);
+      await handler.insertUserMetricsByModelFeature([
+        buildUserMetricsByModelFeature(),
+      ]);
+      await handler.insertUserMetricsByLanguageModel([
+        buildUserMetricsByLanguageModel(),
+      ]);
 
       for (const scope of scopes) {
         const teamSlug = scope.team_slug || undefined;
@@ -3493,7 +3429,7 @@ describe('DatabaseHandlerV2', () => {
         ]);
 
         expect(daily).toHaveLength(1);
-        expect(prs).toHaveLength(1);
+        expect(prs).toHaveLength(teamSlug || costCenter ? 0 : 1);
         expect(byFeature).toHaveLength(1);
         expect(byIde).toHaveLength(1);
         expect(byLanguageFeature).toHaveLength(1);
@@ -3588,13 +3524,37 @@ describe('DatabaseHandlerV2', () => {
         loc_suggested_to_add_sum: count * 4,
         loc_suggested_to_delete_sum: count * 5,
       }));
+      const rawRows = <T extends { cost_center_id: string; team_slug: string }>(
+        rows: T[],
+      ) =>
+        rows.map(({ cost_center_id: _, team_slug: _team, ...row }) => ({
+          ...row,
+          user_id: 1,
+          user_login: 'octocat',
+        }));
 
+      await handler.insertUserMetrics([buildUserMetric({ day })]);
+      await handler.insertUserTeams([
+        buildUserTeam({ day, team_slug: 'demo-team' }),
+      ]);
+      await handler.upsertUserCostCenters([
+        {
+          day,
+          metrics_type: 'organization',
+          entity_id: 'org-1',
+          user_id: 1,
+          user_login: 'octocat',
+          cost_center_id: 'cc-a',
+        },
+      ]);
       await Promise.all([
-        handler.insertByFeature(featureRows),
-        handler.insertByIde(ideRows),
-        handler.insertByLanguageFeature(languageFeatureRows),
-        handler.insertByModelFeature(modelFeatureRows),
-        handler.insertByLanguageModel(languageModelRows),
+        handler.insertUserMetricsByFeature(rawRows(featureRows)),
+        handler.insertUserMetricsByIde(rawRows(ideRows)),
+        handler.insertUserMetricsByLanguageFeature(
+          rawRows(languageFeatureRows),
+        ),
+        handler.insertUserMetricsByModelFeature(rawRows(modelFeatureRows)),
+        handler.insertUserMetricsByLanguageModel(rawRows(languageModelRows)),
       ]);
       await handler.insertByFeature(
         counts.map(count => ({
@@ -3699,6 +3659,638 @@ describe('DatabaseHandlerV2', () => {
       );
       expect(teamFeatures).toHaveLength(12);
       expect(teamFeatures.some(row => row.feature === 'others')).toBe(false);
+    });
+
+    it('groups every raw dimension once per active member and reflects edits without refreshing aggregates', async () => {
+      const day = '2026-05-01';
+      const activeUsers = [1, 2];
+      await handler.insertUserMetrics(
+        activeUsers.map(user_id =>
+          buildUserMetric({ user_id, used_cli: true, used_vscode_agent: true }),
+        ),
+      );
+      await handler.insertUserTeams([
+        ...[1, 2, 3].map(user_id => buildUserTeam({ user_id })),
+        buildUserTeam({ team_id: 101 }),
+        buildUserTeam({ user_id: 4, day: '2026-05-02' }),
+        buildUserTeam({ user_id: 5, entity_id: 'other' }),
+        buildUserTeam({ user_id: 6, metrics_type: 'enterprise' }),
+      ]);
+      await handler.replaceCostCenterMemberships(
+        day,
+        'organization',
+        'org-1',
+        [1, 2, 3].map(user_id => ({
+          day,
+          metrics_type: 'organization',
+          entity_id: 'org-1',
+          user_id,
+          user_login: `u${user_id}`,
+          cost_center_id: 'cc-a',
+        })),
+      );
+      await handler.insertUserMetrics(
+        [4, 5, 6].map(user_id => buildUserMetric({ user_id })),
+      );
+      const usersWithBreakdowns = [1, 2, 3, 4, 5, 6];
+      await handler.insertUserMetricsByFeature(
+        usersWithBreakdowns.map(user_id =>
+          buildUserMetricsByFeature({ user_id }),
+        ),
+      );
+      await handler.insertUserMetricsByIde(
+        usersWithBreakdowns.map(user_id => buildUserMetricsByIde({ user_id })),
+      );
+      await handler.insertUserMetricsByLanguageFeature(
+        usersWithBreakdowns.map(user_id =>
+          buildUserMetricsByLanguageFeature({ user_id }),
+        ),
+      );
+      await handler.insertUserMetricsByModelFeature(
+        usersWithBreakdowns.map(user_id =>
+          buildUserMetricsByModelFeature({ user_id }),
+        ),
+      );
+      await handler.insertUserMetricsByLanguageModel(
+        usersWithBreakdowns.map(user_id =>
+          buildUserMetricsByLanguageModel({ user_id }),
+        ),
+      );
+      await handler.insertCustomizationMetrics(
+        usersWithBreakdowns.map(user_id =>
+          buildCustomizationMetric({ user_id }),
+        ),
+      );
+      await handler.upsertUserCostCenters([
+        {
+          day: '2026-05-02',
+          metrics_type: 'organization',
+          entity_id: 'org-1',
+          user_id: 4,
+          user_login: 'u4',
+          cost_center_id: 'cc-a',
+        },
+        {
+          day,
+          metrics_type: 'organization',
+          entity_id: 'other',
+          user_id: 5,
+          user_login: 'u5',
+          cost_center_id: 'cc-a',
+        },
+        {
+          day,
+          metrics_type: 'enterprise',
+          entity_id: 'org-1',
+          user_id: 6,
+          user_login: 'u6',
+          cost_center_id: 'cc-a',
+        },
+      ]);
+      await expect(
+        handler.getTeams('organization', 'org-1', day, day, 3),
+      ).resolves.toEqual([]);
+      await expect(
+        handler.getCostCenters('organization', 'org-1', day, day, 3),
+      ).resolves.toEqual({
+        costCenters: [],
+        hasUsersWithoutCostCenter: true,
+      });
+      expect(
+        (
+          await handler.getDailyTotals(
+            'organization',
+            'org-1',
+            day,
+            day,
+            undefined,
+            { kind: 'noCostCenter' },
+          )
+        )[0],
+      ).toMatchObject({
+        daily_active_users: 3,
+        loc_added_sum: 30,
+      });
+      const unassignedFeatures = handler.getByFeature(
+        'organization',
+        'org-1',
+        day,
+        day,
+        undefined,
+        { kind: 'noCostCenter' },
+      );
+      expect((await unassignedFeatures)[0]).toMatchObject({
+        code_generation_activity_count: 12,
+        loc_added_sum: 30,
+      });
+      const readDimensions = (team?: string, center?: string) =>
+        Promise.all([
+          handler.getByFeature('organization', 'org-1', day, day, team, center),
+          handler.getByIde('organization', 'org-1', day, day, team, center),
+          handler.getByLanguageFeature(
+            'organization',
+            'org-1',
+            day,
+            day,
+            team,
+            undefined,
+            center,
+          ),
+          handler.getByModelFeature(
+            'organization',
+            'org-1',
+            day,
+            day,
+            team,
+            center,
+          ),
+          handler.getByLanguageModel(
+            'organization',
+            'org-1',
+            day,
+            day,
+            team,
+            center,
+          ),
+        ]);
+      for (const dimensions of [
+        await readDimensions('alpha'),
+        await readDimensions(undefined, 'cc-a'),
+      ]) {
+        for (const rows of dimensions) {
+          expect(rows).toEqual([
+            expect.objectContaining({
+              day,
+              code_generation_activity_count: 8,
+              code_acceptance_activity_count: 6,
+              loc_added_sum: 20,
+              loc_deleted_sum: 4,
+              loc_suggested_to_add_sum: 24,
+              loc_suggested_to_delete_sum: 6,
+            }),
+          ]);
+        }
+        expect(dimensions[0][0].user_initiated_interaction_count).toBe(14);
+        expect(dimensions[4][0].request_count).toBe(8);
+      }
+      const [teamDaily] = await handler.getDailyTotals(
+        'organization',
+        'org-1',
+        day,
+        day,
+        'alpha',
+      );
+      const [centerDaily] = await handler.getDailyTotals(
+        'organization',
+        'org-1',
+        day,
+        day,
+        undefined,
+        'cc-a',
+      );
+      expect(teamDaily).toMatchObject({
+        daily_active_users: 2,
+        daily_active_vscode_agent_users: 2,
+        total_ai_credits_used: 11,
+        loc_added_sum: 20,
+      });
+      expect(teamDaily.daily_active_cli_users).toBeUndefined();
+      expect(centerDaily.daily_active_cli_users).toBe(2);
+      expect(
+        await handler.getCustomizationMetrics(
+          'organization',
+          'org-1',
+          day,
+          day,
+          'alpha',
+        ),
+      ).toEqual([
+        expect.objectContaining({ interaction_count: 14, scope: 'team' }),
+      ]);
+      expect(
+        await handler.getCustomizationMetrics(
+          'organization',
+          'org-1',
+          day,
+          day,
+          undefined,
+          'cc-a',
+        ),
+      ).toEqual([
+        expect.objectContaining({ interaction_count: 14, scope: 'aggregate' }),
+      ]);
+      await expect(
+        handler.getByLanguageFeature(
+          'organization',
+          'org-1',
+          day,
+          day,
+          'alpha',
+          'absent',
+        ),
+      ).resolves.toEqual([]);
+
+      await knex('copilot_user_metrics')
+        .where({ day, user_id: 1 })
+        .update({ loc_added_sum: 100, ai_credits_used: 0.25 });
+      await knex('copilot_user_metrics_by_feature')
+        .where({ day, user_id: 1 })
+        .update({ loc_added_sum: 100 });
+      await knex('copilot_customization_metrics')
+        .where({ day, user_id: 1, scope: 'user' })
+        .update({ interaction_count: 100 });
+      expect(
+        (
+          await handler.getDailyTotals(
+            'organization',
+            'org-1',
+            day,
+            day,
+            'alpha',
+          )
+        )[0],
+      ).toMatchObject({
+        loc_added_sum: 110,
+        total_ai_credits_used: 5.75,
+      });
+      expect((await readDimensions('alpha'))[0][0].loc_added_sum).toBe(110);
+      expect(
+        (
+          await handler.getCustomizationMetrics(
+            'organization',
+            'org-1',
+            day,
+            day,
+            'alpha',
+          )
+        )[0].interaction_count,
+      ).toBe(107);
+      await handler.replaceTeamMemberships(day, 'organization', 'org-1', [
+        buildUserTeam({ user_id: 2 }),
+      ]);
+      await handler.replaceCostCenterMemberships(day, 'organization', 'org-1', [
+        {
+          day,
+          metrics_type: 'organization',
+          entity_id: 'org-1',
+          user_id: 2,
+          user_login: 'u2',
+          cost_center_id: 'cc-a',
+        },
+      ]);
+      for (const dimensions of [
+        await readDimensions('alpha'),
+        await readDimensions(undefined, 'cc-a'),
+      ]) {
+        for (const rows of dimensions) {
+          expect(rows[0].loc_added_sum).toBe(10);
+        }
+      }
+      expect(
+        (
+          await handler.getCustomizationMetrics(
+            'organization',
+            'org-1',
+            day,
+            day,
+            'alpha',
+          )
+        )[0].interaction_count,
+      ).toBe(7);
+    });
+
+    it('preserves legacy team detail only for whole days with no raw breakdowns or completion marker', async () => {
+      const days = ['2026-05-01', '2026-05-02', '2026-05-03', '2026-05-04'];
+      await handler.insertByFeature(
+        days.map(day => ({
+          day,
+          metrics_type: 'organization',
+          entity_id: 'org-1',
+          team_slug: 'alpha',
+          feature: 'legacy',
+          code_acceptance_activity_count: 99,
+          code_generation_activity_count: 99,
+          loc_added_sum: 99,
+          loc_deleted_sum: 0,
+          loc_suggested_to_add_sum: 0,
+          loc_suggested_to_delete_sum: 0,
+          user_initiated_interaction_count: 99,
+        })),
+      );
+      await handler.insertCustomizationMetrics(
+        days.map(day =>
+          buildCustomizationMetric({
+            day,
+            scope: 'team',
+            team_slug: 'alpha',
+            user_id: 0,
+            user_login: '',
+            interaction_count: 99,
+          }),
+        ),
+      );
+      await handler.insertDailyTotals(
+        days.map(day => buildDailyTotal({ day, team_slug: 'alpha' })),
+      );
+      await handler.insertUserMetrics(
+        days.slice(0, 3).map(day => buildUserMetric({ day })),
+      );
+      await handler.insertUserTeams(days.map(day => buildUserTeam({ day })));
+      await handler.insertUserMetricsByFeature([
+        buildUserMetricsByFeature(),
+        buildUserMetricsByFeature({ day: days[3], entity_id: 'other' }),
+        buildUserMetricsByFeature({ day: days[3], metrics_type: 'enterprise' }),
+      ]);
+      // Another dimension, even for an inactive user, makes the whole day raw.
+      await handler.insertUserMetricsByIde([
+        buildUserMetricsByIde({ day: days[1], user_id: 55 }),
+      ]);
+      await handler.upsertIngestionLog(
+        buildIngestionLog({
+          day: days[2],
+          components_loaded: '["users","userBreakdowns"]',
+        }),
+      );
+      const featuresRequest = handler.getByFeature(
+        'organization',
+        'org-1',
+        days[0],
+        days[3],
+        'alpha',
+      );
+      const features = await featuresRequest;
+      expect(
+        features.map(row => [row.day, row.feature, row.loc_added_sum]),
+      ).toEqual([
+        [days[0], 'chat_panel', 10],
+        [days[3], 'legacy', 99],
+      ]);
+      expect(
+        await handler.getCustomizationMetrics(
+          'organization',
+          'org-1',
+          days[0],
+          days[3],
+          'alpha',
+        ),
+      ).toEqual([
+        expect.objectContaining({ day: days[3], interaction_count: 99 }),
+      ]);
+      expect(
+        (
+          await handler.getDailyTotals(
+            'organization',
+            'org-1',
+            days[0],
+            days[3],
+            'alpha',
+          )
+        ).map(row => row.daily_active_users),
+      ).toEqual([1, 1, 1]);
+      await handler.replaceTeamMemberships(
+        days[3],
+        'organization',
+        'org-1',
+        [],
+      );
+      const retainedLegacy = handler.getByFeature(
+        'organization',
+        'org-1',
+        days[3],
+        days[3],
+        'alpha',
+      );
+      expect((await retainedLegacy)[0].loc_added_sum).toBe(99);
+      await handler.upsertIngestionLog(
+        buildIngestionLog({
+          day: days[3],
+          components_loaded: '["users","userBreakdowns"]',
+        }),
+      );
+      await expect(
+        handler.getByFeature(
+          'organization',
+          'org-1',
+          days[3],
+          days[3],
+          'alpha',
+        ),
+      ).resolves.toEqual([]);
+      await expect(
+        handler.getCustomizationMetrics(
+          'organization',
+          'org-1',
+          days[3],
+          days[3],
+          'alpha',
+        ),
+      ).resolves.toEqual([]);
+      await expect(
+        knex('copilot_metrics_by_feature').where({ team_slug: 'alpha' }),
+      ).resolves.toHaveLength(4);
+    });
+
+    it('validates full membership scopes and rolls back replacements with completion evidence', async () => {
+      const day = '2026-05-01';
+      const member = {
+        day,
+        metrics_type: 'organization' as const,
+        entity_id: 'org-1',
+        user_id: 1,
+        user_login: 'octocat',
+        cost_center_id: 'cc-a',
+      };
+      await handler.replaceCostCenterMemberships(
+        day,
+        'organization',
+        'org-1',
+        [member],
+        false,
+      );
+      await expect(
+        handler.replaceCostCenterMemberships(day, 'organization', 'org-1', [
+          { ...member, cost_center_id: 'cc-new' },
+          { ...member, cost_center_id: 'cc-duplicate' },
+        ]),
+      ).rejects.toThrow();
+      await expect(
+        knex('copilot_user_cost_centers').where({ day, entity_id: 'org-1' }),
+      ).resolves.toEqual([expect.objectContaining({ cost_center_id: 'cc-a' })]);
+      await handler.replaceTeamMemberships(day, 'organization', 'org-1', [
+        buildUserTeam(),
+      ]);
+      const otherEntity = { ...member, entity_id: 'other' };
+      await handler.replaceCostCenterMemberships(day, 'organization', 'other', [
+        otherEntity,
+      ]);
+      for (const changed of [
+        { day: '2026-05-02' },
+        { metrics_type: 'enterprise' as const },
+        { entity_id: 'other' },
+      ]) {
+        await expect(
+          handler.replaceCostCenterMemberships(day, 'organization', 'org-1', [
+            { ...member, ...changed },
+          ]),
+        ).rejects.toThrow('requested day and scope');
+        await expect(
+          handler.replaceTeamMemberships(day, 'organization', 'org-1', [
+            buildUserTeam(changed),
+          ]),
+        ).rejects.toThrow('requested day and scope');
+      }
+      await expect(
+        knex.transaction(async transaction => {
+          await handler.replaceTeamMemberships(
+            day,
+            'organization',
+            'org-1',
+            [],
+            transaction,
+          );
+          await handler.replaceCostCenterMemberships(
+            day,
+            'organization',
+            'org-1',
+            [],
+            true,
+            transaction,
+          );
+          throw new Error('rollback');
+        }),
+      ).rejects.toThrow('rollback');
+      await expect(
+        knex('copilot_user_teams').where({ day, entity_id: 'org-1' }),
+      ).resolves.toHaveLength(1);
+      await expect(
+        knex('copilot_user_cost_centers').where({ day, entity_id: 'org-1' }),
+      ).resolves.toEqual([expect.objectContaining({ cost_center_id: 'cc-a' })]);
+      await expect(
+        handler.getDaysWithIncompleteCostCenterMemberships(
+          'organization',
+          'org-1',
+          day,
+          day,
+        ),
+      ).resolves.toEqual([day]);
+      await handler.replaceCostCenterMemberships(
+        day,
+        'organization',
+        'org-1',
+        [],
+      );
+      await handler.replaceCostCenterMemberships(
+        day,
+        'organization',
+        'org-1',
+        [member],
+        false,
+      );
+      await handler.markCostCenterMembershipsDone(
+        day,
+        'organization',
+        'org-1',
+        false,
+      );
+      await expect(
+        knex('copilot_user_cost_centers').where({ day, entity_id: 'org-1' }),
+      ).resolves.toEqual([]);
+      await expect(
+        knex('copilot_user_cost_centers').where({ day, entity_id: 'other' }),
+      ).resolves.toHaveLength(1);
+      await expect(
+        handler.getDaysWithIncompleteCostCenterMemberships(
+          'organization',
+          'org-1',
+          day,
+          day,
+        ),
+      ).resolves.toEqual([]);
+      await expect(
+        knex('copilot_cost_center_aggregation_log').where({
+          needs_reaggregation: true,
+        }),
+      ).resolves.toEqual([]);
+      await expect(
+        knex.transaction(async transaction => {
+          await handler.replaceCostCenterMemberships(
+            '2026-05-02',
+            'organization',
+            'org-1',
+            [],
+            true,
+            transaction,
+          );
+          throw new Error('rollback new snapshot');
+        }),
+      ).rejects.toThrow('rollback new snapshot');
+      await expect(
+        knex('copilot_cost_center_aggregation_log').where({
+          day: '2026-05-02',
+        }),
+      ).resolves.toEqual([]);
+    });
+
+    it('normalizes grouped database count and numeric sums to JavaScript numbers', async () => {
+      const day = '2026-05-01';
+      await handler.insertUserMetrics([buildUserMetric()]);
+      await handler.insertUserTeams([buildUserTeam()]);
+      await handler.insertUserMetricsByFeature([buildUserMetricsByFeature()]);
+      await handler.insertCustomizationMetrics([buildCustomizationMetric()]);
+      const previous = knex.client.config.postProcessResponse;
+      knex.client.config.postProcessResponse = (result: unknown) => {
+        if (!Array.isArray(result)) {
+          return result;
+        }
+        return result.map(row => {
+          if (!row || row.user_id !== undefined) {
+            return row;
+          }
+          return Object.fromEntries(
+            Object.entries(row).map(([key, value]) => [
+              key,
+              typeof value === 'number' ? String(value) : value,
+            ]),
+          );
+        });
+      };
+      try {
+        const [daily] = await handler.getDailyTotals(
+          'organization',
+          'org-1',
+          day,
+          day,
+          'alpha',
+        );
+        expect(daily).toMatchObject({
+          daily_active_users: 1,
+          total_ai_credits_used: 5.5,
+          loc_added_sum: 10,
+          daily_active_vscode_agent_users: 0,
+        });
+        const featureRequest = handler.getByFeature(
+          'organization',
+          'org-1',
+          day,
+          day,
+          'alpha',
+        );
+        const [feature] = await featureRequest;
+        expect(feature).toMatchObject({
+          loc_added_sum: 10,
+          code_generation_activity_count: 4,
+        });
+        const [customization] = await handler.getCustomizationMetrics(
+          'organization',
+          'org-1',
+          day,
+          day,
+          'alpha',
+        );
+        expect(customization.interaction_count).toBe(7);
+      } finally {
+        knex.client.config.postProcessResponse = previous;
+      }
     });
 
     it('getDailyTotals always returns day as a plain YYYY-MM-DD string, regardless of database driver (regression test for #9540)', async () => {
@@ -3880,6 +4472,7 @@ describe('DatabaseHandlerV2', () => {
         where: jest.fn().mockReturnThis(),
         whereBetween: jest.fn().mockReturnThis(),
         whereRaw: jest.fn().mockReturnThis(),
+        whereExists: jest.fn().mockReturnThis(),
         select: jest.fn().mockResolvedValue(fakeActivityRows),
       };
       const fakeCoverageQuery = {
@@ -4115,7 +4708,7 @@ describe('DatabaseHandlerV2', () => {
         '2026-05-08',
         currentDay,
       ]) {
-        await handler.markCostCenterAggregationDone(
+        await handler.markCostCenterMembershipsDone(
           day,
           'organization',
           'org-1',
@@ -4133,7 +4726,7 @@ describe('DatabaseHandlerV2', () => {
       expect(rows).toHaveLength(1);
       expect(rows[0].weekly_active_users).toBeUndefined();
 
-      await handler.markCostCenterAggregationDone(
+      await handler.markCostCenterMembershipsDone(
         incompleteDay,
         'organization',
         'org-1',
@@ -4342,6 +4935,28 @@ describe('DatabaseHandlerV2', () => {
         buildDailyTotal({ day: '2026-05-03', cost_center_id: 'cc-a' }),
         buildDailyTotal({ day: '2026-05-05', cost_center_id: 'cc-b' }),
       ]);
+      await handler.insertUserMetrics([
+        buildUserMetric({ day: '2026-05-03' }),
+        buildUserMetric({ day: '2026-05-05' }),
+      ]);
+      await handler.upsertUserCostCenters([
+        {
+          day: '2026-05-03',
+          metrics_type: 'organization',
+          entity_id: 'org-1',
+          user_id: 1,
+          user_login: 'octocat',
+          cost_center_id: 'cc-a',
+        },
+        {
+          day: '2026-05-05',
+          metrics_type: 'organization',
+          entity_id: 'org-1',
+          user_id: 1,
+          user_login: 'octocat',
+          cost_center_id: 'cc-b',
+        },
+      ]);
 
       await expect(
         handler.getPeriodRange('organization', 'org-1'),
@@ -4357,7 +4972,7 @@ describe('DatabaseHandlerV2', () => {
       });
     });
 
-    it('replaces team aggregates without deleting cost-center aggregates', async () => {
+    it('replaces team memberships without modifying immutable legacy aggregates', async () => {
       const day = '2026-05-01';
       const scope = {
         day,
@@ -4386,28 +5001,9 @@ describe('DatabaseHandlerV2', () => {
         user_id: 2,
         user_login: 'user-two',
       });
-      await handler.replaceTeamAggregates(
-        day,
-        'enterprise',
-        'ent-1',
-        [newMembership],
-        {
-          dailyTotals: [
-            buildDailyTotal({
-              ...scope,
-              team_slug: 'new-team',
-              daily_active_users: 1,
-            }),
-          ],
-          byFeature: [],
-          byIde: [],
-          byLanguageFeature: [],
-          byModelFeature: [],
-          byLanguageModel: [],
-          customizationMetrics: [],
-          costCenterCustomizationMetrics: [],
-        },
-      );
+      await handler.replaceTeamMemberships(day, 'enterprise', 'ent-1', [
+        newMembership,
+      ]);
 
       const memberships = await knex('copilot_user_teams').where({
         day,
@@ -4423,7 +5019,7 @@ describe('DatabaseHandlerV2', () => {
           team_slug: 'old-team',
           cost_center_id: '',
         }),
-      ).resolves.toHaveLength(0);
+      ).resolves.toHaveLength(1);
       await expect(
         knex('copilot_daily_totals').where({
           ...scope,
@@ -4437,10 +5033,13 @@ describe('DatabaseHandlerV2', () => {
           team_slug: 'new-team',
           cost_center_id: '',
         }),
-      ).resolves.toHaveLength(1);
+      ).resolves.toHaveLength(0);
     });
 
     it('getTeams returns only team slugs with 5 or more distinct members', async () => {
+      await handler.insertUserMetrics(
+        [1, 2, 3, 4, 5].map(user_id => buildUserMetric({ user_id })),
+      );
       // 'alpha' has 5 members — should be returned
       await handler.insertUserTeams([
         buildUserTeam({ team_slug: 'alpha', user_id: 1, user_login: 'u1' }),
@@ -4520,7 +5119,7 @@ describe('DatabaseHandlerV2', () => {
       ]);
       await Promise.all(
         ['2026-05-01', '2026-05-02', '2026-05-03'].map(day =>
-          handler.markCostCenterAggregationDone(day, 'organization', 'org-1'),
+          handler.markCostCenterMembershipsDone(day, 'organization', 'org-1'),
         ),
       );
 
@@ -4612,22 +5211,15 @@ describe('DatabaseHandlerV2', () => {
           without_cost_center: true,
         })),
       );
-      await knex('copilot_metrics_by_feature').insert(
-        [currentDay, incompleteDay].map(day => ({
-          ...scope,
-          day,
-          team_slug: '',
-          cost_center_id: '',
-          without_cost_center: true,
-          feature: 'completion',
-          code_acceptance_activity_count: 1,
-          code_generation_activity_count: 1,
-          loc_added_sum: 1,
-          loc_deleted_sum: 0,
-          loc_suggested_to_add_sum: 0,
-          loc_suggested_to_delete_sum: 0,
-          user_initiated_interaction_count: 1,
-        })),
+      await handler.insertUserMetricsByFeature(
+        [currentDay, incompleteDay].map(day =>
+          buildUserMetricsByFeature({
+            ...scope,
+            day,
+            user_id: day === currentDay ? 1 : 5,
+            feature: 'completion',
+          }),
+        ),
       );
       for (const day of [
         '2026-05-04',
@@ -4637,13 +5229,13 @@ describe('DatabaseHandlerV2', () => {
         '2026-05-08',
         currentDay,
       ]) {
-        await handler.markCostCenterAggregationDone(
+        await handler.markCostCenterMembershipsDone(
           day,
           'organization',
           'org-1',
         );
       }
-      await handler.markCostCenterAggregationDone(
+      await handler.markCostCenterMembershipsDone(
         incompleteDay,
         'organization',
         'org-1',
@@ -4690,7 +5282,7 @@ describe('DatabaseHandlerV2', () => {
         ),
       ).resolves.toBe(false);
 
-      await handler.markCostCenterAggregationDone(
+      await handler.markCostCenterMembershipsDone(
         incompleteDay,
         'organization',
         'org-1',
@@ -4771,7 +5363,7 @@ describe('DatabaseHandlerV2', () => {
         })),
       );
       for (const day of completeDays) {
-        await handler.markCostCenterAggregationDone(
+        await handler.markCostCenterMembershipsDone(
           day,
           'organization',
           'org-1',
@@ -4841,24 +5433,11 @@ describe('DatabaseHandlerV2', () => {
           cost_center_id: 'cc-known',
         }),
       );
-      await handler.replaceCostCenterAggregates(
+      await handler.replaceCostCenterMemberships(
         day,
         'organization',
         'org-1',
         memberships,
-        makeCostCenterAggregateRows(
-          day,
-          [
-            {
-              costCenterId: 'cc-known',
-              teamSlug: '',
-              activeUsers: 5,
-              locAdded: 50,
-            },
-          ],
-          'organization',
-          'org-1',
-        ),
         false,
       );
 
@@ -4882,7 +5461,12 @@ describe('DatabaseHandlerV2', () => {
         { id: 'cc-known', name: 'Known center' },
       ]);
       expect(listing.hasUsersWithoutCostCenter).toBe(false);
-      expect(noCostCenterRows).toHaveLength(0);
+      expect(noCostCenterRows).toHaveLength(1);
+      await expect(
+        handler.getDailyTotals('organization', 'org-1', day, day, undefined, {
+          kind: 'noCostCenter',
+        }),
+      ).resolves.toEqual([]);
       expect(Boolean(completion.unassigned_complete)).toBe(false);
     });
 
@@ -5417,127 +6001,6 @@ function buildDailyTotal(overrides: Partial<V2DailyTotal> = {}): V2DailyTotal {
     loc_suggested_to_delete_sum: 700,
     user_initiated_interaction_count: 33,
     ...overrides,
-  };
-}
-
-function makeCostCenterAggregateRows(
-  day: string,
-  groups: Array<{
-    costCenterId: string;
-    teamSlug: string;
-    activeUsers: number;
-    locAdded: number;
-  }>,
-  metricsType: 'enterprise' | 'organization' = 'enterprise',
-  entityId: string = 'ent-1',
-): CostCenterAggregateRows {
-  const scopes = groups.map(
-    ({ costCenterId, teamSlug, activeUsers, locAdded }) => ({
-      scope: {
-        day,
-        metrics_type: metricsType,
-        entity_id: entityId,
-        team_slug: teamSlug,
-        cost_center_id: costCenterId,
-      },
-      activeUsers,
-      locAdded,
-    }),
-  );
-
-  return {
-    dailyTotals: scopes.map(({ activeUsers, locAdded, scope }) =>
-      buildDailyTotal({
-        ...scope,
-        daily_active_users: activeUsers,
-        loc_added_sum: locAdded,
-      }),
-    ),
-    prMetrics: scopes.map(({ activeUsers, scope }) => ({
-      ...scope,
-      total_created: activeUsers,
-      total_merged: activeUsers,
-      total_reviewed: activeUsers,
-      total_created_by_copilot: activeUsers,
-      total_merged_created_by_copilot: activeUsers,
-      total_merged_reviewed_by_copilot: activeUsers,
-      total_reviewed_by_copilot: activeUsers,
-      total_suggestions: activeUsers,
-      total_applied_suggestions: activeUsers,
-      total_copilot_suggestions: activeUsers,
-      total_copilot_applied_suggestions: activeUsers,
-    })),
-    byFeature: scopes.map(({ activeUsers, locAdded, scope }) => ({
-      ...scope,
-      feature: 'chat_panel',
-      code_acceptance_activity_count: activeUsers,
-      code_generation_activity_count: activeUsers,
-      loc_added_sum: locAdded,
-      loc_deleted_sum: 0,
-      loc_suggested_to_add_sum: 0,
-      loc_suggested_to_delete_sum: 0,
-      user_initiated_interaction_count: activeUsers,
-    })),
-    byIde: scopes.map(({ activeUsers, locAdded, scope }) => ({
-      ...scope,
-      ide: 'vscode',
-      code_acceptance_activity_count: activeUsers,
-      code_generation_activity_count: activeUsers,
-      loc_added_sum: locAdded,
-      loc_deleted_sum: 0,
-      loc_suggested_to_add_sum: 0,
-      loc_suggested_to_delete_sum: 0,
-      user_initiated_interaction_count: activeUsers,
-    })),
-    byLanguageFeature: scopes.map(({ activeUsers, locAdded, scope }) => ({
-      ...scope,
-      language: 'typescript',
-      feature: 'chat_panel',
-      code_acceptance_activity_count: activeUsers,
-      code_generation_activity_count: activeUsers,
-      loc_added_sum: locAdded,
-      loc_deleted_sum: 0,
-      loc_suggested_to_add_sum: 0,
-      loc_suggested_to_delete_sum: 0,
-    })),
-    byModelFeature: scopes.map(({ activeUsers, locAdded, scope }) => ({
-      ...scope,
-      model_id: 'gpt-4o',
-      feature: 'chat_panel',
-      user_initiated_interaction_count: activeUsers,
-      code_generation_activity_count: activeUsers,
-      code_acceptance_activity_count: activeUsers,
-      loc_added_sum: locAdded,
-      loc_deleted_sum: 0,
-      loc_suggested_to_add_sum: 0,
-      loc_suggested_to_delete_sum: 0,
-    })),
-    byLanguageModel: scopes.map(({ activeUsers, locAdded, scope }) => ({
-      ...scope,
-      language: 'typescript',
-      model_id: 'gpt-4o',
-      request_count: activeUsers,
-      code_generation_activity_count: activeUsers,
-      code_acceptance_activity_count: activeUsers,
-      loc_added_sum: locAdded,
-      loc_deleted_sum: 0,
-      loc_suggested_to_add_sum: 0,
-      loc_suggested_to_delete_sum: 0,
-    })),
-    byCli: scopes.map(({ activeUsers, scope }) => ({
-      ...scope,
-      prompt_count: activeUsers,
-      request_count: activeUsers,
-      session_count: activeUsers,
-      avg_tokens_per_request: 1,
-      output_tokens_sum: activeUsers,
-      prompt_tokens_sum: activeUsers,
-    })),
-    byVscodeAgent: scopes.map(({ activeUsers, scope }) => ({
-      ...scope,
-      session_count: activeUsers,
-      total_user_messages: activeUsers * 2,
-    })),
   };
 }
 
