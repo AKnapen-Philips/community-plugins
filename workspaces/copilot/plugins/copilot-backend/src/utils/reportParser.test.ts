@@ -774,6 +774,129 @@ describe('reportParser', () => {
         customizationMetrics: [],
         customizationSummaries: [],
       });
+      expect(
+        parseUserDocument([{}], 'enterprise', 'ent-1').userMetrics,
+      ).toEqual([]);
+    });
+
+    it('strict mode rejects rows that would be skipped or overwritten for another day', () => {
+      const day = '2026-05-10';
+      const validUser = {
+        user_id: 1,
+        user_login: 'octocat',
+        day,
+      };
+      const invalidDocuments = [
+        { nope: true },
+        [null],
+        [{ ...validUser, day: '2026-05-09' }],
+        [{ ...validUser, user_login: '' }],
+        [{ ...validUser, user_id: 0 }],
+        [{ ...validUser, totals_by_feature: 'invalid' }],
+        [{ ...validUser, totals_by_feature: [{}] }],
+        [{ ...validUser, used_chat: 'true' }],
+        [{ ...validUser, loc_added_sum: '12' }],
+        [
+          {
+            ...validUser,
+            totals_by_ide: [{ ide: 'vscode', loc_added_sum: NaN }],
+          },
+        ],
+        [
+          {
+            ...validUser,
+            totals_by_custom_mode: [
+              { custom_mode: 'fast', interaction_count: Infinity },
+            ],
+          },
+        ],
+        [
+          {
+            ...validUser,
+            totals_by_custom_mode: [
+              { custom_mode: 'fast', interaction_count: 0 },
+            ],
+            distinct_custom_mode_use_count: '1',
+          },
+        ],
+      ];
+
+      for (const document of invalidDocuments) {
+        expect(() =>
+          parseUserDocument(document, 'enterprise', 'ent-1', {
+            strict: true,
+            expectedDay: day,
+          }),
+        ).toThrow();
+      }
+
+      for (const dimension of [
+        'totals_by_feature',
+        'totals_by_ide',
+        'totals_by_language_feature',
+        'totals_by_model_feature',
+        'totals_by_language_model',
+      ]) {
+        expect(() =>
+          parseUserDocument(
+            [{ ...validUser, [dimension]: [{}] }],
+            'enterprise',
+            'ent-1',
+            { strict: true, expectedDay: day },
+          ),
+        ).toThrow();
+      }
+    });
+
+    it('strict mode accepts optional dimensions, zero defaults, and new customization categories', () => {
+      const day = '2026-05-10';
+      const result = parseUserDocument(
+        [
+          {
+            user_id: 1,
+            user_login: 'octocat',
+            day,
+            enterprise_id: 'ent-1',
+            organization_id: 'org-1',
+            code_generation_activity_count: null,
+            totals_by_feature: null,
+            totals_by_ide: [],
+            totals_by_language_feature: undefined,
+            totals_by_model_feature: [],
+            totals_by_language_model: [],
+            totals_by_custom_mode: [
+              { custom_mode: 'fast', interaction_count: 0 },
+            ],
+            distinct_custom_mode_use_count: 0,
+            totals_by_future_extension: { ignored: true },
+          },
+        ],
+        'enterprise',
+        'ent-1',
+        { strict: true, expectedDay: day },
+      );
+
+      expect(result.userMetrics[0]).toEqual(
+        expect.objectContaining({
+          code_generation_activity_count: 0,
+          used_agent: false,
+          used_chat: false,
+        }),
+      );
+      expect(result.userBreakdowns[0].byFeature).toEqual([]);
+      expect(result.customizationMetrics).toEqual([
+        expect.objectContaining({
+          category: 'custom_mode',
+          item_name: 'fast',
+          interaction_count: 0,
+        }),
+      ]);
+      expect(result.customizationSummaries).toEqual([
+        expect.objectContaining({
+          category: 'custom_mode',
+          distinct_item_count: 0,
+        }),
+      ]);
     });
   });
 
@@ -812,6 +935,54 @@ describe('reportParser', () => {
       expect(
         parseUserTeamsDocument('invalid', 'organization', 'org-1'),
       ).toEqual([]);
+    });
+
+    it('strict mode rejects incomplete or wrong-day membership rows and accepts empty reports', () => {
+      const day = '2026-05-14';
+      const options = { strict: true, expectedDay: day };
+      expect(
+        parseUserTeamsDocument([], 'enterprise', 'ent-1', options),
+      ).toEqual([]);
+      expect(() =>
+        parseUserTeamsDocument(
+          [{ user_id: 1, user_login: 'octocat', day, team_id: 2 }],
+          'enterprise',
+          'ent-1',
+          options,
+        ),
+      ).toThrow();
+      expect(() =>
+        parseUserTeamsDocument(
+          [
+            {
+              user_id: 1,
+              user_login: 'octocat',
+              day: '2026-05-13',
+              team_id: 2,
+              slug: 'team',
+            },
+          ],
+          'enterprise',
+          'ent-1',
+          options,
+        ),
+      ).toThrow();
+      expect(
+        parseUserTeamsDocument(
+          [
+            {
+              user_id: 1,
+              user_login: 'octocat',
+              day,
+              team_id: 2,
+              slug: 'team',
+            },
+          ],
+          'enterprise',
+          'ent-1',
+          options,
+        ),
+      ).toHaveLength(1);
     });
   });
 });

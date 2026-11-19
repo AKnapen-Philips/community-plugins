@@ -574,7 +574,9 @@ describe('TaskManagementV2', () => {
 
       await task.runBackfill(day, day, 'enterprise', 'ent-1');
 
-      expect(api.downloadNdjsonDocument).toHaveBeenCalledWith('users');
+      expect(api.downloadNdjsonDocument).toHaveBeenCalledWith('users', {
+        strict: true,
+      });
       expect(db.getDaysMissingCostCenterMemberships).toHaveBeenLastCalledWith(
         'enterprise',
         'ent-1',
@@ -691,7 +693,9 @@ describe('TaskManagementV2', () => {
 
     await task.runBackfill(day, day, 'enterprise', 'ent-1');
 
-    expect(api.downloadNdjsonDocument).toHaveBeenCalledWith('users');
+    expect(api.downloadNdjsonDocument).toHaveBeenCalledWith('users', {
+      strict: true,
+    });
     expect(db.insertUserMetrics).not.toHaveBeenCalled();
     expect(db.upsertIngestionLog).not.toHaveBeenCalled();
     expect(db.replaceCostCenterMemberships).toHaveBeenCalledWith(
@@ -2712,6 +2716,97 @@ describe('TaskManagementV2', () => {
     ).toBe(true);
   });
 
+  it.each(['user', 'team'] as const)(
+    'preserves existing history when strict %s repair parsing fails',
+    async input => {
+      const db = createDbMock();
+      const api = createApiMock();
+      const logger = createLoggerMock();
+      const yesterday = DateTime.utc().minus({ days: 1 }).toISODate()!;
+      const days = [2, 1, 0].map(
+        offset =>
+          DateTime.fromISO(yesterday).minus({ days: offset }).toISODate()!,
+      );
+      const repairDay = days[1];
+      configureRecentOrganizationTeamRefresh(db, api, repairDay);
+      api.fetchEnterpriseOrganizationUserReportLinks.mockResolvedValue({
+        download_links: [`users-${repairDay}`],
+      });
+      api.downloadNdjsonDocument.mockImplementation(async (url: string) => {
+        if (url === `users-${repairDay}`) {
+          return input === 'user'
+            ? [
+                ...makeUserMetricsDocument(repairDay),
+                { day: repairDay, user_id: 2 },
+              ]
+            : makeUserMetricsDocument(repairDay);
+        }
+        if (url === `teams-${repairDay}` && input === 'team') {
+          return [
+            {
+              ...makeUserTeamsDocument(repairDay)[0],
+              team_id: 0,
+            },
+          ];
+        }
+        return makeUserTeamsDocument(url.replace(/^teams-/, ''));
+      });
+      const task = TaskManagementV2.create({
+        db: db as unknown as DatabaseHandlerV2,
+        api: api as unknown as GithubClientV2,
+        config: createConfigMock({
+          'copilot.enterprise': 'ent-1',
+          'copilot.backfillDelayMs': 0,
+          'copilot.ingestOrganizationTeamReports': true,
+        }),
+        logger,
+      });
+
+      await task.runAsync();
+
+      expect(api.downloadNdjsonDocument).toHaveBeenCalledWith(
+        `users-${repairDay}`,
+        { strict: true },
+      );
+      const teamReportWasDownloadedStrictly =
+        api.downloadNdjsonDocument.mock.calls.some(
+          ([url, options]) =>
+            url === `teams-${repairDay}` &&
+            (options as { strict?: boolean } | undefined)?.strict === true,
+        );
+      expect(teamReportWasDownloadedStrictly).toBe(input === 'team');
+      expect(db.deleteUserReportForDay).not.toHaveBeenCalled();
+      expect(
+        db.insertUserMetrics.mock.calls.some(([rows]) =>
+          rows.some((row: { day: string }) => row.day === repairDay),
+        ),
+      ).toBe(false);
+      expect(
+        db.replaceTeamMemberships.mock.calls.some(([day]) => day === repairDay),
+      ).toBe(false);
+      const repairLog = db.upsertIngestionLog.mock.calls.find(
+        ([row]) => row.day === repairDay,
+      );
+      expect(repairLog?.[0]).toEqual(
+        expect.objectContaining({
+          status: 'error',
+          components_loaded: '["totals","users","teams"]',
+        }),
+      );
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.stringContaining(
+          `Failed ingest for organization:org-a on ${repairDay}`,
+        ),
+        expect.any(Error),
+      );
+      expect(
+        db.updateEnterpriseOrganizationState.mock.calls.some(
+          ([, state]) => state.nextAttemptAt instanceof Date,
+        ),
+      ).toBe(true);
+    },
+  );
+
   it.each(['per-user', 'user-teams'])(
     'routes inaccessible %s report errors through organization handling during repair',
     async report => {
@@ -2928,12 +3023,13 @@ describe('TaskManagementV2', () => {
     const repairLog = db.upsertIngestionLog.mock.calls.find(
       ([row]) => row.day === repairDay,
     );
-    expect(repairLog?.[0].status).toBe('partial');
+    expect(repairLog?.[0].status).toBe('error');
     expect(repairLog?.[0].components_loaded).not.toContain('userBreakdowns');
-    expect(logger.warn).toHaveBeenCalledWith(
+    expect(repairLog?.[0].error_message).toBe('download failed');
+    expect(logger.error).toHaveBeenCalledWith(
       expect.stringContaining(repairDay),
+      expect.any(Error),
     );
-    expect(logger.error).not.toHaveBeenCalled();
   });
 
   it('skips discovered organization backfills when every requested day is complete', async () => {
