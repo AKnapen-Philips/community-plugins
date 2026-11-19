@@ -1296,17 +1296,13 @@ export class TaskManagementV2 {
               )));
         if (!reuseStoredReport) {
           if (requiresUserBreakdownRepair) {
-            try {
-              userReport = await this.prepareUserReports(
-                day,
-                metricsType,
-                entityId,
-                context.organizationReportTarget,
-              );
-              userBreakdownRepairReady = userReport.loaded;
-            } catch {
-              userBreakdownRepairReady = false;
-            }
+            userReport = await this.prepareUserReports(
+              day,
+              metricsType,
+              entityId,
+              context.organizationReportTarget,
+            );
+            userBreakdownRepairReady = userReport.loaded;
           } else {
             userReport = await this.prepareUserReports(
               day,
@@ -1322,18 +1318,14 @@ export class TaskManagementV2 {
         ) {
           if (requiresUserBreakdownRepair) {
             if (userBreakdownRepairReady && userReport?.loaded) {
-              try {
-                preparedTeams = await this.prepareTeamMemberships(
-                  day,
-                  metricsType,
-                  entityId,
-                  true,
-                  context.organizationReportTarget,
-                );
-                userBreakdownRepairReady = preparedTeams !== undefined;
-              } catch {
-                userBreakdownRepairReady = false;
-              }
+              preparedTeams = await this.prepareTeamMemberships(
+                day,
+                metricsType,
+                entityId,
+                true,
+                context.organizationReportTarget,
+              );
+              userBreakdownRepairReady = preparedTeams !== undefined;
             }
           } else {
             preparedTeams = await this.prepareTeamMemberships(

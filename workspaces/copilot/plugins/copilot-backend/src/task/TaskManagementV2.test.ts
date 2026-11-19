@@ -1935,6 +1935,98 @@ describe('TaskManagementV2', () => {
     ).toBe(true);
   });
 
+  it.each(['per-user', 'user-teams'])(
+    'routes inaccessible %s report errors through organization handling during repair',
+    async report => {
+      const db = createDbMock();
+      const api = createApiMock();
+      const logger = createLoggerMock();
+      const accessError = new InaccessibleEnterpriseOrganizationError();
+      const yesterday = DateTime.utc().minus({ days: 1 }).toISODate()!;
+      const days = [2, 1, 0].map(
+        offset =>
+          DateTime.fromISO(yesterday).minus({ days: offset }).toISODate()!,
+      );
+      const repairDay = days[1];
+      configureRecentOrganizationTeamRefresh(db, api, repairDay);
+
+      if (report === 'per-user') {
+        api.fetchEnterpriseOrganizationUserReportLinks.mockRejectedValue(
+          accessError,
+        );
+      } else {
+        api.fetchEnterpriseOrganizationUserReportLinks.mockResolvedValue({
+          download_links: [`users-${repairDay}`],
+        });
+        api.downloadNdjsonDocument.mockImplementation(async (url: string) =>
+          url === `users-${repairDay}`
+            ? makeUserMetricsDocument(repairDay)
+            : makeUserTeamsDocument(url.replace(/^teams-/, '')),
+        );
+        api.fetchEnterpriseOrganizationUserTeamsLinks.mockImplementation(
+          async (_organization: string, day: string) => {
+            if (day === repairDay) {
+              throw accessError;
+            }
+            return { download_links: [`teams-${day}`] };
+          },
+        );
+      }
+
+      const task = TaskManagementV2.create({
+        db: db as unknown as DatabaseHandlerV2,
+        api: api as unknown as GithubClientV2,
+        config: createConfigMock({
+          'copilot.enterprise': 'ent-1',
+          'copilot.backfillDelayMs': 0,
+          'copilot.ingestOrganizationTeamReports': true,
+        }),
+        logger,
+      });
+
+      await task.runAsync();
+
+      expect(
+        api.fetchEnterpriseOrganizationUserReportLinks,
+      ).toHaveBeenCalledWith('org-a', repairDay);
+      expect(db.deleteUserReportForDay).not.toHaveBeenCalled();
+      expect(
+        db.insertUserMetrics.mock.calls.some(([rows]) =>
+          rows.some((row: { day: string }) => row.day === repairDay),
+        ),
+      ).toBe(false);
+      expect(
+        db.replaceTeamMemberships.mock.calls.some(([day]) => day === repairDay),
+      ).toBe(false);
+      const repairLog = db.upsertIngestionLog.mock.calls.find(
+        ([row]) => row.day === repairDay,
+      );
+      expect(repairLog?.[0]).toEqual(
+        expect.objectContaining({
+          status: 'error',
+          components_loaded: '["totals","users","teams"]',
+        }),
+      );
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.stringContaining(
+          `Failed ingest for organization:org-a on ${repairDay}`,
+        ),
+        accessError,
+      );
+      expect(db.updateEnterpriseOrganizationState).toHaveBeenCalledWith(
+        'ent-1',
+        'org-a',
+        expect.objectContaining({ accessState: 'inaccessible' }),
+        expect.any(Date),
+      );
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining(
+          'Organization-team ingestion is inaccessible for organization:org-a',
+        ),
+      );
+    },
+  );
+
   it('does not commit a complete user report when refreshed memberships are unavailable', async () => {
     const db = createDbMock();
     const api = createApiMock();
