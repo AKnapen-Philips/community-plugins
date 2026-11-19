@@ -556,6 +556,7 @@ export class TaskManagementV2 {
                 plan.missingCostCenterDays.includes(day) ||
                   retryIncompleteDays.includes(day) ||
                   loadedUserReportDays.has(day),
+                refreshedUserReportDays.has(day),
                 organizationLease,
               );
             } catch (error) {
@@ -901,7 +902,9 @@ export class TaskManagementV2 {
               missingCostCenterDays.includes(day) ||
                 retryIncompleteDays.includes(day) ||
                 loadedUserReportDays.has(day),
+              refreshedUserReportDays.has(day),
               organizationLease,
+              discoveredOrganization,
             );
           } catch (error) {
             if (error instanceof OrganizationIngestionLeaseLostError) {
@@ -1323,6 +1326,7 @@ export class TaskManagementV2 {
     entityId: string,
     snapshot: CostCenterMembershipSnapshot,
     markEmptyDay: boolean,
+    refreshForUserReport: boolean,
     organizationLease?: OrganizationIngestionLease,
     organizationReportTarget?: string,
   ): Promise<boolean> {
@@ -1397,7 +1401,8 @@ export class TaskManagementV2 {
             );
           if (
             !missingDays.includes(day) &&
-            !(snapshot.unassignedComplete && incompleteDays.includes(day))
+            !(snapshot.unassignedComplete && incompleteDays.includes(day)) &&
+            !(refreshForUserReport && snapshot.complete)
           ) {
             return false;
           }
