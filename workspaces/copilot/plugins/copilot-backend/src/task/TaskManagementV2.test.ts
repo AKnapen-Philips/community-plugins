@@ -182,6 +182,85 @@ describe('TaskManagementV2', () => {
     expect(logger.error).not.toHaveBeenCalled();
   });
 
+  it('preserves a concurrent successful commit when another worker fails during preparation', async () => {
+    const db = createDbMock();
+    const failingApi = createApiMock();
+    const successfulApi = createApiMock();
+    const logger = createLoggerMock();
+    const day = '2026-05-10';
+    const failure = new Error('Failed to download totals');
+    let announceFetchStarted!: () => void;
+    const fetchStarted = new Promise<void>(resolve => {
+      announceFetchStarted = resolve;
+    });
+    let rejectReport!: (error: Error) => void;
+    const pendingReport = new Promise<never>((_resolve, reject) => {
+      rejectReport = reject;
+    });
+    let committedLog: {
+      status?: string;
+      components_loaded: string;
+      error_message?: string;
+      source?: string;
+    } = {
+      status: 'partial',
+      components_loaded: '[]',
+    };
+
+    db.getMissingDays.mockResolvedValue([day]);
+    db.getIngestionLog.mockResolvedValue([
+      { status: 'partial', components_loaded: '[]' },
+    ]);
+    db.withIngestionDay.mockImplementation(
+      async (_day, _scope, _entity, operation) => operation({}, committedLog),
+    );
+    db.upsertIngestionLog.mockImplementation(async log => {
+      committedLog = log;
+    });
+    failingApi.fetchEnterpriseReportLinks.mockImplementation(() => {
+      announceFetchStarted();
+      return pendingReport;
+    });
+    successfulApi.fetchEnterpriseReportLinks.mockResolvedValue({
+      download_links: ['totals'],
+    });
+    successfulApi.downloadDocument.mockResolvedValue(
+      makeEnterpriseDocument(day),
+    );
+
+    const createTask = (api: ReturnType<typeof createApiMock>) =>
+      TaskManagementV2.create({
+        db: db as unknown as DatabaseHandlerV2,
+        api: api as unknown as GithubClientV2,
+        config: createConfigMock({
+          'copilot.enterprise': 'ent-1',
+          'copilot.backfillDelayMs': 0,
+        }),
+        logger,
+      });
+    const failingTask = createTask(failingApi);
+    const successfulTask = createTask(successfulApi);
+
+    const failingRun = failingTask.runBackfill(day, day, 'enterprise', 'ent-1');
+    await fetchStarted;
+    await successfulTask.runBackfill(day, day, 'enterprise', 'ent-1');
+    expect(committedLog.status).toBe('success');
+
+    rejectReport(failure);
+    await failingRun;
+
+    expect(db.withIngestionDay).toHaveBeenCalledTimes(2);
+    expect(db.upsertIngestionLog).toHaveBeenCalledTimes(1);
+    expect(committedLog).toEqual(
+      expect.objectContaining({
+        status: 'success',
+        components_loaded: '["totals"]',
+        source: 'backfill',
+      }),
+    );
+    expect(committedLog.error_message).toBeUndefined();
+  });
+
   it.each(['totals', 'users', 'teams'])(
     'keeps only previously committed components when a later %s file fails to download',
     async component => {

@@ -1481,19 +1481,35 @@ export class TaskManagementV2 {
         error,
       );
 
-      await db.withIngestionDay(day, metricsType, entityId, transaction =>
-        db.upsertIngestionLog(
-          {
-            day,
-            metrics_type: metricsType,
-            entity_id: entityId,
-            status: 'error',
-            components_loaded: JSON.stringify([...previouslyLoaded]),
-            error_message: message,
-            source: context.source,
-          },
-          transaction,
-        ),
+      const failureState = await db.withIngestionDay(
+        day,
+        metricsType,
+        entityId,
+        async (transaction, existingLog) => {
+          const componentsLoaded = parseComponentsLoaded(
+            existingLog.components_loaded,
+          );
+          const alreadyComplete =
+            existingLog.status === 'success' &&
+            requiredComponents.every(component =>
+              componentsLoaded.includes(component),
+            );
+          if (!alreadyComplete) {
+            await db.upsertIngestionLog(
+              {
+                day,
+                metrics_type: metricsType,
+                entity_id: entityId,
+                status: 'error',
+                components_loaded: JSON.stringify(componentsLoaded),
+                error_message: message,
+                source: context.source,
+              },
+              transaction,
+            );
+          }
+          return { alreadyComplete, componentsLoaded };
+        },
       );
       if (
         context.organizationReportTarget &&
@@ -1502,10 +1518,13 @@ export class TaskManagementV2 {
         throw error;
       }
       return {
-        loaded: false,
+        loaded:
+          failureState.alreadyComplete &&
+          context.ingestUsers &&
+          failureState.componentsLoaded.includes('users'),
         refreshed: false,
-        complete: false,
-        totalsLoaded: previouslyLoaded.has('totals'),
+        complete: failureState.alreadyComplete,
+        totalsLoaded: failureState.componentsLoaded.includes('totals'),
       };
     }
   }
