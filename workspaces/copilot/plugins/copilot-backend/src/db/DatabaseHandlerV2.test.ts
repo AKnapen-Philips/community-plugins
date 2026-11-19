@@ -3959,7 +3959,7 @@ describe('DatabaseHandlerV2', () => {
       ).toBe(7);
     });
 
-    it('preserves legacy team detail until the matching breakdown or whole-day completion marker', async () => {
+    it('selects legacy breakdowns day-wide unless raw breakdowns are complete', async () => {
       const days = [
         '2026-05-01',
         '2026-05-02',
@@ -3991,6 +3991,7 @@ describe('DatabaseHandlerV2', () => {
             team_slug: 'alpha',
             user_id: 0,
             user_login: '',
+            item_name: 'legacy',
             interaction_count: 99,
           }),
         ),
@@ -3998,68 +3999,130 @@ describe('DatabaseHandlerV2', () => {
       await handler.insertDailyTotals(
         days.map(day => buildDailyTotal({ day, team_slug: 'alpha' })),
       );
-      await handler.insertUserMetrics(
-        days.slice(0, 3).map(day => buildUserMetric({ day })),
-      );
-      await handler.insertUserTeams(days.map(day => buildUserTeam({ day })));
+      await handler.insertUserMetrics([
+        ...days.slice(0, 3).map(day => buildUserMetric({ day })),
+        buildUserMetric({
+          day: days[0],
+          user_id: 2,
+          user_login: 'beta-user',
+        }),
+        buildUserMetric({
+          day: days[3],
+          user_id: 2,
+          user_login: 'beta-user',
+        }),
+      ]);
+      await handler.insertUserTeams([
+        ...days.slice(0, 3).map(day => buildUserTeam({ day })),
+        buildUserTeam({
+          day: days[0],
+          user_id: 2,
+          user_login: 'beta-user',
+          team_id: 200,
+          team_slug: 'beta',
+        }),
+        buildUserTeam({
+          day: days[3],
+          user_id: 2,
+          user_login: 'beta-user',
+          team_id: 200,
+          team_slug: 'beta',
+        }),
+      ]);
       await handler.insertUserMetricsByFeature([
         buildUserMetricsByFeature(),
+        buildUserMetricsByFeature({
+          day: days[0],
+          user_id: 2,
+          user_login: 'beta-user',
+          feature: 'raw-only',
+        }),
+        buildUserMetricsByFeature({ day: days[1] }),
         buildUserMetricsByFeature({ day: days[3], entity_id: 'other' }),
-        buildUserMetricsByFeature({ day: days[3], metrics_type: 'enterprise' }),
+        buildUserMetricsByFeature({
+          day: days[3],
+          metrics_type: 'enterprise',
+        }),
       ]);
-      // Another dimension, even for an inactive user, does not replace features.
       await handler.insertUserMetricsByIde([
         buildUserMetricsByIde({ day: days[1], user_id: 55 }),
       ]);
+      await handler.insertCustomizationMetrics([
+        buildCustomizationMetric({
+          day: days[1],
+          item_name: 'raw-authoritative',
+          interaction_count: 7,
+        }),
+        buildCustomizationMetric({
+          day: days[3],
+          user_id: 2,
+          user_login: 'beta-user',
+          item_name: 'partial-customization',
+          interaction_count: 5,
+        }),
+      ]);
+      await handler.upsertIngestionLog(
+        buildIngestionLog({
+          day: days[1],
+          components_loaded: '["userBreakdowns"]',
+        }),
+      );
       await handler.upsertIngestionLog(
         buildIngestionLog({
           day: days[2],
           components_loaded: '["users"]',
         }),
       );
-      await handler.insertCustomizationMetrics([
-        buildCustomizationMetric({
-          day: days[2],
-          scope: 'team',
-          team_slug: 'beta',
-          user_id: 0,
-          user_login: '',
-          category: 'prompt',
-          item_name: 'raw-team',
+      await handler.upsertIngestionLog(
+        buildIngestionLog({
+          day: days[4],
+          components_loaded: '["userBreakdowns"]',
         }),
-      ]);
-      const featuresRequest = handler.getByFeature(
-        'organization',
-        'org-1',
-        days[0],
-        days[4],
-        'alpha',
       );
-      const features = await featuresRequest;
       expect(
-        features.map(row => [row.day, row.feature, row.loc_added_sum]),
+        (
+          await handler.getByFeature(
+            'organization',
+            'org-1',
+            days[0],
+            days[4],
+            'alpha',
+          )
+        ).map(row => [row.day, row.feature, row.loc_added_sum]),
       ).toEqual([
-        [days[0], 'chat_panel', 10],
-        [days[1], 'legacy', 99],
+        [days[0], 'legacy', 99],
+        [days[1], 'chat_panel', 10],
         [days[2], 'legacy', 99],
         [days[3], 'legacy', 99],
-        [days[4], 'legacy', 99],
       ]);
+      await expect(
+        handler.getByFeature('organization', 'org-1', days[0], days[0], 'beta'),
+      ).resolves.toEqual([]);
       expect(
-        await handler.getCustomizationMetrics(
+        (
+          await handler.getCustomizationMetrics(
+            'organization',
+            'org-1',
+            days[0],
+            days[4],
+            'alpha',
+          )
+        ).map(row => [row.day, row.item_name, row.interaction_count]),
+      ).toEqual([
+        [days[0], 'legacy', 99],
+        [days[1], 'raw-authoritative', 7],
+        [days[2], 'legacy', 99],
+        [days[3], 'legacy', 99],
+      ]);
+      await expect(
+        handler.getCustomizationMetrics(
           'organization',
           'org-1',
-          days[0],
-          days[4],
-          'alpha',
+          days[3],
+          days[3],
+          'beta',
         ),
-      ).toEqual([
-        expect.objectContaining({ day: days[0], interaction_count: 99 }),
-        expect.objectContaining({ day: days[1], interaction_count: 99 }),
-        expect.objectContaining({ day: days[2], interaction_count: 99 }),
-        expect.objectContaining({ day: days[3], interaction_count: 99 }),
-        expect.objectContaining({ day: days[4], interaction_count: 99 }),
-      ]);
+      ).resolves.toEqual([]);
       expect(
         (
           await handler.getDailyTotals(
@@ -4071,68 +4134,187 @@ describe('DatabaseHandlerV2', () => {
           )
         ).map(row => row.daily_active_users),
       ).toEqual([1, 1, 1]);
-      await handler.replaceTeamMemberships(
-        days[3],
-        'organization',
-        'org-1',
-        [],
-      );
-      const retainedLegacy = handler.getByFeature(
-        'organization',
-        'org-1',
-        days[3],
-        days[3],
-        'alpha',
-      );
-      expect((await retainedLegacy)[0].loc_added_sum).toBe(99);
-      await handler.insertCustomizationMetrics([
-        buildCustomizationMetric({ day: days[3] }),
+    });
+
+    it('deletes only the selected day user report rows during a repair', async () => {
+      const day = '2026-05-01';
+      const otherDay = '2026-04-30';
+      const otherEntityMetric = buildUserMetric({
+        day,
+        entity_id: 'other',
+        user_id: 2,
+      });
+      await handler.insertUserMetrics([
+        buildUserMetric({ day }),
+        otherEntityMetric,
+        buildUserMetric({ day: otherDay }),
       ]);
-      await expect(
-        handler.getByFeature(
-          'organization',
-          'org-1',
-          days[3],
-          days[3],
-          'alpha',
-        ),
-      ).resolves.toEqual([expect.objectContaining({ feature: 'legacy' })]);
-      await expect(
-        handler.getCustomizationMetrics(
-          'organization',
-          'org-1',
-          days[3],
-          days[3],
-          'alpha',
-        ),
-      ).resolves.toEqual([]);
-      await handler.upsertIngestionLog(
-        buildIngestionLog({
-          day: days[4],
-          components_loaded: '["userBreakdowns"]',
+      await handler.insertUserMetricsByFeature([
+        buildUserMetricsByFeature({ day }),
+        buildUserMetricsByFeature({ day, entity_id: 'other', user_id: 2 }),
+        buildUserMetricsByFeature({ day: otherDay }),
+      ]);
+      await handler.insertUserMetricsByIde([
+        buildUserMetricsByIde({ day }),
+        buildUserMetricsByIde({ day: otherDay }),
+      ]);
+      await handler.insertUserMetricsByLanguageFeature([
+        buildUserMetricsByLanguageFeature({ day }),
+        buildUserMetricsByLanguageFeature({ day: otherDay }),
+      ]);
+      await handler.insertUserMetricsByModelFeature([
+        buildUserMetricsByModelFeature({ day }),
+        buildUserMetricsByModelFeature({ day: otherDay }),
+      ]);
+      await handler.insertUserMetricsByLanguageModel([
+        buildUserMetricsByLanguageModel({ day }),
+        buildUserMetricsByLanguageModel({ day: otherDay }),
+      ]);
+      await handler.insertCustomizationMetrics([
+        buildCustomizationMetric({ day, item_name: 'user-row' }),
+        buildCustomizationMetric({
+          day: otherDay,
+          item_name: 'other-day-row',
         }),
+        buildCustomizationMetric({
+          day,
+          scope: 'team',
+          team_slug: 'alpha',
+          user_id: 0,
+          user_login: '',
+          item_name: 'team-row',
+        }),
+        buildCustomizationMetric({
+          day,
+          entity_id: 'other',
+          user_id: 2,
+          item_name: 'other-entity-row',
+        }),
+      ]);
+      await handler.insertCustomizationSummaries([
+        buildCustomizationSummary({ day }),
+        buildCustomizationSummary({ day: otherDay }),
+        buildCustomizationSummary({
+          day,
+          scope: 'team',
+          team_slug: 'alpha',
+          user_id: 0,
+          user_login: '',
+        }),
+        buildCustomizationSummary({
+          day,
+          entity_id: 'other',
+          user_id: 2,
+        }),
+      ]);
+
+      await knex.transaction(async transaction =>
+        handler.deleteUserReportForDay(
+          day,
+          'organization',
+          'org-1',
+          transaction,
+        ),
       );
+
       await expect(
-        handler.getByFeature(
-          'organization',
-          'org-1',
-          days[4],
-          days[4],
-          'alpha',
-        ),
-      ).resolves.toEqual([]);
+        knex('copilot_user_metrics').where({
+          day,
+          metrics_type: 'organization',
+          entity_id: 'org-1',
+        }),
+      ).resolves.toHaveLength(0);
       await expect(
-        handler.getCustomizationMetrics(
-          'organization',
-          'org-1',
-          days[4],
-          days[4],
-          'alpha',
-        ),
-      ).resolves.toEqual([]);
+        knex('copilot_user_metrics').where({
+          day: otherDay,
+          metrics_type: 'organization',
+          entity_id: 'org-1',
+        }),
+      ).resolves.toHaveLength(1);
+      for (const table of [
+        'copilot_user_metrics_by_feature',
+        'copilot_user_metrics_by_ide',
+        'copilot_user_metrics_by_language_feature',
+        'copilot_user_metrics_by_model_feature',
+        'copilot_user_metrics_by_language_model',
+      ]) {
+        await expect(
+          knex(table).where({
+            day,
+            metrics_type: 'organization',
+            entity_id: 'org-1',
+          }),
+        ).resolves.toHaveLength(0);
+        await expect(
+          knex(table).where({
+            day: otherDay,
+            metrics_type: 'organization',
+            entity_id: 'org-1',
+          }),
+        ).resolves.toHaveLength(1);
+      }
       await expect(
-        knex('copilot_metrics_by_feature').where({ team_slug: 'alpha' }),
-      ).resolves.toHaveLength(5);
+        knex('copilot_user_metrics').where({
+          day,
+          metrics_type: 'organization',
+          entity_id: 'other',
+        }),
+      ).resolves.toHaveLength(1);
+      await expect(
+        knex('copilot_customization_metrics').where({
+          day,
+          metrics_type: 'organization',
+          entity_id: 'org-1',
+          scope: 'user',
+        }),
+      ).resolves.toHaveLength(0);
+      await expect(
+        knex('copilot_customization_metrics').where({
+          day: otherDay,
+          metrics_type: 'organization',
+          entity_id: 'org-1',
+          scope: 'user',
+        }),
+      ).resolves.toHaveLength(1);
+      await expect(
+        knex('copilot_customization_summaries').where({
+          day,
+          metrics_type: 'organization',
+          entity_id: 'org-1',
+          scope: 'user',
+        }),
+      ).resolves.toHaveLength(0);
+      await expect(
+        knex('copilot_customization_summaries').where({
+          day: otherDay,
+          metrics_type: 'organization',
+          entity_id: 'org-1',
+          scope: 'user',
+        }),
+      ).resolves.toHaveLength(1);
+      await expect(
+        knex('copilot_customization_metrics').where({
+          day,
+          metrics_type: 'organization',
+          entity_id: 'org-1',
+          scope: 'team',
+        }),
+      ).resolves.toHaveLength(1);
+      await expect(
+        knex('copilot_customization_summaries').where({
+          day,
+          metrics_type: 'organization',
+          entity_id: 'org-1',
+          scope: 'team',
+        }),
+      ).resolves.toHaveLength(1);
+      await expect(
+        knex('copilot_customization_metrics').where({
+          day,
+          metrics_type: 'organization',
+          entity_id: 'other',
+        }),
+      ).resolves.toHaveLength(1);
     });
 
     it('preserves complete memberships when an incoming refresh cannot confirm unassigned users', async () => {

@@ -1373,6 +1373,31 @@ export class DatabaseHandlerV2 {
     });
   }
 
+  async deleteUserReportForDay(
+    day: string,
+    metricsType: MetricsScope,
+    entityId: string,
+    transaction: Knex.Transaction,
+  ): Promise<void> {
+    const scope = { day, metrics_type: metricsType, entity_id: entityId };
+    for (const table of [
+      'copilot_user_metrics_by_feature',
+      'copilot_user_metrics_by_ide',
+      'copilot_user_metrics_by_language_feature',
+      'copilot_user_metrics_by_model_feature',
+      'copilot_user_metrics_by_language_model',
+    ]) {
+      await transaction(table).where(scope).del();
+    }
+    await transaction('copilot_customization_metrics')
+      .where({ ...scope, scope: 'user' })
+      .del();
+    await transaction('copilot_customization_summaries')
+      .where({ ...scope, scope: 'user' })
+      .del();
+    await transaction('copilot_user_metrics').where(scope).del();
+  }
+
   async upsertCostCenters(rows: V2CostCenterRow[]): Promise<void> {
     if (!rows.length) {
       return;

@@ -90,23 +90,7 @@ export function filterScopedUsers(
   }
 }
 
-/**
- * Legacy team detail remains a fallback until its matching raw dimension is
- * present. A completed userBreakdowns log makes the whole day authoritative.
- */
-function onlyLegacyDays(
-  db: Knex,
-  query: Knex.QueryBuilder,
-  rawTable: string,
-  customization: boolean,
-) {
-  query.whereNotExists(function rawBreakdowns() {
-    this.select(db.raw('1')).from(`${rawTable} as raw`);
-    correlate(this, 'raw', 'legacy', false);
-    if (customization) {
-      this.where('raw.scope', 'user');
-    }
-  });
+function withoutCompletedBreakdownDays(db: Knex, query: Knex.QueryBuilder) {
   const textType = String(db.client.config.client).includes('mysql')
     ? 'CHAR'
     : 'TEXT';
@@ -118,6 +102,12 @@ function onlyLegacyDays(
       '%"userBreakdowns"%',
     ]);
   });
+}
+
+function metricDayKey(day: unknown): string {
+  return day instanceof Date
+    ? day.toISOString().slice(0, 10)
+    : String(day).slice(0, 10);
 }
 
 export async function readScopedMetrics<T>(
@@ -211,7 +201,7 @@ export async function readScopedMetrics<T>(
     ...Object.keys(counts),
     ...(daily ? ['daily_active_users', 'total_ai_credits_used'] : []),
   ];
-  const rows = (await query).map(row => {
+  let rows = (await query).map(row => {
     for (const column of numeric) {
       row[column] = Number(row[column]);
     }
@@ -238,9 +228,9 @@ export async function readScopedMetrics<T>(
       .where({
         'legacy.metrics_type': metricsType,
         'legacy.entity_id': entityId,
-        'legacy.team_slug': teamSlug,
       })
-      .whereBetween('legacy.day', [from, to]);
+      .whereBetween('legacy.day', [from, to])
+      .whereNot('legacy.team_slug', '');
     if (customization) {
       legacy.where('legacy.scope', 'team');
     } else {
@@ -248,11 +238,18 @@ export async function readScopedMetrics<T>(
         .where('legacy.cost_center_id', '')
         .where('legacy.without_cost_center', false);
     }
-    if (feature !== undefined) {
-      legacy.where('legacy.feature', feature);
-    }
-    onlyLegacyDays(db, legacy, table, customization);
-    rows.push(...(await legacy.select('legacy.*')));
+    withoutCompletedBreakdownDays(db, legacy);
+    // Select legacy days across teams before filtering rows to the requested team.
+    const legacyRows = await legacy.select('legacy.*');
+    const legacyDays = new Set(legacyRows.map(row => metricDayKey(row.day)));
+    rows = rows.filter(row => !legacyDays.has(metricDayKey(row.day)));
+    rows.push(
+      ...legacyRows.filter(
+        row =>
+          row.team_slug === teamSlug &&
+          (customization || feature === undefined || row.feature === feature),
+      ),
+    );
   }
   return rows.sort(
     (left, right) =>
