@@ -410,6 +410,7 @@ export class TaskManagementV2 {
               plan.missingCostCenterDays.includes(day) ||
                 retryIncompleteDays.includes(day) ||
                 loadedUserReportDays.has(day),
+              refreshedUserReportDays.has(day),
             );
           } catch (error) {
             logger.error(
@@ -682,6 +683,7 @@ export class TaskManagementV2 {
               missingCostCenterDays.includes(day) ||
                 retryIncompleteDays.includes(day) ||
                 loadedUserReportDays.has(day),
+              refreshedUserReportDays.has(day),
             );
           } catch (error) {
             logger.error(
@@ -1042,6 +1044,7 @@ export class TaskManagementV2 {
     entityId: string,
     snapshot: CostCenterMembershipSnapshot,
     markEmptyDay: boolean,
+    refreshForUserReport: boolean,
   ): Promise<boolean> {
     const { db } = this.options;
     const storedUserMetrics = await db.getUserMetricsForDay(
@@ -1107,7 +1110,8 @@ export class TaskManagementV2 {
           );
         if (
           !missingDays.includes(day) &&
-          !(snapshot.unassignedComplete && incompleteDays.includes(day))
+          !(snapshot.unassignedComplete && incompleteDays.includes(day)) &&
+          !(refreshForUserReport && snapshot.complete)
         ) {
           return false;
         }

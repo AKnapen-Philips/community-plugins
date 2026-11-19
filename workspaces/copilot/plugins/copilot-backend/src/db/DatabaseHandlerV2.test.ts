@@ -2745,6 +2745,53 @@ describe('DatabaseHandlerV2', () => {
       ).resolves.toHaveLength(4);
     });
 
+    it('preserves complete memberships when an incoming refresh cannot confirm unassigned users', async () => {
+      const day = '2026-05-01';
+      const scope = {
+        day,
+        metrics_type: 'organization' as const,
+        entity_id: 'org-1',
+      };
+      const existing = {
+        ...scope,
+        user_id: 1,
+        user_login: 'octocat',
+        cost_center_id: 'cc-a',
+      };
+      const incompleteRefresh = {
+        ...scope,
+        user_id: 2,
+        user_login: 'new-user',
+        cost_center_id: 'cc-b',
+      };
+
+      await handler.replaceCostCenterMemberships(day, 'organization', 'org-1', [
+        existing,
+      ]);
+      await handler.replaceCostCenterMemberships(
+        day,
+        'organization',
+        'org-1',
+        [incompleteRefresh],
+        false,
+      );
+
+      const memberships = await knex('copilot_user_cost_centers')
+        .where(scope)
+        .select('user_id', 'cost_center_id');
+      expect(memberships).toHaveLength(1);
+      expect(Number(memberships[0].user_id)).toBe(1);
+      expect(memberships[0].cost_center_id).toBe('cc-a');
+      await expect(
+        handler.getDaysWithIncompleteCostCenterMemberships(
+          'organization',
+          'org-1',
+          day,
+          day,
+        ),
+      ).resolves.toEqual([]);
+    });
+
     it('validates full membership scopes and rolls back replacements with completion evidence', async () => {
       const day = '2026-05-01';
       const member = {

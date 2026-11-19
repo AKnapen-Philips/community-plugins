@@ -582,6 +582,70 @@ describe('TaskManagementV2', () => {
     },
   );
 
+  it.each([true, false])(
+    'refreshes completed cost-center membership after user-report refresh and passes completeness to the database guard (unassigned complete=%s)',
+    async unassignedComplete => {
+      const db = createDbMock();
+      const api = createApiMock();
+      const day = '2026-05-10';
+      db.getMissingDays.mockResolvedValue([day]);
+      db.getDaysMissingCostCenterMemberships.mockResolvedValue([]);
+      db.getDaysWithIncompleteCostCenterMemberships.mockResolvedValue([]);
+      db.getUserMetricsForDay.mockResolvedValue([makeStoredUserMetric(day)]);
+      db.getUserBreakdownsForDay.mockResolvedValue([
+        makeStoredUserBreakdown(1, 'octocat'),
+      ]);
+      api.fetchCostCenterMemberships.mockResolvedValue({
+        ...makeCostCenterSnapshot(
+          new Map([
+            [1, { costCenterId: 'cc-1', login: 'octocat' }],
+            [2, { costCenterId: 'cc-2', login: 'new-user' }],
+          ]),
+          [],
+          true,
+          unassignedComplete,
+        ),
+        costCenters: [
+          { id: 'cc-1', name: 'Engineering' },
+          { id: 'cc-2', name: 'Product' },
+        ],
+      });
+      const task = TaskManagementV2.create({
+        db: db as unknown as DatabaseHandlerV2,
+        api: api as unknown as GithubClientV2,
+        config: createConfigMock({
+          'copilot.enterprise': 'ent-1',
+          'copilot.ingestCostCenters': true,
+          'copilot.backfillDelayMs': 0,
+        }),
+        logger: createLoggerMock(),
+      });
+      jest.spyOn(task as any, 'ingestDay').mockResolvedValue({
+        loaded: true,
+        refreshed: true,
+        complete: true,
+        totalsLoaded: true,
+      });
+
+      await task.runBackfill(day, day, 'enterprise', 'ent-1');
+
+      expect(db.replaceCostCenterMemberships).toHaveBeenCalledWith(
+        day,
+        'enterprise',
+        'ent-1',
+        expect.arrayContaining([
+          expect.objectContaining({
+            user_id: 2,
+            user_login: 'new-user',
+            cost_center_id: 'cc-2',
+          }),
+        ]),
+        unassignedComplete,
+        expect.any(Object),
+      );
+    },
+  );
+
   it('skips a prepared legacy raw repair already completed by another worker without losing memberships', async () => {
     const db = createDbMock();
     const api = createApiMock();
@@ -2174,6 +2238,7 @@ describe('TaskManagementV2', () => {
       'org-1',
       expect.any(Object),
       true,
+      false,
     );
     expect(ingestCostCenterMemberships).toHaveBeenLastCalledWith(
       days[1],
@@ -2181,6 +2246,7 @@ describe('TaskManagementV2', () => {
       'org-1',
       expect.any(Object),
       true,
+      false,
     );
     expect(logger.error).toHaveBeenCalledWith(
       expect.stringContaining(`on ${days[0]}; the day will be retried`),
