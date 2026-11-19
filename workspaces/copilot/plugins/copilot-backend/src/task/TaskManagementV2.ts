@@ -950,8 +950,12 @@ export class TaskManagementV2 {
     entityId: string,
     report: PreparedUserReport,
     transaction: Knex.Transaction,
+    replaceExisting: boolean = false,
   ): Promise<void> {
     const { db } = this.options;
+    if (replaceExisting) {
+      await db.deleteUserReportForDay(day, metricsType, entityId, transaction);
+    }
     const breakdownRows = buildUserBreakdownRows(
       report.userBreakdowns,
       day,
@@ -1233,11 +1237,13 @@ export class TaskManagementV2 {
     totalsLoaded: boolean;
   }> {
     const { db, logger } = this.options;
-    const requiredComponents = getRequiredComponents(
+    let requiredComponents = getRequiredComponents(
       context.ingestUsers,
       context.ingestTeams,
     );
     let previouslyLoaded = new Set<string>();
+    let requiresUserBreakdownRepair = false;
+    let userBreakdownRepairReady = false;
 
     try {
       const previousLog = (
@@ -1246,6 +1252,16 @@ export class TaskManagementV2 {
       previouslyLoaded = new Set(
         parseComponentsLoaded(previousLog?.components_loaded),
       );
+      // Refresh missing user history before replacing a recent team snapshot.
+      requiresUserBreakdownRepair = Boolean(
+        context.refreshTeams &&
+          context.ingestUsers &&
+          context.ingestTeams &&
+          !previouslyLoaded.has('userBreakdowns'),
+      );
+      if (requiresUserBreakdownRepair) {
+        requiredComponents = [...requiredComponents, 'userBreakdowns'];
+      }
       const totals = previouslyLoaded.has('totals')
         ? []
         : await this.prepareTotals(
@@ -1265,10 +1281,11 @@ export class TaskManagementV2 {
           day,
         );
         const storedUserBreakdowns =
-          storedUserMetrics.length > 0
+          storedUserMetrics.length > 0 && !requiresUserBreakdownRepair
             ? await db.getUserBreakdownsForDay(metricsType, entityId, day)
             : [];
         const reuseStoredReport =
+          !requiresUserBreakdownRepair &&
           previouslyLoaded.has('users') &&
           ((storedUserMetrics.length > 0 &&
             previouslyLoaded.has('userBreakdowns')) ||
@@ -1278,23 +1295,59 @@ export class TaskManagementV2 {
                 previouslyLoaded.has(component),
               )));
         if (!reuseStoredReport) {
-          userReport = await this.prepareUserReports(
-            day,
-            metricsType,
-            entityId,
-            context.organizationReportTarget,
-          );
+          if (requiresUserBreakdownRepair) {
+            try {
+              userReport = await this.prepareUserReports(
+                day,
+                metricsType,
+                entityId,
+                context.organizationReportTarget,
+              );
+              userBreakdownRepairReady = userReport.loaded;
+            } catch {
+              userBreakdownRepairReady = false;
+            }
+          } else {
+            userReport = await this.prepareUserReports(
+              day,
+              metricsType,
+              entityId,
+              context.organizationReportTarget,
+            );
+          }
         }
         if (
           context.ingestTeams &&
           (!previouslyLoaded.has('teams') || context.refreshTeams)
         ) {
-          preparedTeams = await this.prepareTeamMemberships(
-            day,
-            metricsType,
-            entityId,
-            userReport?.loaded ?? reuseStoredReport,
-            context.organizationReportTarget,
+          if (requiresUserBreakdownRepair) {
+            if (userBreakdownRepairReady && userReport?.loaded) {
+              try {
+                preparedTeams = await this.prepareTeamMemberships(
+                  day,
+                  metricsType,
+                  entityId,
+                  true,
+                  context.organizationReportTarget,
+                );
+                userBreakdownRepairReady = preparedTeams !== undefined;
+              } catch {
+                userBreakdownRepairReady = false;
+              }
+            }
+          } else {
+            preparedTeams = await this.prepareTeamMemberships(
+              day,
+              metricsType,
+              entityId,
+              userReport?.loaded ?? reuseStoredReport,
+              context.organizationReportTarget,
+            );
+          }
+        }
+        if (requiresUserBreakdownRepair && !userBreakdownRepairReady) {
+          logger.warn(
+            `[TaskManagementV2] Skipping team refresh for ${metricsType}:${entityId} on ${day} because complete user report history or team memberships were unavailable; preserving existing breakdowns, legacy aggregates, and memberships.`,
           );
         }
       }
@@ -1307,6 +1360,21 @@ export class TaskManagementV2 {
           const componentsLoaded = new Set(
             parseComponentsLoaded(existingLog.components_loaded),
           );
+          const userBreakdownRepairRequired = Boolean(
+            context.refreshTeams &&
+              context.ingestUsers &&
+              context.ingestTeams &&
+              !componentsLoaded.has('userBreakdowns'),
+          );
+          if (
+            userBreakdownRepairRequired &&
+            !requiredComponents.includes('userBreakdowns')
+          ) {
+            requiredComponents = [...requiredComponents, 'userBreakdowns'];
+          }
+          const repairSuperseded =
+            requiresUserBreakdownRepair &&
+            componentsLoaded.has('userBreakdowns');
           let currentUserCount = 0;
           let hasCurrentBreakdowns = false;
           if (context.ingestUsers) {
@@ -1329,21 +1397,28 @@ export class TaskManagementV2 {
               ).length > 0;
           }
           const needsUserRepair =
-            componentsLoaded.has('users') &&
-            ((currentUserCount > 0 &&
-              !hasCurrentBreakdowns &&
-              !componentsLoaded.has('userBreakdowns')) ||
-              (currentUserCount === 0 &&
-                !requiredComponents.every(component =>
-                  componentsLoaded.has(component),
-                )));
+            userBreakdownRepairRequired ||
+            (componentsLoaded.has('users') &&
+              ((currentUserCount > 0 &&
+                !hasCurrentBreakdowns &&
+                !componentsLoaded.has('userBreakdowns')) ||
+                (currentUserCount === 0 &&
+                  !requiredComponents.every(component =>
+                    componentsLoaded.has(component),
+                  ))));
+          const repairReadyForTransaction =
+            !userBreakdownRepairRequired ||
+            (requiresUserBreakdownRepair &&
+              userBreakdownRepairReady &&
+              userReport?.loaded === true &&
+              preparedTeams !== undefined);
           const refreshTeams = context.refreshTeams && Boolean(preparedTeams);
           if (
             requiredComponents.every(component =>
               componentsLoaded.has(component),
             ) &&
             !needsUserRepair &&
-            !refreshTeams
+            (!refreshTeams || repairSuperseded)
           ) {
             return {
               loaded: context.ingestUsers && componentsLoaded.has('users'),
@@ -1360,7 +1435,9 @@ export class TaskManagementV2 {
           let refreshed = false;
           if (
             userReport?.loaded &&
-            (!componentsLoaded.has('users') || needsUserRepair)
+            (!componentsLoaded.has('users') || needsUserRepair) &&
+            repairReadyForTransaction &&
+            !repairSuperseded
           ) {
             await this.persistUserReport(
               day,
@@ -1368,6 +1445,7 @@ export class TaskManagementV2 {
               entityId,
               userReport,
               transaction,
+              userBreakdownRepairRequired,
             );
             componentsLoaded.add('users');
             componentsLoaded.add('userBreakdowns');
@@ -1375,6 +1453,8 @@ export class TaskManagementV2 {
           }
           if (
             preparedTeams &&
+            repairReadyForTransaction &&
+            !repairSuperseded &&
             (!componentsLoaded.has('teams') || context.refreshTeams) &&
             componentsLoaded.has('users')
           ) {
@@ -1387,7 +1467,8 @@ export class TaskManagementV2 {
             );
             if (
               currentUserCount > 0 ||
-              (refreshed && (userReport?.userMetrics.length ?? 0) > 0)
+              (refreshed && (userReport?.userMetrics.length ?? 0) > 0) ||
+              (userBreakdownRepairRequired && userBreakdownRepairReady)
             ) {
               componentsLoaded.add('teams');
             }
