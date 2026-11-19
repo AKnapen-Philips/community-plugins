@@ -1470,17 +1470,24 @@ export class GithubClientV2 {
   /**
    * Download a signed document URL containing newline-delimited JSON (NDJSON).
    * Each non-empty line is a separate JSON object. Returns all parsed rows.
+   * Strict mode rejects malformed non-empty lines; default mode skips them.
    * Use for per-user and user-teams reports which are NDJSON format.
    */
-  async downloadNdjsonDocument(url: string): Promise<unknown[]> {
+  async downloadNdjsonDocument(
+    url: string,
+    options: { strict?: boolean } = {},
+  ): Promise<unknown[]> {
     const body = await this.downloadText(url);
     const rows: unknown[] = [];
-    for (const line of body.split('\n')) {
+    for (const [index, line] of body.split('\n').entries()) {
       const trimmed = line.trim();
       if (!trimmed) continue;
       try {
         rows.push(JSON.parse(trimmed));
       } catch (err) {
+        if (options.strict) {
+          throw new Error(`Invalid NDJSON line ${index + 1}`);
+        }
         this.logger.warn(
           `[GithubClientV2] Skipping unparseable NDJSON line: ${err}`,
         );

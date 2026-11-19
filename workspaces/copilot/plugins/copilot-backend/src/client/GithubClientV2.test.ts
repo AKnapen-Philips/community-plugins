@@ -272,6 +272,66 @@ describe('GithubClientV2', () => {
     ).rejects.toThrow(/Refused to download from disallowed host/i);
   });
 
+  it('downloadNdjsonDocument keeps permissive defaults and accepts empty strict reports', async () => {
+    const client = await GithubClientV2.fromConfig(mockConfig, mockLogger);
+    const mockFetch = (global as any).fetch as jest.MockedFunction<any>;
+    const response = (body: string) => ({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      headers: { get: jest.fn().mockReturnValue(null) },
+      text: jest.fn().mockResolvedValue(body),
+    });
+
+    mockFetch.mockResolvedValueOnce(response('{"ok":true}\nnot-json\n  \n'));
+    await expect(
+      client.downloadNdjsonDocument(
+        'https://downloads.github.com/reports/users.ndjson?sig=secret',
+      ),
+    ).resolves.toEqual([{ ok: true }]);
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('Skipping unparseable NDJSON line'),
+    );
+
+    mockFetch.mockResolvedValueOnce(response('\n  \r\n'));
+    await expect(
+      client.downloadNdjsonDocument(
+        'https://downloads.github.com/reports/empty.ndjson?sig=secret',
+        { strict: true },
+      ),
+    ).resolves.toEqual([]);
+  });
+
+  it('downloadNdjsonDocument strict mode rejects malformed lines without exposing content or URL', async () => {
+    const client = await GithubClientV2.fromConfig(mockConfig, mockLogger);
+    const mockFetch = (global as any).fetch as jest.MockedFunction<any>;
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      headers: { get: jest.fn().mockReturnValue(null) },
+      text: jest.fn().mockResolvedValue('{"ok":true}\nprivate-payload'),
+    });
+
+    const error = await client
+      .downloadNdjsonDocument(
+        'https://downloads.github.com/reports/users.ndjson?sig=secret',
+        { strict: true },
+      )
+      .catch(caught => caught as Error);
+
+    if (!(error instanceof Error)) {
+      throw new Error(
+        'Expected strict NDJSON parsing to reject malformed data',
+      );
+    }
+
+    expect(error.message).toBe('Invalid NDJSON line 2');
+    expect(error.message).not.toContain('private-payload');
+    expect(error.message).not.toContain('sig=secret');
+    expect(mockLogger.warn).not.toHaveBeenCalled();
+  });
+
   it('downloadDocument accepts allowed github/githubusercontent/s3 hosts and logs origin+pathname only', async () => {
     const client = await GithubClientV2.fromConfig(mockConfig, mockLogger);
     const mockFetch = (global as any).fetch as jest.MockedFunction<any>;

@@ -51,7 +51,7 @@ import {
   CostCenterBreakdownKind,
 } from './longTailBucketing';
 import { UserBreakdownData } from '../utils/reportParser';
-import type { TeamAggregates } from '../utils/teamAggregator';
+import { filterScopedUsers, readScopedMetrics } from './scopedMetrics';
 
 type Options = {
   database: DatabaseService;
@@ -100,15 +100,6 @@ type CostCenterScopedRow = {
   without_cost_center?: boolean;
 };
 
-export type CostCenterCustomizationMetricRow = CostCenterScopedRow & {
-  day: string;
-  metrics_type: MetricsScope;
-  entity_id: string;
-  category: string;
-  item_name: string;
-  interaction_count: number;
-};
-
 export type CostCenterDashboardScope =
   | { kind: 'costCenter'; id: string }
   | { kind: 'noCostCenter' };
@@ -126,61 +117,8 @@ export type EnterpriseOrganizationDirectory = {
   organizations: string[];
 };
 
-export type CostCenterAggregateRows = {
-  dailyTotals: V2DailyTotal[];
-  prMetrics: V2PrMetricsRow[];
-  byFeature: V2MetricsByFeatureRow[];
-  byIde: V2MetricsByIdeRow[];
-  byLanguageFeature: V2MetricsByLanguageFeatureRow[];
-  byModelFeature: V2MetricsByModelFeatureRow[];
-  byLanguageModel: V2MetricsByLanguageModelRow[];
-  byCli: V2MetricsByCliRow[];
-  byVscodeAgent: V2MetricsByVscodeAgentRow[];
-  customizationMetrics?: CostCenterCustomizationMetricRow[];
-};
-
-const costCenterAggregateTables = [
-  'copilot_daily_totals',
-  'copilot_pr_metrics',
-  'copilot_metrics_by_feature',
-  'copilot_metrics_by_ide',
-  'copilot_metrics_by_language_feature',
-  'copilot_metrics_by_model_feature',
-  'copilot_metrics_by_language_model',
-  'copilot_metrics_by_cli',
-  'copilot_metrics_by_vscode_agent',
-  'copilot_customization_metrics_by_cost_center',
-] as const;
-
 const WEEKLY_ACTIVE_USERS_WINDOW_DAYS = 7;
 const MONTHLY_ACTIVE_USERS_WINDOW_DAYS = 28;
-
-const teamAggregateTables = [
-  'copilot_daily_totals',
-  'copilot_pr_metrics',
-  'copilot_metrics_by_feature',
-  'copilot_metrics_by_ide',
-  'copilot_metrics_by_language_feature',
-  'copilot_metrics_by_model_feature',
-  'copilot_metrics_by_language_model',
-  'copilot_metrics_by_cli',
-  'copilot_metrics_by_vscode_agent',
-  'copilot_customization_metrics',
-] as const;
-
-const teamAggregateRowsByTable = (
-  aggregates: TeamAggregates,
-): Array<[string, object[]]> => [
-  ['copilot_daily_totals', aggregates.dailyTotals],
-  ['copilot_metrics_by_feature', aggregates.byFeature],
-  ['copilot_metrics_by_ide', aggregates.byIde],
-  ['copilot_metrics_by_language_feature', aggregates.byLanguageFeature],
-  ['copilot_metrics_by_model_feature', aggregates.byModelFeature],
-  ['copilot_metrics_by_language_model', aggregates.byLanguageModel],
-  ['copilot_metrics_by_cli', aggregates.byCli ?? []],
-  ['copilot_metrics_by_vscode_agent', aggregates.byVscodeAgent ?? []],
-  ['copilot_customization_metrics', aggregates.customizationMetrics],
-];
 
 export class DatabaseHandlerV2 {
   static async create(options: Options): Promise<DatabaseHandlerV2> {
@@ -586,64 +524,32 @@ export class DatabaseHandlerV2 {
 
   private validateTeamReplacementRows(
     day: string,
+    metricsType: MetricsScope,
+    entityId: string,
     userTeams: V2UserTeamRow[],
   ): void {
-    if (userTeams.some(row => row.day !== day)) {
+    if (
+      userTeams.some(
+        row =>
+          row.day !== day ||
+          row.metrics_type !== metricsType ||
+          row.entity_id !== entityId,
+      )
+    ) {
       throw new Error(
         'Team replacement memberships must match the requested day and scope.',
       );
     }
   }
 
-  private async insertTeamAggregateRows(
-    transaction: Knex.Transaction,
-    aggregates: TeamAggregates,
-  ): Promise<void> {
-    for (const [tableName, rows] of teamAggregateRowsByTable(aggregates)) {
-      if (!rows.length) {
-        continue;
-      }
-      const normalizedRows =
-        tableName === 'copilot_customization_metrics'
-          ? rows
-          : this.withDefaultCostCenter(rows as CostCenterScopedRow[]);
-      await batchInsertInChunks(normalizedRows, 100, async chunk => {
-        await transaction(tableName).insert(chunk);
-      });
-    }
-  }
-
-  private async deleteTeamAggregateRows(
-    transaction: Knex.Transaction,
-    day: string,
-    metricsType: MetricsScope,
-    entityId: string,
-  ): Promise<void> {
-    for (const tableName of teamAggregateTables) {
-      const query = transaction(tableName).where({
-        day,
-        metrics_type: metricsType,
-        entity_id: entityId,
-      });
-      query.whereNot('team_slug', '');
-      if (tableName === 'copilot_customization_metrics') {
-        query.where('scope', 'team');
-      } else {
-        query.where('cost_center_id', '').where('without_cost_center', false);
-      }
-      await query.del();
-    }
-  }
-
-  async replaceTeamAggregates(
+  async replaceTeamMemberships(
     day: string,
     metricsType: MetricsScope,
     entityId: string,
     userTeams: V2UserTeamRow[],
-    aggregates: TeamAggregates,
     outerTransaction?: Knex.Transaction,
   ): Promise<void> {
-    this.validateTeamReplacementRows(day, userTeams);
+    this.validateTeamReplacementRows(day, metricsType, entityId, userTeams);
 
     const replace = async (transaction: Knex.Transaction) => {
       await transaction('copilot_user_teams')
@@ -661,14 +567,6 @@ export class DatabaseHandlerV2 {
           ])
           .ignore();
       });
-
-      await this.deleteTeamAggregateRows(
-        transaction,
-        day,
-        metricsType,
-        entityId,
-      );
-      await this.insertTeamAggregateRows(transaction, aggregates);
     };
 
     if (outerTransaction) {
@@ -1063,6 +961,31 @@ export class DatabaseHandlerV2 {
     });
   }
 
+  async deleteUserReportForDay(
+    day: string,
+    metricsType: MetricsScope,
+    entityId: string,
+    transaction: Knex.Transaction,
+  ): Promise<void> {
+    const scope = { day, metrics_type: metricsType, entity_id: entityId };
+    for (const table of [
+      'copilot_user_metrics_by_feature',
+      'copilot_user_metrics_by_ide',
+      'copilot_user_metrics_by_language_feature',
+      'copilot_user_metrics_by_model_feature',
+      'copilot_user_metrics_by_language_model',
+    ]) {
+      await transaction(table).where(scope).del();
+    }
+    await transaction('copilot_customization_metrics')
+      .where({ ...scope, scope: 'user' })
+      .del();
+    await transaction('copilot_customization_summaries')
+      .where({ ...scope, scope: 'user' })
+      .del();
+    await transaction('copilot_user_metrics').where(scope).del();
+  }
+
   async upsertCostCenters(rows: V2CostCenterRow[]): Promise<void> {
     if (!rows.length) {
       return;
@@ -1096,56 +1019,51 @@ export class DatabaseHandlerV2 {
   }
 
   /**
-   * Replaces all cost-center-derived state for a day atomically.
+   * Replaces a membership snapshot and its completion evidence atomically.
    */
-  async replaceCostCenterAggregates(
+  async replaceCostCenterMemberships(
     day: string,
     metricsType: MetricsScope,
     entityId: string,
     userCostCenters: V2UserCostCenterRow[],
-    aggregates: CostCenterAggregateRows,
     unassignedComplete: boolean = true,
     outerTransaction?: Knex.Transaction,
   ): Promise<void> {
-    const rowsByTable = {
-      copilot_daily_totals: this.withDefaultCostCenter(aggregates.dailyTotals),
-      copilot_pr_metrics: this.withDefaultCostCenter(aggregates.prMetrics),
-      copilot_metrics_by_feature: this.withDefaultCostCenter(
-        aggregates.byFeature,
-      ),
-      copilot_metrics_by_ide: this.withDefaultCostCenter(aggregates.byIde),
-      copilot_metrics_by_language_feature: this.withDefaultCostCenter(
-        aggregates.byLanguageFeature,
-      ),
-      copilot_metrics_by_model_feature: this.withDefaultCostCenter(
-        aggregates.byModelFeature,
-      ),
-      copilot_metrics_by_language_model: this.withDefaultCostCenter(
-        aggregates.byLanguageModel,
-      ),
-      copilot_metrics_by_cli: this.withDefaultCostCenter(aggregates.byCli),
-      copilot_metrics_by_vscode_agent: this.withDefaultCostCenter(
-        aggregates.byVscodeAgent,
-      ),
-      copilot_customization_metrics_by_cost_center: this.withDefaultCostCenter(
-        aggregates.customizationMetrics ?? [],
-      ),
-    };
-    const rowsWithCostCenter = Object.values(rowsByTable).flat();
-
     if (
-      rowsWithCostCenter.some(row =>
-        row.without_cost_center
-          ? row.cost_center_id !== ''
-          : row.cost_center_id === '',
+      userCostCenters.some(
+        row =>
+          row.day !== day ||
+          row.metrics_type !== metricsType ||
+          row.entity_id !== entityId ||
+          !row.cost_center_id,
       )
     ) {
       throw new Error(
-        'Cost-center replacement rows must match the requested day and scope and must not include a team scope.',
+        'Cost-center replacement memberships must match the requested day and scope and have a cost center.',
       );
     }
 
     const replace = async (transaction: Knex.Transaction) => {
+      await transaction('copilot_cost_center_aggregation_log')
+        .insert({
+          day,
+          metrics_type: metricsType,
+          entity_id: entityId,
+          unassigned_complete: false,
+          needs_reaggregation: false,
+        })
+        .onConflict(['day', 'metrics_type', 'entity_id'])
+        .ignore();
+      const previous = await transaction('copilot_cost_center_aggregation_log')
+        .where({ day, metrics_type: metricsType, entity_id: entityId })
+        .forUpdate()
+        .first();
+      if (
+        !unassignedComplete &&
+        isDatabaseBoolean(previous?.unassigned_complete)
+      ) {
+        return;
+      }
       await transaction('copilot_user_cost_centers')
         .where({ day, metrics_type: metricsType, entity_id: entityId })
         .del();
@@ -1156,35 +1074,13 @@ export class DatabaseHandlerV2 {
         ).insert(chunk);
       });
 
-      for (const tableName of costCenterAggregateTables) {
-        await transaction(tableName)
-          .where({ day, metrics_type: metricsType, entity_id: entityId })
-          .andWhere(function removeCostCenterScopes() {
-            this.whereNot('cost_center_id', '').orWhere(
-              'without_cost_center',
-              true,
-            );
-          })
-          .del();
-      }
-
-      for (const [tableName, rows] of Object.entries(rowsByTable)) {
-        await batchInsertInChunks<object>(rows, 100, async chunk => {
-          await transaction(tableName).insert(chunk);
-        });
-      }
-
-      await transaction('copilot_cost_center_aggregation_log')
-        .insert({
-          day,
-          metrics_type: metricsType,
-          entity_id: entityId,
-          unassigned_complete: unassignedComplete,
-          needs_reaggregation: false,
-          aggregated_at: this.db.fn.now(),
-        })
-        .onConflict(['day', 'metrics_type', 'entity_id'])
-        .merge(['unassigned_complete', 'needs_reaggregation', 'aggregated_at']);
+      await this.markCostCenterMembershipsDone(
+        day,
+        metricsType,
+        entityId,
+        unassignedComplete,
+        transaction,
+      );
     };
 
     if (outerTransaction) {
@@ -1424,34 +1320,37 @@ export class DatabaseHandlerV2 {
     }));
   }
 
-  async getDaysMissingCostCenterAggregation(
+  async getDaysMissingCostCenterMemberships(
     metricsType: MetricsScope,
     entityId: string,
     from: string,
     to: string,
+    transaction?: Knex.Transaction,
   ): Promise<string[]> {
+    const connection = this.connection(transaction);
     const [metricRows, ingestionRows, completedRows] = await Promise.all([
-      this.db('copilot_user_metrics')
+      connection('copilot_user_metrics')
         .where({ metrics_type: metricsType, entity_id: entityId })
         .whereBetween('day', [from, to])
         .distinct('day')
         .select('day'),
-      this.db('copilot_ingestion_log')
+      connection('copilot_ingestion_log')
         .where({ metrics_type: metricsType, entity_id: entityId })
         .whereBetween('day', [from, to])
         .select('day', 'components_loaded'),
-      this.db('copilot_cost_center_aggregation_log')
+      connection('copilot_cost_center_aggregation_log')
         .where({ metrics_type: metricsType, entity_id: entityId })
+        // Consume legacy dirty snapshots once; new ingestion never sets this flag.
         .where('needs_reaggregation', false)
         .whereBetween('day', [from, to])
         .select('day'),
     ]);
 
-    const daysToAggregate = new Set<string>();
+    const daysWithUsers = new Set<string>();
     for (const row of metricRows) {
       const day = this.normalizeDay(row.day);
       if (day) {
-        daysToAggregate.add(day);
+        daysWithUsers.add(day);
       }
     }
     for (const row of ingestionRows) {
@@ -1461,7 +1360,7 @@ export class DatabaseHandlerV2 {
 
       const day = this.normalizeDay(row.day);
       if (day) {
-        daysToAggregate.add(day);
+        daysWithUsers.add(day);
       }
     }
 
@@ -1471,16 +1370,19 @@ export class DatabaseHandlerV2 {
         .filter((day): day is string => Boolean(day)),
     );
 
-    return [...daysToAggregate].filter(day => !completedDays.has(day)).sort();
+    return [...daysWithUsers].filter(day => !completedDays.has(day)).sort();
   }
 
-  async getDaysWithIncompleteCostCenterAggregation(
+  async getDaysWithIncompleteCostCenterMemberships(
     metricsType: MetricsScope,
     entityId: string,
     from: string,
     to: string,
+    transaction?: Knex.Transaction,
   ): Promise<string[]> {
-    const rows = await this.db('copilot_cost_center_aggregation_log')
+    const rows = await this.connection(transaction)(
+      'copilot_cost_center_aggregation_log',
+    )
       .where({
         metrics_type: metricsType,
         entity_id: entityId,
@@ -1495,13 +1397,14 @@ export class DatabaseHandlerV2 {
       .sort();
   }
 
-  async markCostCenterAggregationDone(
+  async markCostCenterMembershipsDone(
     day: string,
     metricsType: MetricsScope,
     entityId: string,
     unassignedComplete: boolean = true,
+    transaction?: Knex.Transaction,
   ): Promise<void> {
-    await this.db('copilot_cost_center_aggregation_log')
+    await this.connection(transaction)('copilot_cost_center_aggregation_log')
       .insert({
         day,
         metrics_type: metricsType,
@@ -1511,18 +1414,14 @@ export class DatabaseHandlerV2 {
         aggregated_at: this.db.fn.now(),
       })
       .onConflict(['day', 'metrics_type', 'entity_id'])
-      .merge(['unassigned_complete', 'needs_reaggregation', 'aggregated_at']);
-  }
-
-  async markCostCenterAggregationPending(
-    day: string,
-    metricsType: MetricsScope,
-    entityId: string,
-    transaction?: Knex.Transaction,
-  ): Promise<void> {
-    await this.connection(transaction)('copilot_cost_center_aggregation_log')
-      .where({ day, metrics_type: metricsType, entity_id: entityId })
-      .update({ needs_reaggregation: true });
+      .merge({
+        unassigned_complete: this.db.raw('?? OR ?', [
+          'copilot_cost_center_aggregation_log.unassigned_complete',
+          unassignedComplete,
+        ]),
+        needs_reaggregation: false,
+        aggregated_at: this.db.fn.now(),
+      });
   }
 
   /**
@@ -1537,6 +1436,27 @@ export class DatabaseHandlerV2 {
     teamSlug?: string,
     costCenter?: CostCenterFilter,
   ): Promise<V2DailyTotal[]> {
+    if (teamSlug || costCenter) {
+      const rows = await readScopedMetrics<V2DailyTotal>(
+        this.db,
+        'daily',
+        metricsType,
+        entityId,
+        from,
+        to,
+        teamSlug,
+        costCenter,
+      );
+      return this.enrichScopedRollingActiveUsers(
+        rows.map(row => this.normalizeAggregateRow(row)),
+        metricsType,
+        entityId,
+        from,
+        to,
+        teamSlug,
+        costCenter,
+      );
+    }
     const query = this.db<V2DailyTotal>('copilot_daily_totals')
       .where('metrics_type', metricsType)
       .where('entity_id', entityId)
@@ -1548,21 +1468,6 @@ export class DatabaseHandlerV2 {
     const rows = (await query.orderBy('day', 'asc').select('*')).map(row =>
       this.normalizeAggregateRow(row),
     );
-
-    // Unscoped org/enterprise rows already carry rolling counts from GitHub.
-    // Team and cost-center aggregates are derived from daily per-user data,
-    // so their rolling counts are computed from the membership snapshots.
-    if (teamSlug || costCenter) {
-      return this.enrichScopedRollingActiveUsers(
-        rows,
-        metricsType,
-        entityId,
-        from,
-        to,
-        teamSlug,
-        costCenter,
-      );
-    }
 
     return rows;
   }
@@ -1678,61 +1583,13 @@ export class DatabaseHandlerV2 {
       .minus({ days: monthlyWindowDays - 1 })
       .toFormat('yyyy-MM-dd');
 
-    const database = this.db;
-    const query = database('copilot_user_metrics as m');
-
-    if (teamSlug) {
-      query.join('copilot_user_teams as t', function joinTeam() {
-        this.on('m.day', '=', 't.day')
-          .andOn('m.user_id', '=', 't.user_id')
-          .andOn('m.metrics_type', '=', 't.metrics_type')
-          .andOn('m.entity_id', '=', 't.entity_id');
-      });
-    }
-
-    if (typeof costCenter === 'string') {
-      query.join('copilot_user_cost_centers as c', function joinCostCenter() {
-        this.on('m.day', '=', 'c.day')
-          .andOn('m.user_id', '=', 'c.user_id')
-          .andOn('m.metrics_type', '=', 'c.metrics_type')
-          .andOn('m.entity_id', '=', 'c.entity_id');
-      });
-    } else if (costCenter?.kind === 'noCostCenter') {
-      // Only treat a day as unassigned when its cost-center snapshot was
-      // transactionally completed; an absent snapshot is not evidence that a
-      // user had no cost center.
-      query.join(
-        'copilot_cost_center_aggregation_log as cost_center_done',
-        function joinCompletedCostCenterDay() {
-          this.on('m.day', '=', 'cost_center_done.day')
-            .andOn('m.metrics_type', '=', 'cost_center_done.metrics_type')
-            .andOn('m.entity_id', '=', 'cost_center_done.entity_id');
-        },
-      );
-      query.where('cost_center_done.unassigned_complete', true);
-    }
+    const query = this.db('copilot_user_metrics as m');
+    filterScopedUsers(this.db, query, 'm', teamSlug, costCenter);
 
     query
       .where('m.metrics_type', metricsType)
       .where('m.entity_id', entityId)
       .whereBetween('m.day', [fetchLowerBound, to]);
-
-    if (teamSlug) {
-      query.where('t.team_slug', teamSlug);
-    }
-
-    if (typeof costCenter === 'string') {
-      query.where('c.cost_center_id', costCenter);
-    } else if (costCenter?.kind === 'noCostCenter') {
-      query.whereNotExists(function userHasCostCenter() {
-        this.select(database.raw('1'))
-          .from('copilot_user_cost_centers as c')
-          .whereRaw('?? = ??', ['c.day', 'm.day'])
-          .whereRaw('?? = ??', ['c.metrics_type', 'm.metrics_type'])
-          .whereRaw('?? = ??', ['c.entity_id', 'm.entity_id'])
-          .whereRaw('?? = ??', ['c.user_id', 'm.user_id']);
-      });
-    }
 
     return query.select(
       'm.day as day',
@@ -1941,6 +1798,9 @@ export class DatabaseHandlerV2 {
     teamSlug?: string,
     costCenter?: CostCenterFilter,
   ): Promise<V2PrMetricsRow[]> {
+    if (teamSlug || costCenter) {
+      return [];
+    }
     const query = this.db<V2PrMetricsRow>('copilot_pr_metrics')
       .where('metrics_type', metricsType)
       .where('entity_id', entityId)
@@ -1965,6 +1825,23 @@ export class DatabaseHandlerV2 {
     teamSlug?: string,
     costCenter?: CostCenterFilter,
   ): Promise<V2MetricsByFeatureRow[]> {
+    if (teamSlug || costCenter) {
+      const rows = await readScopedMetrics<V2MetricsByFeatureRow>(
+        this.db,
+        'feature',
+        metricsType,
+        entityId,
+        from,
+        to,
+        teamSlug,
+        costCenter,
+      );
+      return this.applyCostCenterBreakdownBucketing(
+        rows.map(row => this.normalizeAggregateRow(row)),
+        costCenter,
+        'feature',
+      );
+    }
     const query = this.db<V2MetricsByFeatureRow>('copilot_metrics_by_feature')
       .where('metrics_type', metricsType)
       .where('entity_id', entityId)
@@ -1993,6 +1870,23 @@ export class DatabaseHandlerV2 {
     teamSlug?: string,
     costCenter?: CostCenterFilter,
   ): Promise<V2MetricsByIdeRow[]> {
+    if (teamSlug || costCenter) {
+      const rows = await readScopedMetrics<V2MetricsByIdeRow>(
+        this.db,
+        'ide',
+        metricsType,
+        entityId,
+        from,
+        to,
+        teamSlug,
+        costCenter,
+      );
+      return this.applyCostCenterBreakdownBucketing(
+        rows.map(row => this.normalizeAggregateRow(row)),
+        costCenter,
+        'ide',
+      );
+    }
     const query = this.db<V2MetricsByIdeRow>('copilot_metrics_by_ide')
       .where('metrics_type', metricsType)
       .where('entity_id', entityId)
@@ -2022,6 +1916,24 @@ export class DatabaseHandlerV2 {
     feature?: string,
     costCenter?: CostCenterFilter,
   ): Promise<V2MetricsByLanguageFeatureRow[]> {
+    if (teamSlug || costCenter) {
+      const rows = await readScopedMetrics<V2MetricsByLanguageFeatureRow>(
+        this.db,
+        'language_feature',
+        metricsType,
+        entityId,
+        from,
+        to,
+        teamSlug,
+        costCenter,
+        feature,
+      );
+      return this.applyCostCenterBreakdownBucketing(
+        rows.map(row => this.normalizeAggregateRow(row)),
+        costCenter,
+        'language-feature',
+      );
+    }
     const query = this.db<V2MetricsByLanguageFeatureRow>(
       'copilot_metrics_by_language_feature',
     )
@@ -2060,6 +1972,23 @@ export class DatabaseHandlerV2 {
     teamSlug?: string,
     costCenter?: CostCenterFilter,
   ): Promise<V2MetricsByModelFeatureRow[]> {
+    if (teamSlug || costCenter) {
+      const rows = await readScopedMetrics<V2MetricsByModelFeatureRow>(
+        this.db,
+        'model_feature',
+        metricsType,
+        entityId,
+        from,
+        to,
+        teamSlug,
+        costCenter,
+      );
+      return this.applyCostCenterBreakdownBucketing(
+        rows.map(row => this.normalizeAggregateRow(row)),
+        costCenter,
+        'model-feature',
+      );
+    }
     const query = this.db<V2MetricsByModelFeatureRow>(
       'copilot_metrics_by_model_feature',
     )
@@ -2092,6 +2021,23 @@ export class DatabaseHandlerV2 {
     teamSlug?: string,
     costCenter?: CostCenterFilter,
   ): Promise<V2MetricsByLanguageModelRow[]> {
+    if (teamSlug || costCenter) {
+      const rows = await readScopedMetrics<V2MetricsByLanguageModelRow>(
+        this.db,
+        'language_model',
+        metricsType,
+        entityId,
+        from,
+        to,
+        teamSlug,
+        costCenter,
+      );
+      return this.applyCostCenterBreakdownBucketing(
+        rows.map(row => this.normalizeAggregateRow(row)),
+        costCenter,
+        'language-model',
+      );
+    }
     const query = this.db<V2MetricsByLanguageModelRow>(
       'copilot_metrics_by_language_model',
     )
@@ -2120,39 +2066,23 @@ export class DatabaseHandlerV2 {
     teamSlug?: string,
     costCenter?: CostCenterFilter,
   ): Promise<V2CustomizationMetricRow[]> {
-    if (costCenter) {
-      const query = this.db<CostCenterCustomizationMetricRow>(
-        'copilot_customization_metrics_by_cost_center',
-      )
-        .where('metrics_type', metricsType)
-        .where('entity_id', entityId)
-        .whereBetween('day', [from, to]);
-      this.addCostCenterFilter(
-        query,
+    if (teamSlug || costCenter) {
+      const rows = await readScopedMetrics<V2CustomizationMetricRow>(
+        this.db,
+        'customization',
+        metricsType,
+        entityId,
+        from,
+        to,
+        teamSlug,
         costCenter,
-        'copilot_customization_metrics_by_cost_center',
       );
-      const rows = await query.orderBy('day', 'asc').select('*');
-      const normalizedRows: V2CustomizationMetricRow[] = rows.map(row => ({
-        day: this.normalizeRequiredDay(row.day),
-        metrics_type: row.metrics_type,
-        entity_id: row.entity_id,
-        scope: 'aggregate',
-        team_slug: '',
-        user_id: 0,
-        user_login: '',
-        category: row.category,
-        item_name: row.item_name,
-        interaction_count: row.interaction_count,
-      }));
-
       return this.applyCostCenterBreakdownBucketing(
-        normalizedRows,
+        rows.map(row => this.normalizeAggregateRow(row)),
         costCenter,
         'customization',
       );
     }
-
     const query = this.db<V2CustomizationMetricRow>(
       'copilot_customization_metrics',
     )
@@ -2881,6 +2811,16 @@ export class DatabaseHandlerV2 {
       .where('metrics_type', metricsType)
       .whereIn('entity_id', entityIds)
       .whereNot('team_slug', '');
+    const database = this.db;
+    query.whereExists(function activeTeamMember() {
+      this.select(database.raw('1')).from('copilot_user_metrics as active');
+      for (const column of ['day', 'metrics_type', 'entity_id', 'user_id']) {
+        this.whereRaw('?? = ??', [
+          `active.${column}`,
+          `copilot_user_teams.${column}`,
+        ]);
+      }
+    });
     if (from && to) {
       query.whereBetween('day', [from, to]);
     } else if (from) {
@@ -2946,10 +2886,22 @@ export class DatabaseHandlerV2 {
     entityId: string,
     costCenter?: CostCenterFilter,
   ): Promise<PeriodRange | null> {
-    const query = this.db('copilot_daily_totals')
+    const query = this.db(
+      costCenter ? 'copilot_user_metrics' : 'copilot_daily_totals',
+    )
       .where('metrics_type', metricsType)
       .where('entity_id', entityId);
-    this.addCostCenterFilter(query, costCenter, 'copilot_daily_totals');
+    if (costCenter) {
+      filterScopedUsers(
+        this.db,
+        query,
+        'copilot_user_metrics',
+        undefined,
+        costCenter,
+      );
+    } else {
+      this.addCostCenterFilter(query, undefined, 'copilot_daily_totals');
+    }
 
     const row = await query
       .select(

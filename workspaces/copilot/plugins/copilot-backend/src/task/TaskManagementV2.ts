@@ -21,7 +21,6 @@ import {
   MetricsScope,
   V2UserTeamRow,
   V2UserCostCenterRow,
-  V2UserMetricRow,
 } from '@backstage-community/plugin-copilot-common';
 import {
   DatabaseHandlerV2,
@@ -39,12 +38,7 @@ import {
   parseUserTeamsDocument,
   ParsedEnterpriseDocument,
   ParsedUserDocument,
-  UserBreakdownData,
 } from '../utils/reportParser';
-import {
-  aggregateCostCenterMetrics,
-  aggregateTeamMetrics,
-} from '../utils/teamAggregator';
 import { buildUserBreakdownRows } from '../utils/userBreakdownRows';
 
 type IngestSource = 'scheduled' | 'backfill';
@@ -145,28 +139,6 @@ function logOrganizationMetricsPermissionError(
 
 function uniqueDays(...dayLists: string[][]): string[] {
   return [...new Set(dayLists.flat())].sort();
-}
-
-function mergeUserMetrics(
-  stored: V2UserMetricRow[],
-  incoming: V2UserMetricRow[],
-): V2UserMetricRow[] {
-  const metrics = new Map(stored.map(row => [row.user_id, row]));
-  for (const row of incoming) {
-    const existing = metrics.get(row.user_id);
-    // Match insertUserMetrics: legacy base metrics are immutable; only new columns are refreshed.
-    metrics.set(
-      row.user_id,
-      existing
-        ? {
-            ...existing,
-            ai_credits_used: row.ai_credits_used,
-            used_vscode_agent: row.used_vscode_agent,
-          }
-        : row,
-    );
-  }
-  return [...metrics.values()];
 }
 
 function isSupportedCostCenterScope(
@@ -286,7 +258,7 @@ export class TaskManagementV2 {
         ingestUsers,
       );
       const missingCostCenterDays = costCenterEnabledForEntity
-        ? await db.getDaysMissingCostCenterAggregation(
+        ? await db.getDaysMissingCostCenterMemberships(
             entity.metricsType,
             entity.entityId,
             missingFromDate,
@@ -294,7 +266,7 @@ export class TaskManagementV2 {
           )
         : [];
       const incompleteCostCenterDays = costCenterEnabledForEntity
-        ? await db.getDaysWithIncompleteCostCenterAggregation(
+        ? await db.getDaysWithIncompleteCostCenterMemberships(
             entity.metricsType,
             entity.entityId,
             missingFromDate,
@@ -430,7 +402,7 @@ export class TaskManagementV2 {
             continue;
           }
           try {
-            await this.ingestCostCenterAggregates(
+            await this.ingestCostCenterMemberships(
               day,
               plan.entity.metricsType,
               plan.entity.entityId,
@@ -438,10 +410,11 @@ export class TaskManagementV2 {
               plan.missingCostCenterDays.includes(day) ||
                 retryIncompleteDays.includes(day) ||
                 loadedUserReportDays.has(day),
+              refreshedUserReportDays.has(day),
             );
           } catch (error) {
             logger.error(
-              `[TaskManagementV2] Failed cost-center aggregation for ${plan.entity.metricsType}:${plan.entity.entityId} on ${day}; the day will be retried.`,
+              `[TaskManagementV2] Failed cost-center membership ingestion for ${plan.entity.metricsType}:${plan.entity.entityId} on ${day}; the day will be retried.`,
               error,
             );
           }
@@ -574,7 +547,7 @@ export class TaskManagementV2 {
       ingestUsers,
     );
     const missingCostCenterDays = costCenterIngestionAvailable
-      ? await db.getDaysMissingCostCenterAggregation(
+      ? await db.getDaysMissingCostCenterMemberships(
           metricsType,
           backfillEntityId,
           missingFromDate,
@@ -582,7 +555,7 @@ export class TaskManagementV2 {
         )
       : [];
     const incompleteCostCenterDays = costCenterIngestionAvailable
-      ? await db.getDaysWithIncompleteCostCenterAggregation(
+      ? await db.getDaysWithIncompleteCostCenterMemberships(
           metricsType,
           backfillEntityId,
           missingFromDate,
@@ -702,7 +675,7 @@ export class TaskManagementV2 {
           }
 
           try {
-            await this.ingestCostCenterAggregates(
+            await this.ingestCostCenterMemberships(
               day,
               metricsType,
               backfillEntityId,
@@ -710,10 +683,11 @@ export class TaskManagementV2 {
               missingCostCenterDays.includes(day) ||
                 retryIncompleteDays.includes(day) ||
                 loadedUserReportDays.has(day),
+              refreshedUserReportDays.has(day),
             );
           } catch (error) {
             logger.error(
-              `[TaskManagementV2] Failed cost-center aggregation for ${metricsType}:${backfillEntityId} on ${day}; the day will be retried.`,
+              `[TaskManagementV2] Failed cost-center membership ingestion for ${metricsType}:${backfillEntityId} on ${day}; the day will be retried.`,
               error,
             );
           }
@@ -889,6 +863,7 @@ export class TaskManagementV2 {
     metricsType: MetricsScope,
     entityId: string,
     organizationReportTarget?: string,
+    strict = false,
   ): Promise<PreparedUserReport> {
     const { api, logger } = this.options;
     const report: PreparedUserReport = {
@@ -932,8 +907,15 @@ export class TaskManagementV2 {
     }
 
     for (const url of userLinks) {
-      const rows = await api.downloadNdjsonDocument(url);
-      const parsed = parseUserDocument(rows, metricsType, entityId);
+      const rows = strict
+        ? await api.downloadNdjsonDocument(url, { strict: true })
+        : await api.downloadNdjsonDocument(url);
+      const parsed = strict
+        ? parseUserDocument(rows, metricsType, entityId, {
+            strict: true,
+            expectedDay: day,
+          })
+        : parseUserDocument(rows, metricsType, entityId);
       report.userMetrics.push(...parsed.userMetrics);
       report.userBreakdowns.push(...parsed.userBreakdowns);
       report.customizationMetrics.push(...parsed.customizationMetrics);
@@ -976,8 +958,12 @@ export class TaskManagementV2 {
     entityId: string,
     report: PreparedUserReport,
     transaction: Knex.Transaction,
+    replaceExisting: boolean = false,
   ): Promise<void> {
     const { db } = this.options;
+    if (replaceExisting) {
+      await db.deleteUserReportForDay(day, metricsType, entityId, transaction);
+    }
     const breakdownRows = buildUserBreakdownRows(
       report.userBreakdowns,
       day,
@@ -1009,21 +995,14 @@ export class TaskManagementV2 {
     );
   }
 
-  private async prepareTeamAggregates(
+  private async prepareTeamMemberships(
     day: string,
     metricsType: MetricsScope,
     entityId: string,
-    userMetrics: V2UserMetricRow[],
-    userBreakdowns: UserBreakdownData[],
     userReportLoaded: boolean,
     organizationReportTarget?: string,
-  ): Promise<
-    | {
-        userTeams: V2UserTeamRow[];
-        aggregates: ReturnType<typeof aggregateTeamMetrics>;
-      }
-    | undefined
-  > {
+    strict = false,
+  ): Promise<V2UserTeamRow[] | undefined> {
     const { api, logger } = this.options;
     let userTeamsEnvelope: Awaited<
       ReturnType<GithubClientV2['fetchEnterpriseUserTeamsLinks']>
@@ -1051,42 +1030,43 @@ export class TaskManagementV2 {
     const userTeamLinks = userTeamsEnvelope.download_links ?? [];
     if (userTeamLinks.length === 0) {
       logger.warn(
-        `[TaskManagementV2] No download links for ${metricsType} user-teams on ${day} — team aggregation will be skipped.`,
+        `[TaskManagementV2] No download links for ${metricsType} user-teams on ${day} — team memberships will be skipped.`,
       );
       return undefined;
     }
 
     if (!userReportLoaded) {
       logger.warn(
-        `[TaskManagementV2] Skipping ${metricsType} team aggregation for ${day} because the per-user report was not loaded.`,
+        `[TaskManagementV2] Skipping ${metricsType} team memberships for ${day} because the per-user report was not loaded.`,
       );
       return undefined;
     }
 
     const userTeams: V2UserTeamRow[] = [];
     for (const url of userTeamLinks) {
-      const rows = await api.downloadNdjsonDocument(url);
-      userTeams.push(...parseUserTeamsDocument(rows, metricsType, entityId));
+      const rows = strict
+        ? await api.downloadNdjsonDocument(url, { strict: true })
+        : await api.downloadNdjsonDocument(url);
+      userTeams.push(
+        ...(strict
+          ? parseUserTeamsDocument(rows, metricsType, entityId, {
+              strict: true,
+              expectedDay: day,
+            })
+          : parseUserTeamsDocument(rows, metricsType, entityId)),
+      );
     }
 
-    const teamAggregates = aggregateTeamMetrics(
-      userMetrics,
-      userTeams,
-      userBreakdowns,
-      day,
-      metricsType,
-      entityId,
-    );
-
-    return { userTeams, aggregates: teamAggregates };
+    return userTeams;
   }
 
-  private async ingestCostCenterAggregates(
+  private async ingestCostCenterMemberships(
     day: string,
     metricsType: MetricsScope,
     entityId: string,
     snapshot: CostCenterMembershipSnapshot,
     markEmptyDay: boolean,
+    refreshForUserReport: boolean,
   ): Promise<boolean> {
     const { db } = this.options;
     const storedUserMetrics = await db.getUserMetricsForDay(
@@ -1103,57 +1083,67 @@ export class TaskManagementV2 {
       ? await db.getUserBreakdownsForDay(metricsType, entityId, day)
       : [];
     let repair: PreparedUserReport | undefined;
+    const previousLog = (
+      await db.getIngestionLog(metricsType, entityId, day, day)
+    )[0];
     // Legacy successful ingestion logs can predate persisted user breakdowns.
-    if (storedUserMetrics.length > 0 && storedUserBreakdowns.length === 0) {
-      repair = await this.prepareUserReports(day, metricsType, entityId);
-      if (!repair.loaded || repair.userBreakdowns.length === 0) {
+    if (
+      storedUserMetrics.length > 0 &&
+      storedUserBreakdowns.length === 0 &&
+      !parseComponentsLoaded(previousLog?.components_loaded).includes(
+        'userBreakdowns',
+      )
+    ) {
+      // This repair marks raw breakdowns authoritative over legacy details.
+      repair = await this.prepareUserReports(
+        day,
+        metricsType,
+        entityId,
+        undefined,
+        true,
+      );
+      if (!repair.loaded || repair.userMetrics.length === 0) {
         return false;
       }
     }
-    const userMetrics = repair
-      ? mergeUserMetrics(storedUserMetrics, repair.userMetrics)
-      : storedUserMetrics;
-    const userBreakdowns = repair?.userBreakdowns ?? storedUserBreakdowns;
-
-    const memberships = new Map<number, string>();
-    const userCostCentersByUserId = new Map<number, V2UserCostCenterRow>();
-    for (const metric of userMetrics) {
-      const membership = snapshot.members.get(metric.user_id);
-      if (!membership) {
-        continue;
-      }
-      memberships.set(metric.user_id, membership.costCenterId);
-
-      userCostCentersByUserId.set(metric.user_id, {
-        day,
-        metrics_type: metricsType,
-        entity_id: entityId,
-        user_id: metric.user_id,
-        user_login: membership.login,
-        cost_center_id: membership.costCenterId,
-      });
-    }
-    const userCostCenters = [...userCostCentersByUserId.values()];
-
-    const aggregates = aggregateCostCenterMetrics(
-      userMetrics,
-      userBreakdowns,
-      memberships,
+    const userCostCenters: V2UserCostCenterRow[] = [
+      ...snapshot.members.entries(),
+    ].map(([userId, membership]) => ({
       day,
-      metricsType,
-      entityId,
-      snapshot.unassignedComplete,
-    );
-    const storedUsers = JSON.stringify([
-      storedUserMetrics,
-      storedUserBreakdowns,
-    ]);
+      metrics_type: metricsType,
+      entity_id: entityId,
+      user_id: userId,
+      user_login: membership.login,
+      cost_center_id: membership.costCenterId,
+    }));
 
     return db.withIngestionDay(
       day,
       metricsType,
       entityId,
-      async transaction => {
+      async (transaction, existingLog) => {
+        const missingDays = await db.getDaysMissingCostCenterMemberships(
+          metricsType,
+          entityId,
+          day,
+          day,
+          transaction,
+        );
+        const incompleteDays =
+          await db.getDaysWithIncompleteCostCenterMemberships(
+            metricsType,
+            entityId,
+            day,
+            day,
+            transaction,
+          );
+        if (
+          !missingDays.includes(day) &&
+          !(snapshot.unassignedComplete && incompleteDays.includes(day)) &&
+          !(refreshForUserReport && snapshot.complete)
+        ) {
+          return false;
+        }
         const currentMetrics = await db.getUserMetricsForDay(
           metricsType,
           entityId,
@@ -1168,13 +1158,15 @@ export class TaskManagementV2 {
               transaction,
             )
           : [];
-        // Another daily commit may have repaired users while the report was downloading.
+        const componentsLoaded = new Set(
+          parseComponentsLoaded(existingLog.components_loaded),
+        );
         if (
-          JSON.stringify([currentMetrics, currentBreakdowns]) !== storedUsers
+          repair &&
+          currentMetrics.length > 0 &&
+          currentBreakdowns.length === 0 &&
+          !componentsLoaded.has('userBreakdowns')
         ) {
-          return false;
-        }
-        if (repair) {
           await this.persistUserReport(
             day,
             metricsType,
@@ -1182,30 +1174,23 @@ export class TaskManagementV2 {
             repair,
             transaction,
           );
-          await db.markCostCenterAggregationPending(
-            day,
-            metricsType,
-            entityId,
+          componentsLoaded.add('userBreakdowns');
+          await db.upsertIngestionLog(
+            {
+              ...existingLog,
+              day,
+              metrics_type: metricsType,
+              entity_id: entityId,
+              components_loaded: JSON.stringify([...componentsLoaded]),
+            },
             transaction,
           );
         }
-        await db.replaceCostCenterAggregates(
+        await db.replaceCostCenterMemberships(
           day,
           metricsType,
           entityId,
           userCostCenters,
-          {
-            dailyTotals: aggregates.dailyTotals,
-            prMetrics: [],
-            byFeature: aggregates.byFeature,
-            byIde: aggregates.byIde,
-            byLanguageFeature: aggregates.byLanguageFeature,
-            byModelFeature: aggregates.byModelFeature,
-            byLanguageModel: aggregates.byLanguageModel,
-            byCli: aggregates.byCli,
-            byVscodeAgent: aggregates.byVscodeAgent,
-            customizationMetrics: aggregates.costCenterCustomizationMetrics,
-          },
           snapshot.unassignedComplete,
           transaction,
         );
@@ -1277,11 +1262,13 @@ export class TaskManagementV2 {
     totalsLoaded: boolean;
   }> {
     const { db, logger } = this.options;
-    const requiredComponents = getRequiredComponents(
+    let requiredComponents = getRequiredComponents(
       context.ingestUsers,
       context.ingestTeams,
     );
     let previouslyLoaded = new Set<string>();
+    let requiresUserBreakdownRepair = false;
+    let userBreakdownRepairReady = false;
 
     try {
       const previousLog = (
@@ -1290,6 +1277,16 @@ export class TaskManagementV2 {
       previouslyLoaded = new Set(
         parseComponentsLoaded(previousLog?.components_loaded),
       );
+      // Refresh missing user history before replacing a recent team snapshot.
+      requiresUserBreakdownRepair = Boolean(
+        context.refreshTeams &&
+          context.ingestUsers &&
+          context.ingestTeams &&
+          !previouslyLoaded.has('userBreakdowns'),
+      );
+      if (requiresUserBreakdownRepair) {
+        requiredComponents = [...requiredComponents, 'userBreakdowns'];
+      }
       const totals = previouslyLoaded.has('totals')
         ? []
         : await this.prepareTotals(
@@ -1298,61 +1295,82 @@ export class TaskManagementV2 {
             entityId,
             context.organizationReportTarget,
           );
-      let storedUserMetrics: V2UserMetricRow[] = [];
-      let storedUserBreakdowns: UserBreakdownData[] = [];
       let userReport: PreparedUserReport | undefined;
-      let preparedUserMetrics: V2UserMetricRow[] = [];
       let preparedTeams: Awaited<
-        ReturnType<TaskManagementV2['prepareTeamAggregates']>
+        ReturnType<TaskManagementV2['prepareTeamMemberships']>
       >;
       if (context.ingestUsers) {
-        storedUserMetrics = await db.getUserMetricsForDay(
+        const storedUserMetrics = await db.getUserMetricsForDay(
           metricsType,
           entityId,
           day,
         );
-        storedUserBreakdowns =
-          storedUserMetrics.length > 0
+        const storedUserBreakdowns =
+          storedUserMetrics.length > 0 && !requiresUserBreakdownRepair
             ? await db.getUserBreakdownsForDay(metricsType, entityId, day)
             : [];
         const reuseStoredReport =
+          !requiresUserBreakdownRepair &&
           previouslyLoaded.has('users') &&
-          (storedUserBreakdowns.length > 0 ||
+          ((storedUserMetrics.length > 0 &&
+            previouslyLoaded.has('userBreakdowns')) ||
+            storedUserBreakdowns.length > 0 ||
             (storedUserMetrics.length === 0 &&
               requiredComponents.every(component =>
                 previouslyLoaded.has(component),
               )));
         if (!reuseStoredReport) {
-          userReport = await this.prepareUserReports(
-            day,
-            metricsType,
-            entityId,
-            context.organizationReportTarget,
-          );
+          if (requiresUserBreakdownRepair) {
+            userReport = await this.prepareUserReports(
+              day,
+              metricsType,
+              entityId,
+              context.organizationReportTarget,
+              true,
+            );
+            userBreakdownRepairReady = userReport.loaded;
+          } else {
+            userReport = await this.prepareUserReports(
+              day,
+              metricsType,
+              entityId,
+              context.organizationReportTarget,
+            );
+          }
         }
-        preparedUserMetrics = userReport?.loaded
-          ? mergeUserMetrics(storedUserMetrics, userReport.userMetrics)
-          : storedUserMetrics;
         if (
           context.ingestTeams &&
           (!previouslyLoaded.has('teams') || context.refreshTeams)
         ) {
-          preparedTeams = await this.prepareTeamAggregates(
-            day,
-            metricsType,
-            entityId,
-            preparedUserMetrics,
-            userReport?.userBreakdowns ?? storedUserBreakdowns,
-            userReport?.loaded ?? reuseStoredReport,
-            context.organizationReportTarget,
+          if (requiresUserBreakdownRepair) {
+            if (userBreakdownRepairReady && userReport?.loaded) {
+              preparedTeams = await this.prepareTeamMemberships(
+                day,
+                metricsType,
+                entityId,
+                true,
+                context.organizationReportTarget,
+                true,
+              );
+              userBreakdownRepairReady = preparedTeams !== undefined;
+            }
+          } else {
+            preparedTeams = await this.prepareTeamMemberships(
+              day,
+              metricsType,
+              entityId,
+              userReport?.loaded ?? reuseStoredReport,
+              context.organizationReportTarget,
+            );
+          }
+        }
+        if (requiresUserBreakdownRepair && !userBreakdownRepairReady) {
+          logger.warn(
+            `[TaskManagementV2] Skipping team refresh for ${metricsType}:${entityId} on ${day} because complete user report history or team memberships were unavailable; preserving existing breakdowns, legacy aggregates, and memberships.`,
           );
         }
       }
 
-      const storedUsers = JSON.stringify([
-        storedUserMetrics,
-        storedUserBreakdowns,
-      ]);
       return await db.withIngestionDay(
         day,
         metricsType,
@@ -1361,38 +1379,65 @@ export class TaskManagementV2 {
           const componentsLoaded = new Set(
             parseComponentsLoaded(existingLog.components_loaded),
           );
-          let currentMetrics: V2UserMetricRow[] = [];
-          let currentBreakdowns: UserBreakdownData[] = [];
+          const userBreakdownRepairRequired = Boolean(
+            context.refreshTeams &&
+              context.ingestUsers &&
+              context.ingestTeams &&
+              !componentsLoaded.has('userBreakdowns'),
+          );
+          if (
+            userBreakdownRepairRequired &&
+            !requiredComponents.includes('userBreakdowns')
+          ) {
+            requiredComponents = [...requiredComponents, 'userBreakdowns'];
+          }
+          const repairSuperseded =
+            requiresUserBreakdownRepair &&
+            componentsLoaded.has('userBreakdowns');
+          let currentUserCount = 0;
+          let hasCurrentBreakdowns = false;
           if (context.ingestUsers) {
-            currentMetrics = await db.getUserMetricsForDay(
+            const currentMetrics = await db.getUserMetricsForDay(
               metricsType,
               entityId,
               day,
               transaction,
             );
-            currentBreakdowns = currentMetrics.length
-              ? await db.getUserBreakdownsForDay(
+            currentUserCount = currentMetrics.length;
+            hasCurrentBreakdowns =
+              currentUserCount > 0 &&
+              (
+                await db.getUserBreakdownsForDay(
                   metricsType,
                   entityId,
                   day,
                   transaction,
                 )
-              : [];
+              ).length > 0;
           }
           const needsUserRepair =
-            componentsLoaded.has('users') &&
-            ((currentMetrics.length > 0 && currentBreakdowns.length === 0) ||
-              (currentMetrics.length === 0 &&
-                !requiredComponents.every(component =>
-                  componentsLoaded.has(component),
-                )));
+            userBreakdownRepairRequired ||
+            (componentsLoaded.has('users') &&
+              ((currentUserCount > 0 &&
+                !hasCurrentBreakdowns &&
+                !componentsLoaded.has('userBreakdowns')) ||
+                (currentUserCount === 0 &&
+                  !requiredComponents.every(component =>
+                    componentsLoaded.has(component),
+                  ))));
+          const repairReadyForTransaction =
+            !userBreakdownRepairRequired ||
+            (requiresUserBreakdownRepair &&
+              userBreakdownRepairReady &&
+              userReport?.loaded === true &&
+              preparedTeams !== undefined);
           const refreshTeams = context.refreshTeams && Boolean(preparedTeams);
           if (
             requiredComponents.every(component =>
               componentsLoaded.has(component),
             ) &&
             !needsUserRepair &&
-            !refreshTeams
+            (!refreshTeams || repairSuperseded)
           ) {
             return {
               loaded: context.ingestUsers && componentsLoaded.has('users'),
@@ -1407,12 +1452,11 @@ export class TaskManagementV2 {
             componentsLoaded.add('totals');
           }
           let refreshed = false;
-          const sameStoredUsers =
-            JSON.stringify([currentMetrics, currentBreakdowns]) === storedUsers;
           if (
             userReport?.loaded &&
             (!componentsLoaded.has('users') || needsUserRepair) &&
-            sameStoredUsers
+            repairReadyForTransaction &&
+            !repairSuperseded
           ) {
             await this.persistUserReport(
               day,
@@ -1420,33 +1464,31 @@ export class TaskManagementV2 {
               entityId,
               userReport,
               transaction,
+              userBreakdownRepairRequired,
             );
             componentsLoaded.add('users');
+            componentsLoaded.add('userBreakdowns');
             refreshed = true;
-            if (context.ingestCostCenters) {
-              await db.markCostCenterAggregationPending(
-                day,
-                metricsType,
-                entityId,
-                transaction,
-              );
-            }
           }
-          // Prepared team aggregates must refer to the users actually committed for this day.
           if (
             preparedTeams &&
+            repairReadyForTransaction &&
+            !repairSuperseded &&
             (!componentsLoaded.has('teams') || context.refreshTeams) &&
-            (refreshed || (!userReport && sameStoredUsers))
+            componentsLoaded.has('users')
           ) {
-            await db.replaceTeamAggregates(
+            await db.replaceTeamMemberships(
               day,
               metricsType,
               entityId,
-              preparedTeams.userTeams,
-              preparedTeams.aggregates,
+              preparedTeams,
               transaction,
             );
-            if (preparedUserMetrics.length > 0) {
+            if (
+              currentUserCount > 0 ||
+              (refreshed && (userReport?.userMetrics.length ?? 0) > 0) ||
+              (userBreakdownRepairRequired && userBreakdownRepairReady)
+            ) {
               componentsLoaded.add('teams');
             }
           }
@@ -1465,7 +1507,9 @@ export class TaskManagementV2 {
               componentsLoaded.has('users') &&
               (refreshed ||
                 !userReport ||
-                (currentMetrics.length > 0 && currentBreakdowns.length > 0)),
+                (currentUserCount > 0 &&
+                  (hasCurrentBreakdowns ||
+                    componentsLoaded.has('userBreakdowns')))),
             refreshed,
             complete: requiredComponents.every(component =>
               componentsLoaded.has(component),
