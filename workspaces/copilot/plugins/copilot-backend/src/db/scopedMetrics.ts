@@ -91,24 +91,22 @@ export function filterScopedUsers(
 }
 
 /**
- * Legacy team detail is irreplaceable before GitHub raw breakdown ingestion.
- * A single raw breakdown (in any dimension) makes the whole day authoritative.
+ * Legacy team detail remains a fallback until its matching raw dimension is
+ * present. A completed userBreakdowns log makes the whole day authoritative.
  */
-function onlyLegacyDays(db: Knex, query: Knex.QueryBuilder) {
-  for (const table of [
-    ...Object.keys(breakdownDimensions).map(
-      kind => `copilot_user_metrics_by_${kind}`,
-    ),
-    'copilot_customization_metrics',
-  ]) {
-    query.whereNotExists(function rawBreakdowns() {
-      this.select(db.raw('1')).from(`${table} as raw`);
-      correlate(this, 'raw', 'legacy', false);
-      if (table === 'copilot_customization_metrics') {
-        this.where('raw.scope', 'user');
-      }
-    });
-  }
+function onlyLegacyDays(
+  db: Knex,
+  query: Knex.QueryBuilder,
+  rawTable: string,
+  customization: boolean,
+) {
+  query.whereNotExists(function rawBreakdowns() {
+    this.select(db.raw('1')).from(`${rawTable} as raw`);
+    correlate(this, 'raw', 'legacy', false);
+    if (customization) {
+      this.where('raw.scope', 'user');
+    }
+  });
   const textType = String(db.client.config.client).includes('mysql')
     ? 'CHAR'
     : 'TEXT';
@@ -253,7 +251,7 @@ export async function readScopedMetrics<T>(
     if (feature !== undefined) {
       legacy.where('legacy.feature', feature);
     }
-    onlyLegacyDays(db, legacy);
+    onlyLegacyDays(db, legacy, table, customization);
     rows.push(...(await legacy.select('legacy.*')));
   }
   return rows.sort(
