@@ -128,12 +128,57 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 
-function toNumber(value: unknown): number {
-  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+function toNumber(value: unknown, strict = false, context = 'report'): number {
+  if (value === undefined || value === null) {
+    return 0;
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+  if (strict) {
+    throw new Error(`Invalid numeric ${context} value`);
+  }
+  return 0;
 }
 
 function toStringValue(value: unknown): string | null {
   return typeof value === 'string' ? value : null;
+}
+
+type UserReportParseOptions = {
+  strict?: boolean;
+  expectedDay?: string;
+};
+
+function toBoolean(value: unknown, strict: boolean, context: string): boolean {
+  if (value === undefined) {
+    return false;
+  }
+  if (typeof value === 'boolean') {
+    return value;
+  }
+  if (strict) {
+    throw new Error(`Invalid boolean ${context} value`);
+  }
+  return Boolean(value);
+}
+
+function reportRows(
+  value: unknown,
+  strict: boolean,
+  kind: string,
+  day?: string,
+): unknown[] {
+  if (value === undefined || value === null) {
+    return [];
+  }
+  if (Array.isArray(value)) {
+    return value;
+  }
+  if (strict) {
+    throw new Error(`Invalid ${kind} breakdown for ${day ?? 'report day'}`);
+  }
+  return [];
 }
 
 type CustomizationContext = {
@@ -166,10 +211,13 @@ function isCustomizationCategory(category: string): boolean {
 function parseCustomizationData(
   record: Record<string, unknown>,
   context: CustomizationContext,
+  options: UserReportParseOptions = {},
 ): {
   metrics: V2CustomizationMetricRow[];
   summaries: V2CustomizationSummaryRow[];
 } {
+  const strict = options.strict ?? false;
+  const day = options.expectedDay ?? context.day;
   const metrics: V2CustomizationMetricRow[] = [];
   const summaries: V2CustomizationSummaryRow[] = [];
   const categories = new Set<string>();
@@ -187,8 +235,11 @@ function parseCustomizationData(
       continue;
     }
 
-    for (const row of value) {
+    for (const [index, row] of value.entries()) {
       if (!isRecord(row)) {
+        if (strict) {
+          throw new Error(`Invalid customization row ${index + 1} for ${day}`);
+        }
         continue;
       }
 
@@ -200,6 +251,11 @@ function parseCustomizationData(
         typeof interactionCount !== 'number' ||
         !Number.isFinite(interactionCount)
       ) {
+        if (strict) {
+          throw new Error(
+            `Invalid ${category} customization row ${index + 1} for ${day}`,
+          );
+        }
         continue;
       }
 
@@ -221,18 +277,20 @@ function parseCustomizationData(
 
   for (const [field, value] of Object.entries(record)) {
     const match = /^distinct_([a-z][a-z0-9_]*)_use_count$/.exec(field);
-    if (
-      !match ||
-      typeof value !== 'number' ||
-      !Number.isFinite(value) ||
-      !isCustomizationCategory(match[1])
-    ) {
+    if (!match || !isCustomizationCategory(match[1])) {
       continue;
     }
 
     // Keep summary and item data aligned. An absent item list means GitHub
     // did not make that customization category available for this record.
     if (!categories.has(match[1])) {
+      continue;
+    }
+
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+      if (strict) {
+        throw new Error(`Invalid ${match[1]} customization summary for ${day}`);
+      }
       continue;
     }
 
@@ -973,8 +1031,16 @@ export function parseUserDocument(
   doc: unknown,
   metricsType: MetricsScope,
   entityId: string,
+  options: UserReportParseOptions = {},
 ): ParsedUserDocument {
+  const strict = options.strict ?? false;
+  const expectedDay = options.expectedDay;
   if (!Array.isArray(doc)) {
+    if (strict) {
+      throw new Error(
+        `Invalid user report document for ${expectedDay ?? 'report day'}`,
+      );
+    }
     logWarn(
       'Expected user metrics document array, received non-array payload.',
     );
@@ -991,55 +1057,81 @@ export function parseUserDocument(
   const customizationMetrics: V2CustomizationMetricRow[] = [];
   const customizationSummaries: V2CustomizationSummaryRow[] = [];
 
-  for (const metric of doc as V2UserMetric[]) {
+  for (const [rowIndex, metric] of (doc as V2UserMetric[]).entries()) {
+    const rowContext = `user report row ${rowIndex + 1} for ${
+      expectedDay ?? 'report day'
+    }`;
     if (!isRecord(metric)) {
+      if (strict) {
+        throw new Error(`Invalid ${rowContext}`);
+      }
       logWarn('Skipping user metrics row because it is not an object.');
       continue;
     }
 
     const day = toStringValue(metric.day);
     const userLogin = toStringValue(metric.user_login);
-    const userId = toNumber(metric.user_id);
+    const userId = toNumber(metric.user_id, strict, rowContext);
 
-    if (!day || !userLogin || userId <= 0) {
+    if (
+      !day ||
+      !userLogin ||
+      userId <= 0 ||
+      (strict && expectedDay !== undefined && day !== expectedDay)
+    ) {
+      if (strict) {
+        throw new Error(`Invalid ${rowContext}`);
+      }
       logWarn('Skipping user metrics row with missing required fields.');
       continue;
     }
 
+    const userReportNumber = (value: unknown) =>
+      toNumber(value, strict, rowContext);
+    const userReportBoolean = (value: unknown) =>
+      toBoolean(value, strict, rowContext);
     userMetrics.push({
       day,
       metrics_type: metricsType,
       entity_id: entityId,
       user_id: userId,
       user_login: userLogin,
-      used_agent: Boolean(metric.used_agent),
-      used_chat: Boolean(metric.used_chat),
-      used_cli: Boolean(metric.used_cli),
-      used_vscode_agent: Boolean(metric.used_vscode_agent),
-      code_acceptance_activity_count: toNumber(
+      used_agent: userReportBoolean(metric.used_agent),
+      used_chat: userReportBoolean(metric.used_chat),
+      used_cli: userReportBoolean(metric.used_cli),
+      used_vscode_agent: userReportBoolean(metric.used_vscode_agent),
+      code_acceptance_activity_count: userReportNumber(
         metric.code_acceptance_activity_count,
       ),
-      code_generation_activity_count: toNumber(
+      code_generation_activity_count: userReportNumber(
         metric.code_generation_activity_count,
       ),
-      loc_added_sum: toNumber(metric.loc_added_sum),
-      loc_deleted_sum: toNumber(metric.loc_deleted_sum),
-      loc_suggested_to_add_sum: toNumber(metric.loc_suggested_to_add_sum),
-      loc_suggested_to_delete_sum: toNumber(metric.loc_suggested_to_delete_sum),
-      user_initiated_interaction_count: toNumber(
+      loc_added_sum: userReportNumber(metric.loc_added_sum),
+      loc_deleted_sum: userReportNumber(metric.loc_deleted_sum),
+      loc_suggested_to_add_sum: userReportNumber(
+        metric.loc_suggested_to_add_sum,
+      ),
+      loc_suggested_to_delete_sum: userReportNumber(
+        metric.loc_suggested_to_delete_sum,
+      ),
+      user_initiated_interaction_count: userReportNumber(
         metric.user_initiated_interaction_count,
       ),
-      ai_credits_used: toNumber(metric.ai_credits_used),
+      ai_credits_used: userReportNumber(metric.ai_credits_used),
     });
 
-    const customizationData = parseCustomizationData(metric, {
-      day,
-      metrics_type: metricsType,
-      entity_id: entityId,
-      scope: 'user',
-      user_id: userId,
-      user_login: userLogin,
-    });
+    const customizationData = parseCustomizationData(
+      metric,
+      {
+        day,
+        metrics_type: metricsType,
+        entity_id: entityId,
+        scope: 'user',
+        user_id: userId,
+        user_login: userLogin,
+      },
+      { strict, expectedDay: expectedDay ?? day },
+    );
     customizationMetrics.push(...customizationData.metrics);
     customizationSummaries.push(...customizationData.summaries);
 
@@ -1058,139 +1150,200 @@ export function parseUserDocument(
       })),
     };
 
-    if (Array.isArray(metric.totals_by_feature)) {
-      for (const row of metric.totals_by_feature) {
-        if (!isRecord(row) || !toStringValue(row.feature)) continue;
-        breakdown.byFeature.push({
-          feature: toStringValue(row.feature) as string,
-          user_initiated_interaction_count: toNumber(
-            row.user_initiated_interaction_count,
-          ),
-          code_generation_activity_count: toNumber(
-            row.code_generation_activity_count,
-          ),
-          code_acceptance_activity_count: toNumber(
-            row.code_acceptance_activity_count,
-          ),
-          loc_added_sum: toNumber(row.loc_added_sum),
-          loc_deleted_sum: toNumber(row.loc_deleted_sum),
-          loc_suggested_to_add_sum: toNumber(row.loc_suggested_to_add_sum),
-          loc_suggested_to_delete_sum: toNumber(
-            row.loc_suggested_to_delete_sum,
-          ),
-        });
+    for (const [index, row] of reportRows(
+      metric.totals_by_feature,
+      strict,
+      'feature',
+      day,
+    ).entries()) {
+      if (!isRecord(row) || !toStringValue(row.feature)) {
+        if (strict) {
+          throw new Error(
+            `Invalid feature breakdown row ${index + 1} for ${day}`,
+          );
+        }
+        continue;
       }
+      const number = (value: unknown) =>
+        toNumber(
+          value,
+          strict,
+          `feature breakdown row ${index + 1} for ${day}`,
+        );
+      breakdown.byFeature.push({
+        feature: toStringValue(row.feature) as string,
+        user_initiated_interaction_count: number(
+          row.user_initiated_interaction_count,
+        ),
+        code_generation_activity_count: number(
+          row.code_generation_activity_count,
+        ),
+        code_acceptance_activity_count: number(
+          row.code_acceptance_activity_count,
+        ),
+        loc_added_sum: number(row.loc_added_sum),
+        loc_deleted_sum: number(row.loc_deleted_sum),
+        loc_suggested_to_add_sum: number(row.loc_suggested_to_add_sum),
+        loc_suggested_to_delete_sum: number(row.loc_suggested_to_delete_sum),
+      });
     }
 
-    if (Array.isArray(metric.totals_by_ide)) {
-      for (const row of metric.totals_by_ide) {
-        if (!isRecord(row) || !toStringValue(row.ide)) continue;
-        breakdown.byIde.push({
-          ide: toStringValue(row.ide) as string,
-          user_initiated_interaction_count: toNumber(
-            row.user_initiated_interaction_count,
-          ),
-          code_generation_activity_count: toNumber(
-            row.code_generation_activity_count,
-          ),
-          code_acceptance_activity_count: toNumber(
-            row.code_acceptance_activity_count,
-          ),
-          loc_added_sum: toNumber(row.loc_added_sum),
-          loc_deleted_sum: toNumber(row.loc_deleted_sum),
-          loc_suggested_to_add_sum: toNumber(row.loc_suggested_to_add_sum),
-          loc_suggested_to_delete_sum: toNumber(
-            row.loc_suggested_to_delete_sum,
-          ),
-        });
+    for (const [index, row] of reportRows(
+      metric.totals_by_ide,
+      strict,
+      'IDE',
+      day,
+    ).entries()) {
+      if (!isRecord(row) || !toStringValue(row.ide)) {
+        if (strict) {
+          throw new Error(`Invalid IDE breakdown row ${index + 1} for ${day}`);
+        }
+        continue;
       }
+      const number = (value: unknown) =>
+        toNumber(value, strict, `IDE breakdown row ${index + 1} for ${day}`);
+      breakdown.byIde.push({
+        ide: toStringValue(row.ide) as string,
+        user_initiated_interaction_count: number(
+          row.user_initiated_interaction_count,
+        ),
+        code_generation_activity_count: number(
+          row.code_generation_activity_count,
+        ),
+        code_acceptance_activity_count: number(
+          row.code_acceptance_activity_count,
+        ),
+        loc_added_sum: number(row.loc_added_sum),
+        loc_deleted_sum: number(row.loc_deleted_sum),
+        loc_suggested_to_add_sum: number(row.loc_suggested_to_add_sum),
+        loc_suggested_to_delete_sum: number(row.loc_suggested_to_delete_sum),
+      });
     }
 
-    if (Array.isArray(metric.totals_by_language_feature)) {
-      for (const row of metric.totals_by_language_feature) {
-        if (
-          !isRecord(row) ||
-          !toStringValue(row.language) ||
-          !toStringValue(row.feature)
-        )
-          continue;
-        breakdown.byLanguageFeature.push({
-          language: toStringValue(row.language) as string,
-          feature: toStringValue(row.feature) as string,
-          code_generation_activity_count: toNumber(
-            row.code_generation_activity_count,
-          ),
-          code_acceptance_activity_count: toNumber(
-            row.code_acceptance_activity_count,
-          ),
-          loc_added_sum: toNumber(row.loc_added_sum),
-          loc_deleted_sum: toNumber(row.loc_deleted_sum),
-          loc_suggested_to_add_sum: toNumber(row.loc_suggested_to_add_sum),
-          loc_suggested_to_delete_sum: toNumber(
-            row.loc_suggested_to_delete_sum,
-          ),
-        });
+    for (const [index, row] of reportRows(
+      metric.totals_by_language_feature,
+      strict,
+      'language-feature',
+      day,
+    ).entries()) {
+      if (
+        !isRecord(row) ||
+        !toStringValue(row.language) ||
+        !toStringValue(row.feature)
+      ) {
+        if (strict) {
+          throw new Error(
+            `Invalid language-feature breakdown row ${index + 1} for ${day}`,
+          );
+        }
+        continue;
       }
+      const number = (value: unknown) =>
+        toNumber(
+          value,
+          strict,
+          `language-feature breakdown row ${index + 1} for ${day}`,
+        );
+      breakdown.byLanguageFeature.push({
+        language: toStringValue(row.language) as string,
+        feature: toStringValue(row.feature) as string,
+        code_generation_activity_count: number(
+          row.code_generation_activity_count,
+        ),
+        code_acceptance_activity_count: number(
+          row.code_acceptance_activity_count,
+        ),
+        loc_added_sum: number(row.loc_added_sum),
+        loc_deleted_sum: number(row.loc_deleted_sum),
+        loc_suggested_to_add_sum: number(row.loc_suggested_to_add_sum),
+        loc_suggested_to_delete_sum: number(row.loc_suggested_to_delete_sum),
+      });
     }
 
-    if (Array.isArray(metric.totals_by_model_feature)) {
-      for (const row of metric.totals_by_model_feature) {
-        // API uses "model" field name, not "model_id"
-        if (
-          !isRecord(row) ||
-          !toStringValue(row.model) ||
-          !toStringValue(row.feature)
-        )
-          continue;
-        breakdown.byModelFeature.push({
-          model_id: toStringValue(row.model) as string,
-          feature: toStringValue(row.feature) as string,
-          user_initiated_interaction_count: toNumber(
-            row.user_initiated_interaction_count,
-          ),
-          code_generation_activity_count: toNumber(
-            row.code_generation_activity_count,
-          ),
-          code_acceptance_activity_count: toNumber(
-            row.code_acceptance_activity_count,
-          ),
-          loc_added_sum: toNumber(row.loc_added_sum),
-          loc_deleted_sum: toNumber(row.loc_deleted_sum),
-          loc_suggested_to_add_sum: toNumber(row.loc_suggested_to_add_sum),
-          loc_suggested_to_delete_sum: toNumber(
-            row.loc_suggested_to_delete_sum,
-          ),
-        });
+    for (const [index, row] of reportRows(
+      metric.totals_by_model_feature,
+      strict,
+      'model-feature',
+      day,
+    ).entries()) {
+      // API uses "model" field name, not "model_id"
+      if (
+        !isRecord(row) ||
+        !toStringValue(row.model) ||
+        !toStringValue(row.feature)
+      ) {
+        if (strict) {
+          throw new Error(
+            `Invalid model-feature breakdown row ${index + 1} for ${day}`,
+          );
+        }
+        continue;
       }
+      const number = (value: unknown) =>
+        toNumber(
+          value,
+          strict,
+          `model-feature breakdown row ${index + 1} for ${day}`,
+        );
+      breakdown.byModelFeature.push({
+        model_id: toStringValue(row.model) as string,
+        feature: toStringValue(row.feature) as string,
+        user_initiated_interaction_count: number(
+          row.user_initiated_interaction_count,
+        ),
+        code_generation_activity_count: number(
+          row.code_generation_activity_count,
+        ),
+        code_acceptance_activity_count: number(
+          row.code_acceptance_activity_count,
+        ),
+        loc_added_sum: number(row.loc_added_sum),
+        loc_deleted_sum: number(row.loc_deleted_sum),
+        loc_suggested_to_add_sum: number(row.loc_suggested_to_add_sum),
+        loc_suggested_to_delete_sum: number(row.loc_suggested_to_delete_sum),
+      });
     }
 
-    if (Array.isArray(metric.totals_by_language_model)) {
-      for (const row of metric.totals_by_language_model) {
-        // API uses "model" field name, not "model_id"; no "request_count" — use code_generation_activity_count
-        if (
-          !isRecord(row) ||
-          !toStringValue(row.language) ||
-          !toStringValue(row.model)
-        )
-          continue;
-        breakdown.byLanguageModel.push({
-          language: toStringValue(row.language) as string,
-          model_id: toStringValue(row.model) as string,
-          request_count: toNumber(row.code_generation_activity_count),
-          code_generation_activity_count: toNumber(
-            row.code_generation_activity_count,
-          ),
-          code_acceptance_activity_count: toNumber(
-            row.code_acceptance_activity_count,
-          ),
-          loc_added_sum: toNumber(row.loc_added_sum),
-          loc_deleted_sum: toNumber(row.loc_deleted_sum),
-          loc_suggested_to_add_sum: toNumber(row.loc_suggested_to_add_sum),
-          loc_suggested_to_delete_sum: toNumber(
-            row.loc_suggested_to_delete_sum,
-          ),
-        });
+    for (const [index, row] of reportRows(
+      metric.totals_by_language_model,
+      strict,
+      'language-model',
+      day,
+    ).entries()) {
+      // API uses "model" field name, not "model_id"; no "request_count" — use code_generation_activity_count
+      if (
+        !isRecord(row) ||
+        !toStringValue(row.language) ||
+        !toStringValue(row.model)
+      ) {
+        if (strict) {
+          throw new Error(
+            `Invalid language-model breakdown row ${index + 1} for ${day}`,
+          );
+        }
+        continue;
       }
+      const number = (value: unknown) =>
+        toNumber(
+          value,
+          strict,
+          `language-model breakdown row ${index + 1} for ${day}`,
+        );
+      breakdown.byLanguageModel.push({
+        language: toStringValue(row.language) as string,
+        model_id: toStringValue(row.model) as string,
+        request_count: number(row.code_generation_activity_count),
+        code_generation_activity_count: number(
+          row.code_generation_activity_count,
+        ),
+        code_acceptance_activity_count: number(
+          row.code_acceptance_activity_count,
+        ),
+        loc_added_sum: number(row.loc_added_sum),
+        loc_deleted_sum: number(row.loc_deleted_sum),
+        loc_suggested_to_add_sum: number(row.loc_suggested_to_add_sum),
+        loc_suggested_to_delete_sum: number(row.loc_suggested_to_delete_sum),
+      });
     }
 
     userBreakdowns.push(breakdown);
@@ -1211,16 +1364,30 @@ export function parseUserTeamsDocument(
   doc: unknown,
   metricsType: MetricsScope,
   entityId: string,
+  options: UserReportParseOptions = {},
 ): V2UserTeamRow[] {
+  const strict = options.strict ?? false;
+  const expectedDay = options.expectedDay;
   if (!Array.isArray(doc)) {
+    if (strict) {
+      throw new Error(
+        `Invalid user-team report document for ${expectedDay ?? 'report day'}`,
+      );
+    }
     logWarn('Expected user teams document array, received non-array payload.');
     return [];
   }
 
   const parsed: V2UserTeamRow[] = [];
 
-  for (const teamMembership of doc as V2UserTeam[]) {
+  for (const [rowIndex, teamMembership] of (doc as V2UserTeam[]).entries()) {
+    const rowContext = `user-team row ${rowIndex + 1} for ${
+      expectedDay ?? 'report day'
+    }`;
     if (!isRecord(teamMembership)) {
+      if (strict) {
+        throw new Error(`Invalid ${rowContext}`);
+      }
       logWarn('Skipping user teams row because it is not an object.');
       continue;
     }
@@ -1228,10 +1395,20 @@ export function parseUserTeamsDocument(
     const day = toStringValue(teamMembership.day);
     const userLogin = toStringValue(teamMembership.user_login);
     const teamSlug = toStringValue(teamMembership.slug);
-    const userId = toNumber(teamMembership.user_id);
-    const teamId = toNumber(teamMembership.team_id);
+    const userId = toNumber(teamMembership.user_id, strict, rowContext);
+    const teamId = toNumber(teamMembership.team_id, strict, rowContext);
 
-    if (!day || !userLogin || !teamSlug || userId <= 0 || teamId <= 0) {
+    if (
+      !day ||
+      !userLogin ||
+      !teamSlug ||
+      userId <= 0 ||
+      teamId <= 0 ||
+      (strict && expectedDay !== undefined && day !== expectedDay)
+    ) {
+      if (strict) {
+        throw new Error(`Invalid ${rowContext}`);
+      }
       logWarn('Skipping user teams row with missing required fields.');
       continue;
     }

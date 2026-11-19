@@ -863,6 +863,7 @@ export class TaskManagementV2 {
     metricsType: MetricsScope,
     entityId: string,
     organizationReportTarget?: string,
+    strict = false,
   ): Promise<PreparedUserReport> {
     const { api, logger } = this.options;
     const report: PreparedUserReport = {
@@ -906,8 +907,15 @@ export class TaskManagementV2 {
     }
 
     for (const url of userLinks) {
-      const rows = await api.downloadNdjsonDocument(url);
-      const parsed = parseUserDocument(rows, metricsType, entityId);
+      const rows = strict
+        ? await api.downloadNdjsonDocument(url, { strict: true })
+        : await api.downloadNdjsonDocument(url);
+      const parsed = strict
+        ? parseUserDocument(rows, metricsType, entityId, {
+            strict: true,
+            expectedDay: day,
+          })
+        : parseUserDocument(rows, metricsType, entityId);
       report.userMetrics.push(...parsed.userMetrics);
       report.userBreakdowns.push(...parsed.userBreakdowns);
       report.customizationMetrics.push(...parsed.customizationMetrics);
@@ -993,6 +1001,7 @@ export class TaskManagementV2 {
     entityId: string,
     userReportLoaded: boolean,
     organizationReportTarget?: string,
+    strict = false,
   ): Promise<V2UserTeamRow[] | undefined> {
     const { api, logger } = this.options;
     let userTeamsEnvelope: Awaited<
@@ -1035,8 +1044,17 @@ export class TaskManagementV2 {
 
     const userTeams: V2UserTeamRow[] = [];
     for (const url of userTeamLinks) {
-      const rows = await api.downloadNdjsonDocument(url);
-      userTeams.push(...parseUserTeamsDocument(rows, metricsType, entityId));
+      const rows = strict
+        ? await api.downloadNdjsonDocument(url, { strict: true })
+        : await api.downloadNdjsonDocument(url);
+      userTeams.push(
+        ...(strict
+          ? parseUserTeamsDocument(rows, metricsType, entityId, {
+              strict: true,
+              expectedDay: day,
+            })
+          : parseUserTeamsDocument(rows, metricsType, entityId)),
+      );
     }
 
     return userTeams;
@@ -1076,7 +1094,14 @@ export class TaskManagementV2 {
         'userBreakdowns',
       )
     ) {
-      repair = await this.prepareUserReports(day, metricsType, entityId);
+      // This repair marks raw breakdowns authoritative over legacy details.
+      repair = await this.prepareUserReports(
+        day,
+        metricsType,
+        entityId,
+        undefined,
+        true,
+      );
       if (!repair.loaded || repair.userMetrics.length === 0) {
         return false;
       }
@@ -1301,6 +1326,7 @@ export class TaskManagementV2 {
               metricsType,
               entityId,
               context.organizationReportTarget,
+              true,
             );
             userBreakdownRepairReady = userReport.loaded;
           } else {
@@ -1324,6 +1350,7 @@ export class TaskManagementV2 {
                 entityId,
                 true,
                 context.organizationReportTarget,
+                true,
               );
               userBreakdownRepairReady = preparedTeams !== undefined;
             }
