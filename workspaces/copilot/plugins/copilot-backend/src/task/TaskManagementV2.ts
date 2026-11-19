@@ -1603,30 +1603,15 @@ export class TaskManagementV2 {
               )));
         if (!reuseStoredReport) {
           if (requiresUserBreakdownRepair) {
-            try {
-              userReport = await this.prepareUserReports(
-                day,
-                metricsType,
-                entityId,
-                context.organizationLease,
-                context.organizationReportTarget,
-                markAccessVerified,
-              );
-              userBreakdownRepairReady = userReport.loaded;
-            } catch (error) {
-              const accessDenial = getOrganizationAccessDenial(error);
-              if (
-                (context.organizationLease ||
-                  context.organizationReportTarget) &&
-                accessDenial
-              ) {
-                throw accessDenial;
-              }
-              if (error instanceof OrganizationIngestionLeaseLostError) {
-                throw error;
-              }
-              userBreakdownRepairReady = false;
-            }
+            userReport = await this.prepareUserReports(
+              day,
+              metricsType,
+              entityId,
+              context.organizationLease,
+              context.organizationReportTarget,
+              markAccessVerified,
+            );
+            userBreakdownRepairReady = userReport.loaded;
           } else {
             userReport = await this.prepareUserReports(
               day,
@@ -1652,31 +1637,16 @@ export class TaskManagementV2 {
         ) {
           if (requiresUserBreakdownRepair) {
             if (userBreakdownRepairReady && userReport?.loaded) {
-              try {
-                preparedTeams = await this.prepareTeamMemberships(
-                  day,
-                  metricsType,
-                  entityId,
-                  true,
-                  context.organizationLease,
-                  context.organizationReportTarget,
-                  markAccessVerified,
-                );
-                userBreakdownRepairReady = preparedTeams !== undefined;
-              } catch (error) {
-                const accessDenial = getOrganizationAccessDenial(error);
-                if (
-                  (context.organizationLease ||
-                    context.organizationReportTarget) &&
-                  accessDenial
-                ) {
-                  throw accessDenial;
-                }
-                if (error instanceof OrganizationIngestionLeaseLostError) {
-                  throw error;
-                }
-                userBreakdownRepairReady = false;
-              }
+              preparedTeams = await this.prepareTeamMemberships(
+                day,
+                metricsType,
+                entityId,
+                true,
+                context.organizationLease,
+                context.organizationReportTarget,
+                markAccessVerified,
+              );
+              userBreakdownRepairReady = preparedTeams !== undefined;
             }
           } else {
             preparedTeams = await this.prepareTeamMemberships(
