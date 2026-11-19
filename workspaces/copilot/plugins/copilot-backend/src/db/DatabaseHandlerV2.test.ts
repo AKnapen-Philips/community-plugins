@@ -3637,7 +3637,7 @@ describe('DatabaseHandlerV2', () => {
         '2026-05-08',
         currentDay,
       ]) {
-        await handler.markCostCenterAggregationDone(
+        await handler.markCostCenterMembershipsDone(
           day,
           'organization',
           'org-1',
@@ -3655,7 +3655,7 @@ describe('DatabaseHandlerV2', () => {
       expect(rows).toHaveLength(1);
       expect(rows[0].weekly_active_users).toBeUndefined();
 
-      await handler.markCostCenterAggregationDone(
+      await handler.markCostCenterMembershipsDone(
         incompleteDay,
         'organization',
         'org-1',
