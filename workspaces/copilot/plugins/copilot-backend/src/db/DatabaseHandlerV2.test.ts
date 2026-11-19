@@ -3959,8 +3959,14 @@ describe('DatabaseHandlerV2', () => {
       ).toBe(7);
     });
 
-    it('preserves legacy team detail only for whole days with no raw breakdowns or completion marker', async () => {
-      const days = ['2026-05-01', '2026-05-02', '2026-05-03', '2026-05-04'];
+    it('preserves legacy team detail until the matching breakdown or whole-day completion marker', async () => {
+      const days = [
+        '2026-05-01',
+        '2026-05-02',
+        '2026-05-03',
+        '2026-05-04',
+        '2026-05-05',
+      ];
       await handler.insertByFeature(
         days.map(day => ({
           day,
@@ -4001,21 +4007,32 @@ describe('DatabaseHandlerV2', () => {
         buildUserMetricsByFeature({ day: days[3], entity_id: 'other' }),
         buildUserMetricsByFeature({ day: days[3], metrics_type: 'enterprise' }),
       ]);
-      // Another dimension, even for an inactive user, makes the whole day raw.
+      // Another dimension, even for an inactive user, does not replace features.
       await handler.insertUserMetricsByIde([
         buildUserMetricsByIde({ day: days[1], user_id: 55 }),
       ]);
       await handler.upsertIngestionLog(
         buildIngestionLog({
           day: days[2],
-          components_loaded: '["users","userBreakdowns"]',
+          components_loaded: '["users"]',
         }),
       );
+      await handler.insertCustomizationMetrics([
+        buildCustomizationMetric({
+          day: days[2],
+          scope: 'team',
+          team_slug: 'beta',
+          user_id: 0,
+          user_login: '',
+          category: 'prompt',
+          item_name: 'raw-team',
+        }),
+      ]);
       const featuresRequest = handler.getByFeature(
         'organization',
         'org-1',
         days[0],
-        days[3],
+        days[4],
         'alpha',
       );
       const features = await featuresRequest;
@@ -4023,18 +4040,25 @@ describe('DatabaseHandlerV2', () => {
         features.map(row => [row.day, row.feature, row.loc_added_sum]),
       ).toEqual([
         [days[0], 'chat_panel', 10],
+        [days[1], 'legacy', 99],
+        [days[2], 'legacy', 99],
         [days[3], 'legacy', 99],
+        [days[4], 'legacy', 99],
       ]);
       expect(
         await handler.getCustomizationMetrics(
           'organization',
           'org-1',
           days[0],
-          days[3],
+          days[4],
           'alpha',
         ),
       ).toEqual([
+        expect.objectContaining({ day: days[0], interaction_count: 99 }),
+        expect.objectContaining({ day: days[1], interaction_count: 99 }),
+        expect.objectContaining({ day: days[2], interaction_count: 99 }),
         expect.objectContaining({ day: days[3], interaction_count: 99 }),
+        expect.objectContaining({ day: days[4], interaction_count: 99 }),
       ]);
       expect(
         (
@@ -4042,7 +4066,7 @@ describe('DatabaseHandlerV2', () => {
             'organization',
             'org-1',
             days[0],
-            days[3],
+            days[4],
             'alpha',
           )
         ).map(row => row.daily_active_users),
@@ -4061,12 +4085,9 @@ describe('DatabaseHandlerV2', () => {
         'alpha',
       );
       expect((await retainedLegacy)[0].loc_added_sum).toBe(99);
-      await handler.upsertIngestionLog(
-        buildIngestionLog({
-          day: days[3],
-          components_loaded: '["users","userBreakdowns"]',
-        }),
-      );
+      await handler.insertCustomizationMetrics([
+        buildCustomizationMetric({ day: days[3] }),
+      ]);
       await expect(
         handler.getByFeature(
           'organization',
@@ -4075,7 +4096,7 @@ describe('DatabaseHandlerV2', () => {
           days[3],
           'alpha',
         ),
-      ).resolves.toEqual([]);
+      ).resolves.toEqual([expect.objectContaining({ feature: 'legacy' })]);
       await expect(
         handler.getCustomizationMetrics(
           'organization',
@@ -4085,9 +4106,33 @@ describe('DatabaseHandlerV2', () => {
           'alpha',
         ),
       ).resolves.toEqual([]);
+      await handler.upsertIngestionLog(
+        buildIngestionLog({
+          day: days[4],
+          components_loaded: '["userBreakdowns"]',
+        }),
+      );
+      await expect(
+        handler.getByFeature(
+          'organization',
+          'org-1',
+          days[4],
+          days[4],
+          'alpha',
+        ),
+      ).resolves.toEqual([]);
+      await expect(
+        handler.getCustomizationMetrics(
+          'organization',
+          'org-1',
+          days[4],
+          days[4],
+          'alpha',
+        ),
+      ).resolves.toEqual([]);
       await expect(
         knex('copilot_metrics_by_feature').where({ team_slug: 'alpha' }),
-      ).resolves.toHaveLength(4);
+      ).resolves.toHaveLength(5);
     });
 
     it('preserves complete memberships when an incoming refresh cannot confirm unassigned users', async () => {
