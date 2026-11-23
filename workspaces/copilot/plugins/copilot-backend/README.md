@@ -124,7 +124,7 @@ Named cost centers are listed or queryable only when at least five distinct user
 
 Days whose roster could not be fully resolved are omitted from the **No cost center** view, and their data is excluded from rolling-user counts and threshold checks.
 
-When all relevant organization rosters are readable, users without a matching resource appear as **No cost center**. If a cost-center organization resource has no GitHub App installation, that resource is skipped with a warning and other cost centers continue to ingest. Because its members cannot be identified, no-cost-center results are withheld for affected days; the other named cost centers remain available. Previously complete days are retained if an organization installation later disappears; only newly aggregated days use the incomplete roster state. Permission or transient failures for an installed organization fail the whole snapshot and preserve existing data. A direct user resource that returns 404 is skipped because it cannot contribute metrics; other user-lookup failures fail closed.
+When all relevant organization rosters are readable, users without a matching resource appear as **No cost center**. If a cost-center organization resource has no GitHub App installation, that resource is skipped with a warning and other cost centers continue to ingest. Because its members cannot be identified, no-cost-center results are withheld for affected days; the other named cost centers remain available. Previously complete days are retained if an organization installation later disappears; only new membership snapshots use the incomplete roster state. Permission or transient failures for an installed organization fail the whole snapshot and preserve existing data. A direct user resource that returns 404 is skipped because it cannot contribute metrics; other user-lookup failures fail closed.
 
 The cost-center listing response contains real cost centers in `costCenters`
 and reports the unassigned-user threshold separately in
@@ -136,7 +136,14 @@ implementation markers.
 
 GitHub does not provide historical cost-center membership. Each ingested day uses the membership snapshot fetched at that time; backfilling existing per-user data applies the current snapshot to those historical days. GitHub's per-user and team reports cover roughly a rolling year, so newly enabled user, team, and cost-center data is backfilled only within that window. Older totals-only records remain unchanged and are not retried.
 
-Refreshing a user report queues its existing cost-center aggregates for replacement. Scheduled ingestion and manual backfills retry pending days within the report window until replacement succeeds, retaining the previous aggregates, including **No cost center**, meanwhile. Reusing a cached user report does not queue a replacement.
+Team and cost-center metrics are calculated by SQL queries over stored per-user
+metrics and daily membership snapshots. Newly stored user metrics and breakdowns
+are reflected without rebuilding aggregate tables. Scheduled ingestion and manual
+backfills retry missing or incomplete membership snapshots within the report
+window. A missing snapshot is never treated as proof that users have no cost
+center. New cost-center snapshots retain all resolved assigned members, including
+those without activity that day; metrics and eligibility count only users with
+stored Copilot activity.
 
 For expired native team-report days, `/v2/backfill/status` omits `teams` from `components_loaded` while preserving the successful totals status.
 
@@ -242,6 +249,19 @@ New V2 data is stored in plugin-owned tables aligned with the new GitHub report 
 - `copilot_customization_summaries`
 
 The older schema and legacy read paths remain available during migration, but new data is written to the V2 tables.
+
+Team and cost-center totals and breakdowns are grouped at read time from the
+per-user tables and daily memberships, rather than stored as additional copies
+in the aggregate tables. Unfiltered enterprise and organization metrics continue
+to use GitHub's canonical aggregate reports. Rolling scoped active-user counts
+continue to use distinct users across the daily membership snapshots.
+
+Existing team breakdowns from before per-user breakdown storage was introduced
+remain readable as a legacy fallback for days without any stored per-user
+breakdowns. New ingestion no longer writes these derived rows. Legacy aggregate
+tables and columns are retained for compatibility; the existing
+`copilot_cost_center_aggregation_log` records membership-snapshot completeness,
+not a cache requiring refresh.
 
 ### Named Customization Metrics
 
@@ -411,7 +431,7 @@ With `copilot.ingestCostCenters` enabled, cost-center and enterprise-team lookup
 - **GitHub App:** install the App on the enterprise with **Enterprise Copilot metrics: read**, **Enterprise teams: read**, and **Enterprise billing: read**. Also install it on each organization included as a cost-center `Org` resource, with **Members: read**.
 - **Classic PAT:** `read:enterprise` to read cost centers and enterprise teams, and `read:org` to read members of organizations included as cost-center `Org` resources. The token owner must also be an active member of each such organization; a scope alone does not grant access to concealed members. If active membership cannot be verified, the snapshot is marked incomplete.
 
-If an organization roster, enterprise-team list or membership, or direct-user lookup cannot be resolved, the snapshot is marked incomplete. No cost-center memberships or aggregates are replaced for any affected day, and the next ingestion run retries. An empty or unverifiable organization roster also blocks the snapshot; for fine-grained PATs, a missing scopes header means roster completeness cannot be verified. A direct `User` resource that returns HTTP 404 is the exception: it is treated as permanently unresolvable and skipped because that user cannot contribute metrics. Other direct-user lookup failures, including permission and transient errors, block the snapshot.
+If an organization roster, enterprise-team list or membership, or direct-user lookup cannot be resolved, the snapshot is marked incomplete. No cost-center memberships are replaced for any affected day, and the next ingestion run retries. An empty or unverifiable organization roster also blocks the snapshot; for fine-grained PATs, a missing scopes header means roster completeness cannot be verified. A direct `User` resource that returns HTTP 404 is the exception: it is treated as permanently unresolvable and skipped because that user cannot contribute metrics. Other direct-user lookup failures, including permission and transient errors, block the snapshot.
 
 ### Organization teams
 

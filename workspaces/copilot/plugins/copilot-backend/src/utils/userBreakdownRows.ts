@@ -36,10 +36,8 @@ export interface UserBreakdownRows {
  * Converts the in-memory per-user breakdown data (parsed from the
  * users-1-day report) into DB row shapes for persistence.
  *
- * This is the per-user counterpart to the aggregation done in
- * teamAggregator.ts — instead of folding breakdown rows across all users in
- * a team, it emits one row per (day, entity, user, dimension) so that a
- * single user's own breakdowns can be queried back out later.
+ * Emits one row per (day, entity, user, dimension) for individual breakdowns
+ * and scoped SQL aggregation through team and cost-center memberships.
  */
 export function buildUserBreakdownRows(
   userBreakdowns: UserBreakdownData[],
