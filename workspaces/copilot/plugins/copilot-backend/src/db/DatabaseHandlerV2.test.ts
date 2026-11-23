@@ -4079,16 +4079,19 @@ describe('DatabaseHandlerV2', () => {
           components_loaded: '["userBreakdowns"]',
         }),
       );
+      const featureRowsPromise = handler.getByFeature(
+        'organization',
+        'org-1',
+        days[0],
+        days[4],
+        'alpha',
+      );
       expect(
-        (
-          await handler.getByFeature(
-            'organization',
-            'org-1',
-            days[0],
-            days[4],
-            'alpha',
-          )
-        ).map(row => [row.day, row.feature, row.loc_added_sum]),
+        (await featureRowsPromise).map(row => [
+          row.day,
+          row.feature,
+          row.loc_added_sum,
+        ]),
       ).toEqual([
         [days[0], 'legacy', 99],
         [days[1], 'chat_panel', 10],
