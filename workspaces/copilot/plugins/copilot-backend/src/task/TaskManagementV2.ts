@@ -183,28 +183,6 @@ function uniqueDays(...dayLists: string[][]): string[] {
   return [...new Set(dayLists.flat())].sort();
 }
 
-function mergeUserMetrics(
-  stored: V2UserMetricRow[],
-  incoming: V2UserMetricRow[],
-): V2UserMetricRow[] {
-  const metrics = new Map(stored.map(row => [row.user_id, row]));
-  for (const row of incoming) {
-    const existing = metrics.get(row.user_id);
-    // Match insertUserMetrics: legacy base metrics are immutable; only new columns are refreshed.
-    metrics.set(
-      row.user_id,
-      existing
-        ? {
-            ...existing,
-            ai_credits_used: row.ai_credits_used,
-            used_vscode_agent: row.used_vscode_agent,
-          }
-        : row,
-    );
-  }
-  return [...metrics.values()];
-}
-
 function isSupportedCostCenterScope(
   metricsType: MetricsScope,
   entityId: string,
@@ -1598,7 +1576,6 @@ export class TaskManagementV2 {
       let storedUserMetrics: V2UserMetricRow[] = [];
       let storedUserBreakdowns: UserBreakdownData[] = [];
       let userReport: PreparedUserReport | undefined;
-      let preparedUserMetrics: V2UserMetricRow[] = [];
       let preparedTeams: Awaited<
         ReturnType<TaskManagementV2['prepareTeamMemberships']>
       >;
@@ -1646,9 +1623,6 @@ export class TaskManagementV2 {
           }
         }
         accessVerified ||= userReport?.accessVerified ?? false;
-        preparedUserMetrics = userReport?.loaded
-          ? mergeUserMetrics(storedUserMetrics, userReport.userMetrics)
-          : storedUserMetrics;
         if (
           context.ingestTeams &&
           (!previouslyLoaded.has('teams') ||

@@ -559,6 +559,7 @@ describe('TaskManagementV2', () => {
         async (_day, _scope, _entity, operation) =>
           operation(transaction, {
             components_loaded: '["totals","users","userBreakdowns"]',
+            status: 'success',
           }),
       );
       const task = TaskManagementV2.create({
@@ -678,6 +679,7 @@ describe('TaskManagementV2', () => {
       async (_day, _scope, _entity, operation) =>
         operation(transaction, {
           components_loaded: '["totals","users","userBreakdowns"]',
+          status: 'success',
         }),
     );
     const task = TaskManagementV2.create({
@@ -4842,6 +4844,7 @@ describe('TaskManagementV2', () => {
         try {
           return await operation(transaction, {
             components_loaded: '["totals","users","teams"]',
+            status: 'partial',
           });
         } finally {
           inTransaction = false;
